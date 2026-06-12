@@ -4,7 +4,7 @@ Linear-response TDDFT (Casida / RPA) for Kohn–Sham and embedded subsystem calc
 
 - **Standalone MPI Casida** from exported SCF data (density, orbitals, eigenvalues)
 - **QEpy adapter** to build inputs directly from a QEpy driver
-- **Subsystem coupling** (Pavanello non-additive kernel) for multi-fragment eDFTpy workflows
+- **Subsystem coupling** (non-additive kernel) for multi-fragment eDFTpy workflows
 
 The Python package lives in `casidapy/`. Install with pip; entry points are `casidapy-run` and `casidapy-plot`.
 
@@ -12,13 +12,10 @@ The Python package lives in `casidapy/`. Install with pip; entry points are `cas
 
 ```bash
 cd CasidaPy
-pip install -e .
+pip install .
 
 # Optional extras
-pip install -e ".[qepy]"      # QEpy integration
-pip install -e ".[libxc]"      # triplet excitations (pylibxc)
-pip install -e ".[plotting]"   # matplotlib spectrum plots
-pip install -e ".[all]"
+pip install qepy     # QEpy integration
 ```
 
 Core dependencies: `numpy`, `scipy`, `mpi4py`, `dftpy`, `ase`.
@@ -29,11 +26,37 @@ For the full embedded workflow you also need **eDFTpy** (with `task = casida`) a
 
 | Mode | When to use | Entry point |
 |------|-------------|-------------|
-| **CLI** (`casidapy-run`) | Single system; SCF outputs already on disk | `scripts/run_casida.sh` or `casidapy-run` |
+| **CLI** (`casidapy-run`) | Single system; SCF outputs already on disk|
 | **Python API** | Custom scripts, notebooks, tests | `run_casida_in_memory`, `CasidaKS_MPI` |
 | **eDFTpy embedded** | Multi-fragment embedding + inter-fragment coupling | `python -m edftpy input.ini` |
 
 Step-by-step H₂O tutorials: `tutorials/h2o_tddft_approach1_highlevel.ipynb` (one-call) and `tutorials/h2o_tddft_approach2_stepwise.ipynb` (explicit stages).
+
+## Examples
+
+### Standalone Casida LR-TDDFT (Ag₄)
+
+CasidaPy run on a single Kohn–Sham ground state: stick spectrum (oscillator strengths) and Gaussian-broadened absorption (σ = 0.1 eV). The dominant transition near 2.8 eV is the main optical feature of the tetramer; the inset compares the broadened TDDFT curve with experiment.
+
+![Ag₄ Casida stick and broadened absorption spectrum](docs/images/ag4_casida_spectrum.png)
+
+Typical workflow: QEpy SCF → `casidapy-run` (or `run_casida.sh`) on exported `rho`, `psi`, `eigs`, and `occs`. See [§1 Standalone Casida](#1-standalone-casida-scf--casida) below.
+
+### Polaritonic splitting (Ag₄ + cavity)
+
+Strong coupling between the Ag₄ exciton and a cavity mode tuned near the main transition (~2.75 eV): the bare excitonic peak splits into upper and lower polariton branches (Rabi splitting). Bottom panel: effective oscillator strength of polaritonic states; dashed line marks the cavity frequency.
+
+![Ag₄ bare vs polaritonic spectrum](docs/images/ag4_polaritonic_spectrum.png)
+
+Enable with `--polariton` and related flags in `casidapy-run` (see `casidapy.polariton_handler`).
+
+### Subsystem LR-TDDFT with eDFTpy + CasidaPy (ethylene dimer)
+
+Embedded multi-fragment calculation: each monomer gets a local Casida solve on its MPI sub-communicator, then Pavanello non-additive coupling builds the coupled spectrum (σ = 0.1 eV). At **3.5 Å**, satellite peaks appear below the monomer π→π* band (~7.1 eV); as separation increases (**4.5 Å**, **5.5 Å**), those features fade and the coupled curve approaches the fragment-local Subsystem Casida lines (dashed/dotted green at 5.5 Å).
+
+![Ethylene dimer coupled 3.5Å/4.5Å/5.5Å + Subsystem Casida](docs/images/ethylene_dimer_subsystem_tddft.png)
+
+Typical workflow: `python -m edftpy input.ini` with `task = casida` and one `[SUB_FRAG_*]` block per fragment. See [§3 eDFTpy embedded subsystem Casida](#3-edftpy-embedded-subsystem-casida) below.
 
 ---
 
@@ -44,14 +67,6 @@ Step-by-step H₂O tutorials: `tutorials/h2o_tddft_approach1_highlevel.ipynb` (o
 Run QEpy SCF **as a single MPI rank** (QE parallelises internally; multi-rank Python launch breaks wavefunction gather for USPP).
 
 ```bash
-# Via SLURM wrapper
-sbatch scripts/run_scf.sh \
-  --geometry path/to/system.vasp \
-  --pseudo path/to/Element.UPF \
-  --workdir ./my_run \
-  --output-prefix system
-
-# Or directly
 python casidapy/generate_inputs_qepy.py \
   --geometry system.vasp --pseudo Element.UPF --workdir ./my_run
 ```
@@ -66,42 +81,9 @@ Expected files in `workdir`:
 | `occs_<prefix>.npy` | Occupation numbers |
 
 ### Step 2: Run Casida (MPI)
-
-```bash
-sbatch scripts/run_casida.sh \
-  --workdir ./my_run \
-  --atoms system.vasp \
-  --density rho_scf_system.xsf \
-  --psi psi_system.npy \
-  --eigs eig_system.npy \
-  --occs occs_system.npy \
-  --pseudo-map "Ag:Element.UPF" \
-  --xc PBE \
-  --n-occ 10 --n-unocc 20 --n-states 30 \
-  --matrix-free --solver-method eigsh \
-  --output-prefix casida_system
-```
-
-Ultrasoft pseudopotentials:
-
-```bash
-sbatch scripts/run_casida.sh \
-  ... \
-  --use-uspp --uspp-map "Ag:ag_pbe_v1.4.uspp.F.UPF" \
-  --xc PBE
-```
-
-### Input file (`.in`)
-
-Pass all options via a key–value file; CLI flags override file values.
-
 ```bash
 casidapy-run --input-file sample_h2o_pbe.in
-# or
-sbatch scripts/run_casida.sh --input-file sample_h2o_pbe.in
 ```
-
-Sample files in the repo root: `sample_h2o_pbe.in`, `sample_h2o_pbe0.in`, `sample_ag5_of.in`.
 
 Example snippet:
 
@@ -126,11 +108,6 @@ plot
 
 ### Full pipeline (one SLURM job)
 
-```bash
-sbatch scripts/run_full_pipeline.sh \
-  --scf "--geometry system.vasp --pseudo Element.UPF --workdir ./my_run --output-prefix system" \
-  --casida "--workdir ./my_run --atoms system.vasp --density rho_scf_system.xsf --psi psi_system.npy --eigs eig_system.npy --occs occs_system.npy --pseudo-map Ag:Element.UPF --xc PBE --output-prefix casida_system"
-```
 
 Use `--skip-scf` or `--skip-casida` to run only one stage.
 
