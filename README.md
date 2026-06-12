@@ -1,5 +1,7 @@
 # CasidaPy
 
+CasidaPy is supported by a grant from the US Department of Energy, No. DE-SC0024496
+
 Linear-response TDDFT (Casida / RPA) for Kohn–Sham and embedded subsystem calculations. CasidaPy provides:
 
 - **Standalone MPI Casida** from exported SCF data (density, orbitals, eigenvalues)
