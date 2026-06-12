@@ -1,0 +1,39 @@
+# Sample input: H2O Casida (PBE)
+
+# ===== File Paths =====
+workdir = examples/H2O_COMPARE
+atoms = h2o.vasp
+density = rho_scf_h2o.xsf
+psi = psi_h2o.npy
+eigs = eig_h2o.npy
+occs = occs_h2o.npy
+
+# ===== Pseudopotentials =====
+pseudo_map = H:H_ONCV_PBE-1.2.upf,O:O_ONCV_PBE-1.2.upf
+
+# ===== Calculation Parameters =====
+n_occ = 4
+n_unocc = 30
+n_states = 20
+n_total_occ = 4
+
+# ===== Solver Options =====
+matrix_free
+tda
+solver_method = eigsh
+solver_tol = 1e-8
+solver_maxiter = 200
+
+# ===== Grid =====
+grid_nr = 80 80 80
+
+# ===== Exchange-Correlation =====
+xc = PBE
+
+# ===== Spin State =====
+spin_state = singlet
+
+# ===== Output =====
+output_prefix = casida_h2o_pbe
+plot
+sigma = 0.1

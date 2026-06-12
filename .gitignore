@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.out
+.cache/
+.coverage
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+doc/source/tutorials/config.rst
+H2O_SERIAL/tmp.save/
+STDDFT/

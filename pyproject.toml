@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "CasidaPy"
+version = "0.1.0"
+description = "Linear-response TDDFT (Casida) solver for KS and OF-DFT"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "scipy",
+    "mpi4py",
+    "dftpy",
+    "ase",
+]
+
+[project.optional-dependencies]
+qepy = ["qepy"]
+libxc = ["pylibxc"]
+plotting = ["matplotlib"]
+all = ["qepy", "pylibxc", "matplotlib"]
+
+[project.scripts]
+casidapy-run = "casidapy.run_casida_parallel_generic:main"
+casidapy-plot = "casidapy.plot_casida_spectrum:main"
+
+[tool.setuptools.packages.find]
+include = ["casidapy*"]
