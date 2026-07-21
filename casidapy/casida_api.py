@@ -27,12 +27,15 @@ class CasidaOptions:
     # if None, the lowest n_occ bands are used (see qepy_adapter.slice_active_space).
     n_total_occ: Optional[int] = None
 
+    # Kernel backend: "pw" = plane-wave / FFT grid (QE, DFTpy); "gto" = molecular AO/MO.
+    basis: str = "pw"
+
     tda: bool = False
     matrix_free: bool = False
     solver_method: str = "lobpcg"  # matrix-free iterative diagonalization (lobpcg or eigsh)
     solver_tol: float = 1e-8
     solver_maxiter: int = 200
-    use_gpu: bool = False
+    use_gpu: bool = False  # reserved; GPU not wired yet (CPU only)
 
     xc: str = "PBE"
     spin_state: str = "singlet"  # or "triplet" (requires libxc component map in the engine)

@@ -392,6 +392,8 @@ def assemble_coupled_casida(
             A_coupled[i0:i1, i0:i1] = np.diag(omega_blocks[I])
 
         for (I, J), K_IJ in K_coupling.items():
+            if I == J:
+                continue  # diagonal stays diag(omega_I); no self-block (see RPA note)
             i0_I, i0_J = offsets[I], offsets[J]
             n_I, n_J = block_sizes[I], block_sizes[J]
             K_blk = _project_k_to_state_basis(
@@ -409,7 +411,17 @@ def assemble_coupled_casida(
         i0, i1 = offsets[I], offsets[I] + block_sizes[I]
         C_coupled[i0:i1, i0:i1] = np.diag(omega_blocks[I] ** 2)
 
+    # Only OFF-diagonal blocks couple fragments. The diagonal stays diag(omega_I**2):
+    # the fragment excitations already are eigenstates of their embedded Casida, so a
+    # self-block K[I,I] re-integrates the kernel over a fragment's own transitions and
+    # double-counts response already in omega_I. Empirically the self-block drives the
+    # RPA C matrix indefinite (negative eigenvalues -> spurious omega=0 states) and
+    # shifts states below the fragment manifold even at large separation where the
+    # inter-fragment coupling is ~0. Skipping it makes the coupled spectrum reduce to
+    # the fragment spectrum as K_IJ(I!=J) -> 0, as it must.
     for (I, J), K_IJ in K_coupling.items():
+        if I == J:
+            continue
         i0_I, i0_J = offsets[I], offsets[J]
         n_I, n_J = block_sizes[I], block_sizes[J]
         sqrt_omega_I = np.sqrt(np.maximum(omega_blocks[I], 1e-30))
@@ -728,41 +740,29 @@ def run_subsystem_casida(
     hartree = Functional(type="HARTREE")
     K_coupling: Dict[Tuple[int, int], np.ndarray] = {}
 
+    # Only OFF-diagonal (inter-fragment) blocks are computed. The diagonal
+    # self-block K[I,I] is intentionally NOT built: the coupled matrix keeps
+    # diag(omega_I) on the diagonal (see assemble_coupled_casida). Re-integrating
+    # the kernel over a fragment's own transitions double-counts response already
+    # in omega_I and makes the RPA matrix indefinite. Skipping it also removes the
+    # diagonal Hartree FFTs entirely.
     for a, I in enumerate(active_indices):
         phi_I = _fragment_transition_densities(
             fragment_results, fragment_stream_paths, I,
         )
-        for b in range(a, len(active_indices)):
+        for b in range(a + 1, len(active_indices)):
             J = active_indices[b]
             if verbose:
                 print(f"  Computing K[{I},{J}] coupling block...", flush=True)
             phi_J = _fragment_transition_densities(
                 fragment_results, fragment_stream_paths, J,
             )
-            if I == J:
-                f_kernel = _diagonal_coupling_kernel(
-                    f_nadd,
-                    rho_subs_by_idx[I],
-                    gsystem,
-                    I,
-                    ke_functional,
-                    rho_cutoff=rho_cutoff,
-                    fxc_max=fxc_max,
-                )
-            else:
-                f_kernel = f_nadd
-
-            # Diagonal self-block (I == J): omit Hartree — the intra-fragment
-            # Coulomb response is already in omega_I, so including it double-counts
-            # and spuriously blue-shifts the fragment manifold. Inter-fragment
-            # blocks keep Hartree (the physical Coulomb coupling).
             K_IJ = compute_coupling_block(
-                phi_I, phi_J, gsystem, I, J, f_kernel, hartree,
-                include_hartree=(I != J),
+                phi_I, phi_J, gsystem, I, J, f_nadd, hartree,
+                include_hartree=True,
             )
             K_coupling[(I, J)] = K_IJ
-            if I != J:
-                K_coupling[(J, I)] = K_IJ.T
+            K_coupling[(J, I)] = K_IJ.T
 
     if verbose:
         for a, I in enumerate(active_indices):

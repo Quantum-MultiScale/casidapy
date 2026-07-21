@@ -102,11 +102,13 @@ class TestSliceActiveSpace:
             self.eigs, self.psi_all, n_occ, n_unocc, n_total_occ=n_total_occ
         )
 
-        # Should select occupied indices [3, 4, 5] (top 3 of 6 occupied)
-        assert len(occ_e) == 5
-        np.testing.assert_array_equal(occ_e, self.eigs[0:n_total_occ])
+        # Occupied window [n_total_occ - n_occ, n_total_occ) = [2, 5)
+        assert len(occ_e) == 3
+        np.testing.assert_array_equal(occ_e, self.eigs[2:5])
         assert len(unocc_e) == 2
-        # np.testing.assert_array_equal(unocc_e, self.eigs[6:8])
+        np.testing.assert_array_equal(unocc_e, self.eigs[5:7])
+        assert psi_occ == [2, 3, 4]
+        assert psi_unocc == [5, 6]
 
     def test_n_unocc_none_uses_all(self):
         """When n_unocc is None, use all available unoccupied orbitals."""
@@ -149,6 +151,7 @@ class TestCasidaAPI:
         assert opts.matrix_free is False
         assert opts.xc == "PBE"
         assert opts.spin_state == "singlet"
+        assert opts.basis == "pw"
 
     def test_inputs_creation(self):
         from casidapy.casida_api import CasidaInputs
@@ -162,6 +165,91 @@ class TestCasidaAPI:
             occs=np.ones(5),
         )
         assert inputs.psi.shape == (5, 10, 10, 10)
+
+
+# ---------------------------------------------------------------------------
+# Kernel backend unit tests
+# ---------------------------------------------------------------------------
+
+class TestKernelBackends:
+    def test_plane_wave_kernel_import(self):
+        from casidapy.kernels import PlaneWaveKernel, GTOKernel, KernelBackend
+        assert PlaneWaveKernel is not None
+        assert GTOKernel is not None
+        assert KernelBackend is not None
+
+    def test_gto_kernel_requires_pyscf_or_runs(self):
+        pytest.importorskip("pyscf")
+        from pyscf import gto, dft
+        from casidapy.pyscf_adapter import extract_gto_kernel
+        from casidapy.casida_engine import run_casida
+
+        # Use 6-31G so n_trans > 1; eigsh cannot solve k >= N for LinearOperator.
+        mol = gto.M(
+            atom="H 0 0 0; H 0 0 0.74",
+            basis="6-31g",
+            verbose=0,
+        )
+        mf = dft.RKS(mol)
+        mf.xc = "lda,vwn"
+        mf.kernel()
+        kernel, opts = extract_gto_kernel(
+            mf, n_states=2, tda=True, use_df=False, verbose=False
+        )
+        opts.solver_method = "eigsh"
+        opts.solver_maxiter = 100
+        results = run_casida(kernel, opts)
+        assert results.omega.size >= 1
+        assert np.all(np.asarray(results.omega) > 0)
+        assert results.metadata.get("kernel") == "GTOKernel"
+        assert results.metadata.get("basis") == "gto"
+
+    @pytest.mark.parametrize("xc", ["pbe", "pbe0", "b3lyp"])
+    def test_gto_kernel_matches_pyscf_tda(self, xc):
+        """GTO TDA must reproduce PySCF TDA, including hybrids."""
+        pytest.importorskip("pyscf")
+        from pyscf import gto, dft
+        from casidapy.pyscf_adapter import extract_gto_kernel
+        from casidapy.casida_engine import run_casida
+
+        # Small H2 system: the matrix-free solver calls gen_response per
+        # matvec, so larger molecules make this test very slow.
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="6-31g", verbose=0)
+        mf = dft.RKS(mol)
+        mf.xc = xc
+        mf.kernel()
+
+        td = mf.TDA()
+        td.nstates = 2
+        e_ref = td.kernel()[0]
+
+        kernel, opts = extract_gto_kernel(
+            mf, n_states=2, tda=True, use_df=False, verbose=False
+        )
+        opts.solver_method = "eigsh"
+        opts.solver_maxiter = 300
+        results = run_casida(kernel, opts)
+
+        n = min(len(results.omega), len(e_ref))
+        np.testing.assert_allclose(results.omega[:n], e_ref[:n], atol=1e-6)
+
+    def test_gto_kernel_hybrid_rejects_rpa(self):
+        """Hybrid XC + full Casida (non-TDA) is unsupported and must raise."""
+        pytest.importorskip("pyscf")
+        from pyscf import gto, dft
+        from casidapy.pyscf_adapter import extract_gto_kernel
+        from casidapy.casida_engine import run_casida
+
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="6-31g", verbose=0)
+        mf = dft.RKS(mol)
+        mf.xc = "pbe0"
+        mf.kernel()
+        kernel, opts = extract_gto_kernel(
+            mf, n_states=2, tda=False, use_df=False, verbose=False
+        )
+        opts.solver_method = "eigsh"
+        with pytest.raises(NotImplementedError, match="requires TDA"):
+            run_casida(kernel, opts)
 
 
 # ---------------------------------------------------------------------------
@@ -185,12 +273,14 @@ class TestFullCasidaWorkflow:
 
     @pytest.fixture(autouse=True)
     def setup_driver(self, tmp_path):
+        from pathlib import Path
         from qepy.driver import Driver
 
+        pseudo_dir = Path(__file__).resolve().parent.parent / "scripts"
         qe_options = {
             '&control': {
                 'calculation': "'scf'",
-                'pseudo_dir': "'../scripts/'",
+                'pseudo_dir': f"'{pseudo_dir}/'",
             },
             '&system': {
                 'ibrav': 0,
@@ -223,7 +313,7 @@ class TestFullCasidaWorkflow:
         results = run_casida_in_memory(inputs, options)
 
         assert results.omega is not None
-        assert results.omega[0]==0.5026924502910796
+        assert np.isclose(results.omega[0], 0.5026924502910796, rtol=0, atol=1e-8)
         assert len(results.omega) > 0
         assert np.all(results.omega > 0), "All excitation energies should be positive"
 

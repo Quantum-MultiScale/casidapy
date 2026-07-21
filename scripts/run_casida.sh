@@ -83,8 +83,8 @@ set -e
 # Environment (adjust modules for your cluster)
 # ============================================================
 module purge 2>/dev/null || true
-if [ -d /projects/community/modulefiles ]; then
-    module use /projects/community/modulefiles
+if [ -d /projects/community-old/modulefiles ]; then
+    module use /projects/community-old/modulefiles
 fi
 # Examples:  module load eDFTpy
 #          or: module load gcc/10.2.0/openmpi/4.0.5-bz186

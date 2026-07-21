@@ -1,7 +1,5 @@
 # CasidaPy
 
-CasidaPy is supported by a grant from the US Department of Energy, No. DE-SC0024496
-
 Linear-response TDDFT (Casida / RPA) for Kohn–Sham and embedded subsystem calculations. CasidaPy provides:
 
 - **Standalone MPI Casida** from exported SCF data (density, orbitals, eigenvalues)
@@ -28,8 +26,9 @@ For the full embedded workflow you also need **eDFTpy** (with `task = casida`) a
 
 | Mode | When to use | Entry point |
 |------|-------------|-------------|
-| **CLI** (`casidapy-run`) | Single system; SCF outputs already on disk|
-| **Python API** | Custom scripts, notebooks, tests | `run_casida_in_memory`, `CasidaKS_MPI` |
+| **CLI** (`casidapy-run`) | Single system; SCF outputs already on disk | `casidapy-run` / `scripts/run_casida.sh` |
+| **Python API (PW)** | QE / DFTpy grid orbitals | `run_casida_in_memory`, `CasidaKS_MPI` |
+| **Python API (GTO)** | PySCF / QMLearn MO ground states | `run_casida`, `GTOKernel` |
 | **eDFTpy embedded** | Multi-fragment embedding + inter-fragment coupling | `python -m edftpy input.ini` |
 
 Step-by-step H₂O tutorials: `tutorials/h2o_tddft_approach1_highlevel.ipynb` (one-call) and `tutorials/h2o_tddft_approach2_stepwise.ipynb` (explicit stages).
@@ -164,6 +163,36 @@ results = run_casida_in_memory(inputs, opts, comm=comm)
 
 Set `use_eDFTpy=True` when called from an eDFTpy fragment driver (charge grid, MPI-safe density broadcast).
 
+### Kernel backends (plane-wave vs GTO)
+
+Casida algebra (TDA/RPA eigensolve) is shared. Coupling ``K`` is provided by a backend:
+
+| `CasidaOptions.basis` | Kernel | Ground state |
+|-----------------------|--------|--------------|
+| `"pw"` (default) | `PlaneWaveKernel` | QE / DFTpy real-space grid |
+| `"gto"` | `GTOKernel` | PySCF / QMLearn MO coefficients |
+
+**Plane-wave** (existing path) — unchanged:
+
+```python
+results = run_casida_in_memory(inputs, opts)  # basis="pw"
+```
+
+**GTO** (molecular AO/MO) — build a kernel from PySCF, then:
+
+```python
+from casidapy import extract_gto_kernel, run_casida
+
+kernel, opts = extract_gto_kernel(
+    mf, n_occ=None, n_unocc=None, n_states=10, tda=True, xc="pbe",
+)
+results = run_casida(kernel, opts)
+```
+
+`GTOKernel` delegates the coupling to PySCF `mf.gen_response`, so it matches PySCF TDDFT exactly: Coulomb, singlet-adapted adiabatic f_xc, and exact exchange for hybrid / range-separated functionals (e.g. `pbe0`, `b3lyp`, `cam-b3lyp`). A plain RHF ground state gives CIS. Hybrids require `tda=True` (the matrix-free RPA chain assumes `A - B = diag(dE)`, which exact exchange breaks); pure functionals support both TDA and full Casida. Density fitting is used when `use_df=True`. GPU support is deferred.
+
+**Performance:** when `n_trans <= k_cache_max` (default 4096), `setup()` precomputes the full K matrix using batched `gen_response` calls — a few AO-integral passes total instead of one per solver iteration — after which every matvec is a DGEMM. For larger active spaces, matvecs are evaluated on the fly. PySCF's integrals and grid quadrature are OpenMP-threaded; set `OMP_NUM_THREADS` to the core count for intra-node parallelism (MPI does not help the GTO path). `GTOKernel.dense_K_rows` also plugs into the engine's MPI dense build (`build_matrices`), same as the plane-wave backend.
+
 ### Stepwise control (`CasidaKS_MPI`)
 
 See `tutorials/h2o_tddft_approach2_stepwise.ipynb` for the explicit sequence:
@@ -256,9 +285,14 @@ python -m casidapy.plot_uncoupled_spectrum --help
 ```
 casidapy/
   casida_api.py          # CasidaInputs, CasidaOptions, CasidaResults
-  casida_engine.py       # CasidaKS_MPI, run_casida_in_memory
+  casida_engine.py       # CasidaKS_MPI, run_casida_in_memory, run_casida
   casida_utils.py        # transitions, normalization, MPI helpers
+  kernels/
+    base.py              # KernelBackend protocol
+    plane_wave.py        # PlaneWaveKernel (FFT grid / QE)
+    gto.py               # GTOKernel (PySCF AO/MO)
   qepy_adapter.py        # extract_casida_inputs_from_qepy_driver, slice_active_space
+  pyscf_adapter.py       # extract_gto_kernel
   subsystem_coupling.py  # Pavanello coupling, run_subsystem_casida
   run_casida_parallel_generic.py  # casidapy-run CLI
   generate_inputs_qepy.py         # SCF export for standalone workflow

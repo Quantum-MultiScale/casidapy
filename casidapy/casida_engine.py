@@ -6,7 +6,6 @@ from typing import Any, Optional, Sequence
 import numpy as np
 from mpi4py import MPI
 
-from dftpy.field import DirectField
 from dftpy.functional import Functional, LocalPseudo, TotalFunctional
 from dftpy.ions import Ions
 from dftpy.time_data import timer
@@ -17,44 +16,31 @@ from scipy.sparse.linalg import LinearOperator
 from casidapy.casida_api import CasidaInputs, CasidaOptions, CasidaResults
 from casidapy.casida_of import build_of_functional_context
 from casidapy.casida_utils import (
-    _as_scalar_field_on_grid,
-    _compute_fxc_triplet_pylibxc,
     XC_TO_LIBXC_COMPONENTS,
-    build_energy_differences,
     build_initial_guess,
-    filtered,
     mpi_comm_rank,
     mpi_comm_size,
     normalize_wavefunctions,
     psi_to_fields,
-    proj_overlap,
-    rho_aug,
-    augmentation_integral,
 )
 from casidapy.davidson import davidson, solve_eigsh, solve_lobpcg
+from casidapy.kernels.plane_wave import PlaneWaveKernel
 from casidapy.qepy_adapter import slice_active_space
 
 
 class CasidaKS_MPI:
-    """Casida equation solver with MPI parallelization (CPU only)."""
+    """Casida equation solver with MPI parallelization (CPU).
+
+    Plane-wave / real-space kernel work is delegated to
+    :class:`~casidapy.kernels.plane_wave.PlaneWaveKernel`.  The public API
+    (``set_active_orbitals``, ``setup_matrix_free``, ``solve_*``, …) is unchanged.
+    """
 
     def __init__(self, rho_ks, xc_functional, polarized=False,
                  rho_cutoff=1e-3, fxc_max=20.0, use_gpu=False,
                  spin_state="singlet", libxc_xc_components=None, comm=None,
                  use_uspp=False, beta_projectors=None, qij_augmentation=None,
-                 use_eDFTpy=False):
-        self.rho = rho_ks
-        self.grid = rho_ks.grid
-        self._grid_shape = self.grid.nr
-        self.N = float(rho_ks.integral())
-        self.polarized = bool(polarized)
-
-        self.use_uspp = bool(use_uspp) and beta_projectors is not None
-        self.beta_projectors = beta_projectors
-        self.qij_augmentation = qij_augmentation
-
-        self.use_eDFTpy = bool(use_eDFTpy)
-        self.transition_densities = None
+                 use_eDFTpy=False, kernel=None):
         if comm is None:
             self.comm = MPI.COMM_WORLD
         else:
@@ -62,31 +48,41 @@ class CasidaKS_MPI:
         self.rank = mpi_comm_rank(self.comm)
         self.size = mpi_comm_size(self.comm)
 
-        self.hartree = Functional(type="HARTREE")
-        self.functional = xc_functional
-
-        spin_state = spin_state.lower()
-        if spin_state not in ("singlet", "triplet"):
-            raise ValueError(f"spin_state must be 'singlet' or 'triplet', got '{spin_state}'")
-        self.triplet = (spin_state == "triplet")
-
-        if self.triplet:
-            if libxc_xc_components is None:
-                raise ValueError(
-                    "libxc_xc_components must be specified for triplet calculations."
-                )
-            component_names = list(libxc_xc_components)
-            f_xc_T = _compute_fxc_triplet_pylibxc(rho_ks, component_names, self.grid)
-            fxc_arr = filtered(f_xc_T, fxc_max, rho_ks, rho_cutoff)
-            self.fkxc_arr = DirectField(self.grid, rank=1, griddata_3d=fxc_arr)
+        if kernel is not None:
+            self._kernel = kernel
         else:
-            self.fkxc_raw = xc_functional(rho_ks, calcType=["V2"]).v2rho2
-            fkxc = _as_scalar_field_on_grid(self.grid, self.fkxc_raw)
-            fxc_arr = filtered(fkxc, fxc_max, rho_ks, rho_cutoff)
-            self.fkxc_arr = DirectField(self.grid, rank=1, griddata_3d=fxc_arr)
+            self._kernel = PlaneWaveKernel(
+                rho_ks,
+                xc_functional,
+                polarized=polarized,
+                rho_cutoff=rho_cutoff,
+                fxc_max=fxc_max,
+                spin_state=spin_state,
+                libxc_xc_components=libxc_xc_components,
+                use_uspp=use_uspp,
+                beta_projectors=beta_projectors,
+                qij_augmentation=qij_augmentation,
+                use_eDFTpy=use_eDFTpy,
+                verbose=(self.rank == 0),
+            )
 
+        # Mirror kernel attributes for backward-compatible access
+        self.rho = getattr(self._kernel, "rho", None)
+        self.grid = getattr(self._kernel, "grid", None)
+        self._grid_shape = getattr(self._kernel, "_grid_shape", None)
+        self.N = float(self.rho.integral()) if self.rho is not None else 0.0
+        self.polarized = bool(getattr(self._kernel, "polarized", polarized))
+        self.use_uspp = bool(getattr(self._kernel, "use_uspp", False))
+        self.beta_projectors = getattr(self._kernel, "beta_projectors", None)
+        self.qij_augmentation = getattr(self._kernel, "qij_augmentation", None)
+        self.use_eDFTpy = bool(getattr(self._kernel, "use_eDFTpy", False))
+        self.transition_densities = None
+        self.hartree = getattr(self._kernel, "hartree", None)
+        self.functional = getattr(self._kernel, "functional", xc_functional)
+        self.triplet = bool(getattr(self._kernel, "triplet", False))
+        self.fkxc_arr = getattr(self._kernel, "fkxc_arr", None)
         self.fkxc = self.fkxc_arr
-        self._fkxc_ndarray = np.asarray(fxc_arr)
+        self._fkxc_ndarray = getattr(self._kernel, "_fkxc_ndarray", None)
 
         self.A = None
         self.B = None
@@ -98,6 +94,8 @@ class CasidaKS_MPI:
         self.mu_transition = None
         self.d_mode = None
         self.tda = False
+        self.n_occ = 0
+        self.n_unocc = 0
 
     def set_active_orbitals(self, occ_eigs, unocc_eigs, psi_occ, psi_unocc):
         """Store pre-sliced active occupied/unoccupied orbital sets.
@@ -105,88 +103,29 @@ class CasidaKS_MPI:
         Use ``qepy_adapter.slice_active_space`` to obtain the four arguments
         from full KS arrays before calling this method.
         """
-        self._occ_e = np.asarray(occ_eigs, dtype=float).copy()
-        self._unocc_e = np.asarray(unocc_eigs, dtype=float).copy()
-        self._psi_occ = list(psi_occ)
-        self._psi_unocc = list(psi_unocc)
-        self._n_occ = len(self._psi_occ)
-        self._n_unocc = len(self._psi_unocc)
+        self._kernel.set_active_orbitals(occ_eigs, unocc_eigs, psi_occ, psi_unocc)
+        self._occ_e = self._kernel._occ_e
+        self._unocc_e = self._kernel._unocc_e
+        self._psi_occ = self._kernel._psi_occ
+        self._psi_unocc = self._kernel._psi_unocc
+        self._n_occ = self._kernel.n_occ
+        self._n_unocc = self._kernel.n_unocc
         self.n_occ = self._n_occ
         self.n_unocc = self._n_unocc
-
-        self._proj_occ = None
-        self._proj_unocc = None
-        if self.use_uspp:
-            self._proj_occ = proj_overlap(self.beta_projectors, self.grid, self._psi_occ)
-            self._proj_unocc = proj_overlap(self.beta_projectors, self.grid, self._psi_unocc)
+        self._proj_occ = getattr(self._kernel, "_proj_occ", None)
+        self._proj_unocc = getattr(self._kernel, "_proj_unocc", None)
 
     def transition_orbital(self, psi_i, psi_a, proj_i=None, proj_a=None):
         """Transition density ψ_i* ψ_a + USPP augmentation if enabled."""
-        phi = psi_i.conj() * psi_a
-        if self.use_uspp and proj_i is not None and proj_a is not None:
-            phi = phi + rho_aug(self.grid, self.qij_augmentation, proj_i, proj_a)
-        return phi
+        return self._kernel.transition_orbital(psi_i, psi_a, proj_i=proj_i, proj_a=proj_a)
 
     def _hartree_potential(self, rho):
         """Compute Hartree potential from density."""
-        if np.iscomplexobj(np.asarray(rho)):
-            rho = rho.real
-        return self.hartree(rho, calcType=["V"]).potential
+        return self._kernel._hartree_potential(rho)
 
-    def _kernel_element_cpu(self, phi_ia, phi_jb, vh_ia,
-                            proj_i=None, proj_a=None, proj_j=None, proj_b=None):
-        """Compute kernel matrix element K[ia,jb] on CPU with optional USPP augmentation."""
-        xc_part = (phi_ia.conj() * self.fkxc_arr * phi_jb).integral()
-        if vh_ia is not None:
-            hartree_part = (phi_jb.conj() * vh_ia).integral()
-            k_val = hartree_part + xc_part
-        else:
-            k_val = xc_part
-
-        if self.use_uspp and proj_j is not None and proj_b is not None:
-            dV = float(self.grid.dV)
-            response = np.asarray(self.fkxc_arr) * np.asarray(phi_ia)
-            if vh_ia is not None:
-                response = np.asarray(vh_ia) + response
-            aug_corr = augmentation_integral(
-                response, self.qij_augmentation, proj_j, proj_b, dV
-            )
-            k_val = float(k_val) + aug_corr
-
-        return float(k_val)
-
-    def _dipole_matrix(self, psi_occ, psi_unocc):
-        """Transition dipole matrix elements mu_ia^alpha with optional USPP augmentation."""
-        n_o = len(psi_occ)
-        n_u = len(psi_unocc)
-        dV = float(self.grid.dV)
-
-        # μ[ia, α] = dV Σ_r ψ_i(r) r_α(r) ψ_a(r)
-        # BLAS:  mu_α = (psi_o * r_α) @ psi_u.T * dV  (n_o, n_u)
-        psi_o = np.stack([np.asarray(p).ravel() for p in psi_occ])   # (n_o, n_grid)
-        psi_u = np.stack([np.asarray(p).ravel() for p in psi_unocc]) # (n_u, n_grid)
-        rx = np.asarray(self.grid.r[0]).ravel()
-        ry = np.asarray(self.grid.r[1]).ravel()
-        rz = np.asarray(self.grid.r[2]).ravel()
-
-        mu_x = (psi_o * rx) @ psi_u.T * dV  # (n_o, n_u)
-        mu_y = (psi_o * ry) @ psi_u.T * dV
-        mu_z = (psi_o * rz) @ psi_u.T * dV
-        mu = np.stack([mu_x.ravel(), mu_y.ravel(), mu_z.ravel()], axis=-1)  # (n_trans, 3)
-
-        if self.use_uspp and self._proj_occ is not None:
-            for i in range(n_o):
-                for a in range(n_u):
-                    ia = i * n_u + a
-                    p_i = self._proj_occ[:, i]
-                    p_a = self._proj_unocc[:, a]
-                    rho_a = rho_aug(self.grid, self.qij_augmentation, p_i, p_a)
-                    rho_arr = np.asarray(rho_a).ravel()
-                    mu[ia, 0] += float(np.dot(rx, rho_arr).real * dV)
-                    mu[ia, 1] += float(np.dot(ry, rho_arr).real * dV)
-                    mu[ia, 2] += float(np.dot(rz, rho_arr).real * dV)
-
-        return mu
+    def _dipole_matrix(self, psi_occ=None, psi_unocc=None):
+        """Transition dipole matrix elements (delegates to plane-wave kernel)."""
+        return self._kernel.dipole_matrix()
 
     def oscillator_strengths(
         self,
@@ -209,10 +148,8 @@ class CasidaKS_MPI:
                 k=k, use_davidson=use_davidson, davidson_tol=davidson_tol, verbose=verbose
             )
 
-        if not hasattr(self, "_psi_occ") or not hasattr(self, "_psi_unocc"):
+        if self._kernel.n_occ == 0:
             raise RuntimeError("Call build_matrices(...) or setup_matrix_free(...) first.")
-        psi_occ = self._psi_occ
-        psi_unocc = self._psi_unocc
 
         if self.triplet:
             n_states = len(self.omega)
@@ -221,7 +158,7 @@ class CasidaKS_MPI:
             self.d_mode = None
             return self.f
 
-        mu = self._dipole_matrix(psi_occ, psi_unocc)
+        mu = self._kernel.dipole_matrix()
         self.mu_transition = mu
 
         if self.tda:
@@ -232,22 +169,12 @@ class CasidaKS_MPI:
 
         d2 = np.sum(d * d, axis=0)
         f = (2.0 / 3.0) * self.omega * d2
-        s = float(np.sum(f))
-        #if s > 0.0:
-        #    f = f / s
         self.f = f
         return f
 
     def collapse_transition_densities_to_state_basis(self, k: int) -> Optional[np.ndarray]:
-        """ρ_k(r) = Σ_ia amp_ia,k φ_ia(r); amp = Z (TDA) or xpy (RPA).
-
-        Non-USPP path: vectorized loop over occupied orbitals — one DGEMM per i,
-        so only n_occ iterations instead of n_occ * n_unocc.  USPP path falls back
-        to the original element-wise loop (augmentation charge per pair).
-        """
+        """ρ_k(r) = Σ_ia amp_ia,k φ_ia(r); amp = Z (TDA) or xpy (RPA)."""
         if not getattr(self, "use_eDFTpy", False):
-            return None
-        if not hasattr(self, "_psi_occ"):
             return None
         if self.tda:
             amp = np.real(np.asarray(self.Z[:, :k], dtype=float))
@@ -257,184 +184,44 @@ class CasidaKS_MPI:
                     "RPA requires xpy before collapsing transition densities",
                 )
             amp = np.real(np.asarray(self.xpy[:, :k], dtype=float))
-        n_trans, n_states = amp.shape
-        n_unocc = self._n_unocc
-
-        use_fast = (
-            hasattr(self, "_psi_occ_arr")
-            and not (self.use_uspp and self._proj_occ is not None)
-        )
-        if use_fast:
-            # φ_k(r) = Σ_i ψ_i(r) · [Σ_a amp[i,a,k] ψ_a(r)]
-            # loop over i only; inner sum is a DGEMM.
-            n_flat = self._psi_occ_arr.shape[1]
-            amp_3d = amp.reshape(self._n_occ, n_unocc, n_states)  # (n_occ, n_unocc, n_states)
-            phi_flat = np.zeros((n_states, n_flat), dtype=np.float64)
-            for i in range(self._n_occ):
-                # c_i[k, r] = Σ_a amp[i,a,k] * ψ_a(r)  →  DGEMM (n_states, n_flat)
-                c_i = amp_3d[i].T @ self._psi_unocc_arr
-                phi_flat += c_i * self._psi_occ_arr[i]
-            return phi_flat.reshape((n_states, *self._grid_shape))
-
-        # Fallback: original per-(i,a) loop; handles USPP augmentation.
-        phi_states = None
-        for i in range(self._n_occ):
-            for a in range(n_unocc):
-                ia = i * n_unocc + a
-                row = amp[ia]
-                if not np.any(row):
-                    continue
-                p_i = self._proj_occ[:, i] if (self.use_uspp and self._proj_occ is not None) else None
-                p_a = self._proj_unocc[:, a] if (self.use_uspp and self._proj_unocc is not None) else None
-                phi_ia = np.real(
-                    np.asarray(
-                        self.transition_orbital(
-                            self._psi_occ[i], self._psi_unocc[a], proj_i=p_i, proj_a=p_a,
-                        )
-                    )
-                ).astype(float)
-                if phi_states is None:
-                    phi_states = [np.zeros_like(phi_ia) for _ in range(n_states)]
-                for state_k in range(n_states):
-                    c = row[state_k]
-                    if c != 0.0:
-                        phi_states[state_k] += c * phi_ia
-        if phi_states is None:
-            return None
-        return np.stack(phi_states, axis=0)  # (n_states, nx, ny, nz)
+        # Sync caches from kernel after setup_matrix_free
+        self._psi_occ_arr = getattr(self._kernel, "_psi_occ_arr", None)
+        self._psi_unocc_arr = getattr(self._kernel, "_psi_unocc_arr", None)
+        self._grid_shape = getattr(self._kernel, "_grid_shape", self._grid_shape)
+        return self._kernel.collapse_transition_densities_to_state_basis(amp)
 
     # --- Matrix-free Casida (LOBPCG / eigsh on matvec) ---
 
     def setup_matrix_free(self, tda: bool = False):
-        if self.polarized:
-            raise NotImplementedError("Spin-polarized Casida not implemented.")
-        if not hasattr(self, "_occ_e") or not hasattr(self, "_psi_occ"):
-            raise RuntimeError("Call set_active_orbitals() first.")
-
-        self._n_trans = self._n_occ * self._n_unocc
+        self._kernel.setup(tda=tda)
         self.tda = tda
-
-        self._dE = build_energy_differences(self._occ_e, self._unocc_e)
-
-        if np.any(self._dE <= 0.0):
-            raise ValueError("Found non-positive excitation energies. Check orbital ordering.")
-
+        self._n_trans = self._kernel.n_trans
+        self._dE = self._kernel.diagonal_dE()
         self._sqrt_dE = np.sqrt(self._dE)
-        self._dV = float(self.grid.dV)
-        self._grid_shape = self.grid.nr
-
-        # Keep the USPP projector overlaps computed in set_active_orbitals.
-        # Previously these were reset to None here, which silently disabled the
-        # USPP augmentation branches in the matvec (they are gated on
-        # ``_proj_occ is not None``). Recompute defensively if missing.
-        if self.use_uspp and getattr(self, "_proj_occ", None) is None:
-            self._proj_occ = proj_overlap(self.beta_projectors, self.grid, self._psi_occ)
-            self._proj_unocc = proj_overlap(self.beta_projectors, self.grid, self._psi_unocc)
-
-        # Pre-cache flat orbital arrays so the hot matvec loop avoids repeated
-        # np.asarray() calls and can use BLAS DGEMM instead of Python loops.
-        n_flat = int(np.prod(self._grid_shape))
-        self._psi_occ_arr = np.empty((self._n_occ, n_flat), dtype=np.float64)
-        self._psi_unocc_arr = np.empty((self._n_unocc, n_flat), dtype=np.float64)
-        for _i, _p in enumerate(self._psi_occ):
-            self._psi_occ_arr[_i] = np.asarray(_p).ravel()
-        for _a, _p in enumerate(self._psi_unocc):
-            self._psi_unocc_arr[_a] = np.asarray(_p).ravel()
-
+        self._dV = getattr(self._kernel, "_dV", None)
+        self._grid_shape = getattr(self._kernel, "_grid_shape", None)
+        self._psi_occ_arr = getattr(self._kernel, "_psi_occ_arr", None)
+        self._psi_unocc_arr = getattr(self._kernel, "_psi_unocc_arr", None)
+        self._proj_occ = getattr(self._kernel, "_proj_occ", None)
+        self._proj_unocc = getattr(self._kernel, "_proj_unocc", None)
         self._matrix_free = True
 
-        # NOTE: transition densities are NOT materialized here. The matvec
-        # (`_apply_K_matvec`) recomputes φ_ia on the fly from the active
-        # orbitals, and `collapse_transition_densities_to_state_basis` does the
-        # same at the end. Storing all Ntrans full-grid arrays (replicated on
-        # every rank) was the dominant memory cost and is unnecessary.
-
         if self.rank == 0:
-            n_grid = np.prod(self._grid_shape)
-            wfn_mem = (self._n_occ + self._n_unocc) * n_grid * 8 / 1e9
+            n_grid = int(np.prod(self._grid_shape)) if self._grid_shape is not None else 0
+            wfn_mem = (self._n_occ + self._n_unocc) * n_grid * 8 / 1e9 if n_grid else 0.0
             matrix_mem = self._n_trans ** 2 * 8 / 1e9
             print("Matrix-free mode initialized:")
+            print(f"  Backend: {type(self._kernel).__name__}")
             print(f"  Transitions: {self._n_occ} occ × {self._n_unocc} unocc = {self._n_trans}")
-            print(f"  Grid: {self._grid_shape} = {n_grid:,} points")
-            print(f"  Wavefunction memory: {wfn_mem:.2f} GB")
+            if self._grid_shape is not None:
+                print(f"  Grid: {self._grid_shape} = {n_grid:,} points")
+                print(f"  Wavefunction memory: {wfn_mem:.2f} GB")
             print(f"  (Full matrix would be: {matrix_mem:.2f} GB)")
             print(f"  TDA: {tda}, CPU only")
 
     def _apply_K_matvec(self, v):
-        """
-        Apply the eh coupling block ``K`` to a transition vector ``v`` (length Ntrans) without
-        forming ``K`` explicitly.
-
-        Indexing: ``ia = i * n_unocc + a`` for occupied ``i`` and unoccupied ``a``.  ``K`` is the
-        Hartree + adiabatic ``f_xc`` (singlet) or ``f_xc`` only (triplet) kernel between
-        transition densities ``φ_i^* φ_a``.
-
-        Both the rho_v accumulation and the Kv projection are done as BLAS DGEMMs using
-        pre-cached flat orbital arrays (_psi_occ_arr, _psi_unocc_arr) set up in
-        setup_matrix_free().  Python loops are kept only for the USPP augmentation path.
-        """
-        Ntrans = self._n_trans
-        n_occ = self._n_occ
-        n_unocc = self._n_unocc
-        v_arr = np.asarray(v, dtype=np.float64)
-
-        # ρ_v(r) = Σ_{jb} v[jb] ψ_j(r) ψ_b(r)
-        # BLAS path:  V = v.reshape(n_occ, n_unocc)
-        #             w = V @ psi_unocc_arr      (n_occ, n_grid) DGEMM
-        #             rho_v = (psi_occ_arr * w).sum(axis=0)     (n_grid,)
-        V = v_arr.reshape(n_occ, n_unocc)
-        w = V @ self._psi_unocc_arr                       # (n_occ, n_grid)
-        rho_v_flat = (self._psi_occ_arr * w).sum(axis=0)  # (n_grid,)
-        rho_v = rho_v_flat.reshape(self._grid_shape)
-
-        if self.use_uspp and self._proj_occ is not None:
-            for j in range(n_occ):
-                for b in range(n_unocc):
-                    jb = j * n_unocc + b
-                    if abs(v_arr[jb]) < 1e-30:
-                        continue
-                    p_j = self._proj_occ[:, j]
-                    p_b = self._proj_unocc[:, b]
-                    rho_v += np.asarray(rho_aug(
-                        self.grid, self.qij_augmentation, p_j, p_b
-                    )) * v_arr[jb]
-
-        fkxc_arr = np.asarray(self._fkxc_ndarray)
-
-        if self.triplet:
-            response_flat = (fkxc_arr * rho_v).ravel()
-        else:
-            rho_v_field = DirectField(self.grid, rank=1, griddata_3d=rho_v)
-            vh_v = self._hartree_potential(rho_v_field)
-            response_flat = (np.asarray(vh_v) + fkxc_arr * rho_v).ravel()
-
-        # Kv[i,a] = dV Σ_r ψ_i(r) ψ_a(r) response(r), one DGEMM.
-        #
-        # IMPORTANT: this matvec must be collective-free. The matrix-free
-        # eigensolver (eigsh/lobpcg) runs independently and redundantly on every
-        # rank, and ARPACK's reverse-communication calls the matvec a
-        # *rank-dependent* number of times (different random initial guesses,
-        # non-bit-identical FP). Any MPI collective here (Allreduce) therefore
-        # deadlocks the moment two ranks' iteration counts diverge — which is
-        # exactly what hung the multi-rank runs. Each rank computes the full Kv
-        # itself; the cost is dominated by the per-rank Hartree FFT above, so
-        # distributing this trivial DGEMM bought nothing anyway.
-        Kv = (
-            (self._psi_occ_arr * response_flat) @ self._psi_unocc_arr.T * self._dV
-        ).ravel()
-
-        if self.use_uspp and self._proj_occ is not None:
-            for i in range(n_occ):
-                for a in range(n_unocc):
-                    ia = i * n_unocc + a
-                    p_i = self._proj_occ[:, i]
-                    p_a = self._proj_unocc[:, a]
-                    Kv[ia] += augmentation_integral(
-                        response_flat.reshape(self._grid_shape),
-                        self.qij_augmentation, p_i, p_a, self._dV
-                    )
-
-        return Kv
+        """Apply eh coupling ``K`` via the active kernel backend."""
+        return self._kernel.apply_K(v)
 
     def _apply_C_matvec(self, v):
         """
@@ -515,8 +302,17 @@ class CasidaKS_MPI:
             omega = np.sqrt(eigenvalues)
 
         if not self.tda:
-            inv_sqrt_dE = 1.0 / self._sqrt_dE
-            self.xpy = inv_sqrt_dE[:, None] * eigenvectors
+            # RPA excitation vector (X+Y), the quantity the transition dipole and
+            # transition density couple to:
+            #     (X+Y)_n = omega_n^{-1/2} (A-B)^{1/2} Z_n = omega_n^{-1/2} sqrt(dE) Z_n
+            # (for pure DFT, A-B = diag(dE)). The previous code used
+            # (A-B)^{-1/2} Z = inv_sqrt_dE * Z, which is proportional to (X-Y), not
+            # (X+Y): it weights by 1/sqrt(dE) instead of sqrt(dE), over-weighting
+            # small-gap transitions and inflating oscillator strengths (and the
+            # amplitude-basis transition densities used in subsystem coupling) by
+            # ~1/omega. This form reduces correctly to the TDA result as K->0.
+            omega_safe = np.sqrt(np.maximum(omega, 1e-30))
+            self.xpy = (self._sqrt_dE[:, None] * eigenvectors) / omega_safe[None, :]
 
         self.omega = omega
         self.Z = eigenvectors
@@ -532,80 +328,33 @@ class CasidaKS_MPI:
 
     @timer("Casida Matrix (MPI)")
     def build_matrices(self, tda: bool = False):
+        """Dense Casida build: MPI row distribution + A/B/C assembly.
+
+        The basis-specific K rows (transition densities, Hartree + f_xc,
+        USPP augmentation) are computed by the kernel backend.
+        """
         if self.polarized:
             raise NotImplementedError("Spin-polarized Casida not implemented.")
         if not hasattr(self, "_occ_e") or not hasattr(self, "_psi_occ"):
             raise RuntimeError("Call set_active_orbitals() first.")
 
-        occ_e = self._occ_e
-        unocc_e = self._unocc_e
-        psi_occ = self._psi_occ
-        psi_unocc = self._psi_unocc
-
-        n_o = len(psi_occ)
-        n_u = len(psi_unocc)
-        Ntrans = n_o * n_u
+        n_o = self._kernel.n_occ
+        n_u = self._kernel.n_unocc
+        Ntrans = self._kernel.n_trans
 
         if self.rank == 0:
             print(f"Building Casida matrices: {n_o} occ x {n_u} unocc = {Ntrans} transitions")
             print(f"MPI ranks: {self.size} (CPU only)")
 
-        dE = np.zeros(Ntrans, dtype=float)
-        for i in range(n_o):
-            for a in range(n_u):
-                dE[i * n_u + a] = unocc_e[a] - occ_e[i]
-
+        dE = self._kernel.diagonal_dE()
         if np.any(dE <= 0.0):
             raise ValueError("Found non-positive excitation energies. Check orbital ordering.")
 
-        phi_list = []
-        proj_map = []
-        for i in range(n_o):
-            for a in range(n_u):
-                p_i = self._proj_occ[:, i] if self.use_uspp else None
-                p_a = self._proj_unocc[:, a] if self.use_uspp else None
-                phi_ia = self.transition_orbital(psi_occ[i], psi_unocc[a], proj_i=p_i, proj_a=p_a)
-                phi_list.append(phi_ia)
-                proj_map.append((p_i, p_a))
-
-        if self.use_eDFTpy:
-            self.transition_densities = phi_list
-
-        # Pre-flatten all transition densities for vectorized row construction (non-USPP).
-        phi_flat = np.stack([np.asarray(f).ravel() for f in phi_list])  # (Ntrans, n_grid)
-        fkxc_flat = np.asarray(self.fkxc_arr).ravel()                   # (n_grid,)
-        dV = float(self.grid.dV)
-
         local_rows = [ia for ia in range(Ntrans) if ia % self.size == self.rank]
         n_local = len(local_rows)
-        K_local = np.zeros((n_local, Ntrans), dtype=float)
-
-        for local_idx, ia in enumerate(local_rows):
-            if self.rank == 0 and local_idx % 10 == 0:
-                print(f"  Rank 0: row {local_idx}/{n_local}")
-
-            if self.triplet:
-                vh_ia = None
-            else:
-                vh_ia = self._hartree_potential(phi_list[ia])
-
-            if not self.use_uspp:
-                # Vectorized: replace inner jb loop with two DGEMV operations.
-                # XC row: K_xc[jb] = dV Σ_r phi_ia[r] fkxc[r] phi_jb[r]
-                xc_row = (phi_flat[ia] * fkxc_flat) @ phi_flat.T * dV     # (Ntrans,)
-                if vh_ia is not None:
-                    hartree_row = phi_flat @ np.asarray(vh_ia).ravel() * dV  # (Ntrans,)
-                    K_local[local_idx, :] = hartree_row + xc_row
-                else:
-                    K_local[local_idx, :] = xc_row
-            else:
-                for jb in range(Ntrans):
-                    pj_i, pj_a = proj_map[jb]
-                    K_local[local_idx, jb] = self._kernel_element_cpu(
-                        phi_list[ia], phi_list[jb], vh_ia,
-                        proj_i=proj_map[ia][0], proj_a=proj_map[ia][1],
-                        proj_j=pj_i, proj_b=pj_a,
-                    )
+        K_local = self._kernel.dense_K_rows(local_rows, verbose=(self.rank == 0))
+        if self.use_eDFTpy:
+            self.transition_densities = self._kernel.transition_densities
 
         self.comm.gather(n_local, root=0)
         if self.rank == 0:
@@ -717,13 +466,16 @@ class CasidaKS_MPI:
             omega = np.sqrt(w2)
 
         if not self.tda:
+            # (X+Y)_n = omega_n^{-1/2} (A-B)^{1/2} Z_n  (see solve_matrix_free note).
+            # Build (A-B)^{1/2} from the stored A-B eigendecomposition, then scale
+            # each column by omega_n^{-1/2}. The previous code used (A-B)^{-1/2},
+            # which is proportional to (X-Y) and inflated intensities by ~1/omega.
             s = self._AmB_evals
             U = self._AmB_evecs
-            s_clip = np.where(s > 1e-14, s, np.inf)
-            inv_sqrt_s = 1.0 / np.sqrt(s_clip)
-            inv_sqrt_s = np.where(np.isfinite(inv_sqrt_s), inv_sqrt_s, 0.0)
-            inv_sqrt_AmB = (U * inv_sqrt_s) @ U.T
-            self.xpy = inv_sqrt_AmB @ Z
+            sqrt_s = np.sqrt(np.maximum(s, 0.0))
+            sqrt_AmB = (U * sqrt_s) @ U.T
+            omega_safe = np.sqrt(np.maximum(omega, 1e-30))
+            self.xpy = (sqrt_AmB @ Z) / omega_safe[None, :]
 
         self.omega = omega
         self.Z = Z
@@ -737,7 +489,155 @@ class CasidaKS_MPI:
         return omega, f, Z
 
 
+def run_casida(
+    kernel,
+    options: CasidaOptions,
+    comm=None,
+) -> CasidaResults:
+    """Solve Casida using a pre-built kernel backend (PW or GTO).
+
+    Typical GTO usage::
+
+        from casidapy.pyscf_adapter import extract_gto_kernel
+        from casidapy.casida_engine import run_casida
+
+        kernel, opts = extract_gto_kernel(mf, n_states=10, tda=True)
+        results = run_casida(kernel, opts)
+    """
+    from casidapy.kernels.gto import GTOKernel
+    from casidapy.kernels.plane_wave import PlaneWaveKernel
+
+    comm = MPI.COMM_WORLD if comm is None else comm
+    rank = mpi_comm_rank(comm)
+
+    if not hasattr(kernel, "apply_K"):
+        raise TypeError("kernel must implement apply_K (KernelBackend protocol)")
+
+    # Algebra layer: reuse CasidaKS_MPI with an injected kernel.
+    # For GTO, pass a dummy rho/xc only if needed — inject kernel directly.
+    if isinstance(kernel, PlaneWaveKernel):
+        casida = CasidaKS_MPI(
+            kernel.rho,
+            kernel.functional,
+            comm=comm,
+            kernel=kernel,
+            use_eDFTpy=kernel.use_eDFTpy,
+            use_uspp=kernel.use_uspp,
+        )
+        # orbitals already on kernel
+        casida.set_active_orbitals(
+            kernel._occ_e, kernel._unocc_e, kernel._psi_occ, kernel._psi_unocc
+        )
+    elif isinstance(kernel, GTOKernel):
+        # Minimal shell: attach GTO kernel without PW fxc construction
+        casida = object.__new__(CasidaKS_MPI)
+        casida.comm = comm
+        casida.rank = rank
+        casida.size = mpi_comm_size(comm)
+        casida._kernel = kernel
+        casida.rho = None
+        casida.grid = None
+        casida._grid_shape = None
+        casida.N = 0.0
+        casida.polarized = False
+        casida.use_uspp = False
+        casida.beta_projectors = None
+        casida.qij_augmentation = None
+        casida.use_eDFTpy = False
+        casida.transition_densities = None
+        casida.hartree = None
+        casida.functional = None
+        casida.triplet = False
+        casida.fkxc_arr = None
+        casida.fkxc = None
+        casida._fkxc_ndarray = None
+        casida.A = casida.B = casida.C = None
+        casida.omega = casida.f = casida.xpy = casida.Z = None
+        casida.mu_transition = casida.d_mode = None
+        casida.tda = False
+        casida.n_occ = kernel.n_occ
+        casida.n_unocc = kernel.n_unocc
+        casida._n_occ = kernel.n_occ
+        casida._n_unocc = kernel.n_unocc
+        casida._occ_e = kernel._occ_e
+        casida._unocc_e = kernel._unocc_e
+        casida._psi_occ = []  # unused for GTO dipole path
+        casida._psi_unocc = []
+    else:
+        raise TypeError(f"Unsupported kernel type: {type(kernel)}")
+
+    n_trans = kernel.n_trans
+    n_states_actual = min(options.n_states, n_trans)
+
+    t0 = MPI.Wtime()
+    if not options.matrix_free and isinstance(kernel, GTOKernel):
+        # Dense GTO not implemented — force matrix-free
+        if rank == 0:
+            print("GTO backend: forcing matrix_free=True")
+        options.matrix_free = True
+
+    if options.matrix_free:
+        casida.setup_matrix_free(tda=options.tda)
+        t_build = MPI.Wtime() - t0
+        t1 = MPI.Wtime()
+        omega, Z = casida.solve_matrix_free(
+            k=n_states_actual,
+            tol=options.solver_tol,
+            maxiter=options.solver_maxiter,
+            verbose=1 if rank == 0 else 0,
+            method=options.solver_method,
+        )
+        t_solve = MPI.Wtime() - t1
+    else:
+        casida.build_matrices(tda=options.tda)
+        t_build = MPI.Wtime() - t0
+        t1 = MPI.Wtime()
+        omega, Z = casida.solve(k=n_states_actual)
+        t_solve = MPI.Wtime() - t1
+
+    f = casida.oscillator_strengths(k=n_states_actual)
+    rho_state = None
+    if isinstance(kernel, PlaneWaveKernel) and options.use_eDFTpy:
+        rho_state = casida.collapse_transition_densities_to_state_basis(n_states_actual)
+
+    return CasidaResults(
+        omega=np.asarray(omega),
+        f=np.asarray(f),
+        Z=np.asarray(Z),
+        mu_transition=None if casida.mu_transition is None else np.asarray(casida.mu_transition),
+        rho_transition=rho_state,
+        d_mode=None if casida.d_mode is None else np.asarray(casida.d_mode),
+        xpy=np.asarray(casida.xpy) if casida.xpy is not None else np.asarray(casida.Z),
+        metadata={
+            "basis": getattr(options, "basis", "pw"),
+            "kernel": type(kernel).__name__,
+            "n_trans": n_trans,
+            "n_states": n_states_actual,
+            "tda": options.tda,
+            "matrix_free": options.matrix_free,
+            "t_build": t_build,
+            "t_solve": t_solve,
+        },
+    )
+
+
 def run_casida_in_memory(inputs: CasidaInputs, options: CasidaOptions, comm=None) -> CasidaResults:
+    """Plane-wave Casida from :class:`CasidaInputs` (QE / DFTpy grid path).
+
+    For GTO / PySCF ground states use
+    :func:`run_casida` with a :class:`~casidapy.kernels.gto.GTOKernel`.
+    """
+    basis = getattr(options, "basis", "pw") or "pw"
+    if str(basis).lower() == "gto":
+        raise ValueError(
+            "options.basis='gto' requires run_casida(GTOKernel, options). "
+            "Use casidapy.pyscf_adapter.extract_gto_kernel(mf)."
+        )
+
+    return _run_casida_plane_wave(inputs, options, comm=comm)
+
+
+def _run_casida_plane_wave(inputs: CasidaInputs, options: CasidaOptions, comm=None) -> CasidaResults:
     comm = MPI.COMM_WORLD if comm is None else comm
     rank = comm.Get_rank()
 

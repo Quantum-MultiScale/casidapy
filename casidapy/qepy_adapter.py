@@ -313,7 +313,7 @@ def extract_casida_inputs_from_qepy_driver(
         use_eDFTpy=use_eDFTpy,
     )
     casida_inputs = CasidaInputs(
-        atoms=atoms.ions,
+        atoms=atoms,
         grid=grid_casida,
         rho_ks=rho_field,
         psi=psi_array,
