@@ -21,7 +21,8 @@ dependencies = [
 qepy = ["qepy"]
 libxc = ["pylibxc"]
 plotting = ["matplotlib"]
-all = ["qepy", "pylibxc", "matplotlib"]
+pyscf = ["pyscf"]
+all = ["qepy", "pylibxc", "matplotlib", "pyscf"]
 
 [project.scripts]
 casidapy-run = "casidapy.run_casida_parallel_generic:main"
