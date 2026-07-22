@@ -20,6 +20,7 @@ def extract_gto_kernel(
     use_df: bool = True,
     tda: bool = True,
     verbose: bool = False,
+    use_gpu: bool = False,
 ) -> Tuple[GTOKernel, CasidaOptions]:
     """Create a :class:`GTOKernel` and matching :class:`CasidaOptions` from ``mf``.
 
@@ -31,6 +32,9 @@ def extract_gto_kernel(
     - virtual window  = ``[n_total_occ, n_total_occ + n_unocc)``
 
     Defaults use the full occupied / virtual spaces.
+
+    ``use_gpu=True`` enables CuPy MO contractions / cached ``K @ v`` and, when
+    gpu4pyscf is installed, a GPU ``gen_response``.
     """
     mo_e = np.asarray(mf.mo_energy, dtype=float)
     mo_c = np.asarray(mf.mo_coeff, dtype=float)
@@ -68,6 +72,7 @@ def extract_gto_kernel(
         use_df=use_df,
         mf=mf,
         verbose=verbose,
+        use_gpu=use_gpu,
     )
     opts = CasidaOptions(
         n_occ=kernel.n_occ,
@@ -77,6 +82,7 @@ def extract_gto_kernel(
         tda=tda,
         matrix_free=True,
         solver_method="eigsh",
+        use_gpu=use_gpu,
         xc=str(xc_name),
         basis="gto",
         use_uspp=False,

@@ -5,6 +5,8 @@ Derived from the workflow in scripts/test.ipynb (Al FCC unit cell with QEpy).
 Tests here cover the utility and slicing logic without requiring QEpy/QE.
 """
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -250,6 +252,257 @@ class TestKernelBackends:
         opts.solver_method = "eigsh"
         with pytest.raises(NotImplementedError, match="requires TDA"):
             run_casida(kernel, opts)
+
+    def test_gto_apply_K_matmat_matches_columns(self):
+        """Batched matmat must match column-wise apply_K (LOBPCG block path)."""
+        pytest.importorskip("pyscf")
+        from pyscf import gto, dft
+        from casidapy.kernels.gto import GTOKernel
+
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="6-31g", verbose=0)
+        mf = dft.RKS(mol)
+        mf.xc = "pbe"
+        mf.kernel()
+        # Force on-the-fly response so we exercise batched gen_response
+        kernel = GTOKernel(
+            mol, mf.mo_coeff, mf.mo_energy, mf.mo_occ,
+            xc="pbe", use_df=False, mf=mf, k_cache_max=0, verbose=False,
+        )
+        kernel.setup(tda=True)
+        rng = np.random.default_rng(0)
+        V = rng.standard_normal((kernel.n_trans, 4))
+        KV_block = kernel.apply_K_matmat(V)
+        KV_cols = np.column_stack([kernel.apply_K(V[:, j]) for j in range(4)])
+        assert KV_block.shape == V.shape
+        assert np.allclose(KV_block, KV_cols, atol=1e-9)
+
+
+def _make_synthetic_pw_kernel(use_gpu=False):
+    """Small PlaneWaveKernel on a non-cubic DFTpy grid with Gaussian orbitals.
+
+    No QEpy needed; used to validate the spectral Hartree solve and the GPU
+    matvec path against the CPU reference.
+    """
+    from dftpy.grid import DirectGrid
+    from dftpy.field import DirectField
+    from dftpy.functional.xc import XC
+    from casidapy.kernels import PlaneWaveKernel
+
+    lattice = np.array([
+        [8.0, 0.4, 0.0],
+        [0.0, 9.0, 0.3],
+        [0.2, 0.0, 10.0],
+    ])
+    grid = DirectGrid(lattice=lattice, nr=[18, 20, 24])
+    r = np.asarray(grid.r)  # (3, nx, ny, nz)
+    center = lattice.sum(axis=0) / 2.0
+    dr2 = sum((r[k] - center[k]) ** 2 for k in range(3))
+
+    rho = np.exp(-dr2 / 2.0) + 0.02
+    rho_field = DirectField(grid, rank=1, griddata_3d=rho)
+
+    # Smooth, linearly independent "orbitals": Gaussian × low-order polynomials
+    def orb(fn):
+        arr = fn * np.exp(-dr2 / 3.0)
+        arr /= np.sqrt(np.sum(arr**2) * grid.dV)
+        return DirectField(grid, rank=1, griddata_3d=arr)
+
+    psi_occ = [orb(1.0), orb(r[0] - center[0])]
+    psi_unocc = [orb(r[1] - center[1]), orb(r[2] - center[2]),
+                 orb((r[0] - center[0]) * (r[1] - center[1]))]
+
+    kernel = PlaneWaveKernel(rho_field, XC(xc="PBE"), use_gpu=use_gpu)
+    kernel.set_active_orbitals(
+        [-0.5, -0.4], [0.1, 0.2, 0.3], psi_occ, psi_unocc
+    )
+    kernel.setup(tda=True)
+    return kernel, rho_field
+
+
+class TestGPUAcceleration:
+    """Spectral (4π/G²) Hartree and CuPy matvec parity checks."""
+
+    def test_spectral_hartree_matches_dftpy(self):
+        """numpy spectral Hartree must reproduce DFTpy's Hartree functional.
+
+        Validates FFT normalization and reciprocal-lattice conventions on a
+        non-orthogonal cell; this is the same code path the GPU uses via CuPy.
+        """
+        pytest.importorskip("dftpy")
+        kernel, rho_field = _make_synthetic_pw_kernel(use_gpu=False)
+
+        vh_ref = np.asarray(kernel._hartree_potential(rho_field))
+        vh_spec = kernel._hartree_spectral(np.asarray(rho_field), xp=np)
+
+        assert vh_spec.shape == vh_ref.shape
+        # Agreement is limited by FFT round-off differences between DFTpy's
+        # backend and numpy (~1e-9 relative); a convention error (transposed
+        # lattice, wrong normalization) would show up at O(1).
+        scale = np.max(np.abs(vh_ref))
+        assert np.max(np.abs(vh_spec - vh_ref)) < 1e-7 * max(scale, 1.0)
+
+    def test_gpu_apply_K_matches_cpu(self):
+        """GPU apply_K (CuPy DGEMMs + cuFFT Hartree) must match CPU apply_K."""
+        pytest.importorskip("dftpy")
+        cupy = pytest.importorskip("cupy")
+        try:
+            cupy.cuda.Device().compute_capability
+        except Exception:
+            pytest.skip("CuPy installed but no usable CUDA device")
+
+        kernel_cpu, _ = _make_synthetic_pw_kernel(use_gpu=False)
+        kernel_gpu, _ = _make_synthetic_pw_kernel(use_gpu=True)
+
+        rng = np.random.default_rng(42)
+        for _ in range(3):
+            v = rng.standard_normal(kernel_cpu.n_trans)
+            Kv_cpu = kernel_cpu.apply_K(v)
+            Kv_gpu = kernel_gpu.apply_K(v)
+            # CPU uses DFTpy's Hartree, GPU the spectral solve: agreement is
+            # limited by FFT round-off (~1e-9 relative), not by physics.
+            assert np.allclose(Kv_gpu, Kv_cpu, rtol=1e-6, atol=1e-8)
+
+    def test_use_gpu_without_cupy_raises(self):
+        """use_gpu=True must fail loudly (ImportError) when CuPy is missing."""
+        pytest.importorskip("dftpy")
+        try:
+            import cupy  # noqa: F401
+            pytest.skip("CuPy is installed; cannot test the missing-CuPy error")
+        except ImportError:
+            pass
+
+        with pytest.raises(ImportError, match="requires CuPy"):
+            _make_synthetic_pw_kernel(use_gpu=True)
+
+
+def _h2_rks(xc="pbe"):
+    from pyscf import gto, dft
+
+    mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="6-31g", verbose=0)
+    mf = dft.RKS(mol)
+    mf.xc = xc
+    mf.kernel()
+    return mf
+
+
+class TestGTOGPUAcceleration:
+    """GTO CuPy matvecs (option A) and optional gpu4pyscf response (option B)."""
+
+    def test_gto_use_gpu_without_cupy_raises(self):
+        pytest.importorskip("pyscf")
+        try:
+            import cupy  # noqa: F401
+            pytest.skip("CuPy is installed; cannot test the missing-CuPy error")
+        except ImportError:
+            pass
+        from casidapy.pyscf_adapter import extract_gto_kernel
+
+        mf = _h2_rks()
+        with pytest.raises(ImportError, match="requires CuPy"):
+            extract_gto_kernel(mf, n_states=2, tda=True, use_gpu=True)
+
+    def test_gto_gpu_cached_apply_K_matches_cpu(self):
+        """Cached K @ v on GPU must match the CPU DGEMM."""
+        pytest.importorskip("pyscf")
+        cupy = pytest.importorskip("cupy")
+        try:
+            cupy.cuda.Device().compute_capability
+        except Exception:
+            pytest.skip("CuPy installed but no usable CUDA device")
+
+        from casidapy.pyscf_adapter import extract_gto_kernel
+
+        mf = _h2_rks("pbe")
+        k_cpu, _ = extract_gto_kernel(
+            mf, n_states=2, tda=True, use_df=False, use_gpu=False, verbose=False
+        )
+        k_gpu, _ = extract_gto_kernel(
+            mf, n_states=2, tda=True, use_df=False, use_gpu=True, verbose=False
+        )
+        k_cpu.setup(tda=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            k_gpu.setup(tda=True)
+
+        assert k_cpu._K is not None and k_gpu._K_dev is not None
+        rng = np.random.default_rng(0)
+        for _ in range(3):
+            v = rng.standard_normal(k_cpu.n_trans)
+            assert np.allclose(k_gpu.apply_K(v), k_cpu.apply_K(v), atol=1e-10)
+
+    def test_gto_gpu_onthefly_apply_K_matches_cpu(self):
+        """On-the-fly path: GPU contractions (+ optional GPU response) vs CPU."""
+        pytest.importorskip("pyscf")
+        cupy = pytest.importorskip("cupy")
+        try:
+            cupy.cuda.Device().compute_capability
+        except Exception:
+            pytest.skip("CuPy installed but no usable CUDA device")
+
+        from casidapy.kernels.gto import GTOKernel
+
+        mf = _h2_rks("pbe0")
+        kwargs = dict(
+            mol=mf.mol,
+            mo_coeff=mf.mo_coeff,
+            mo_energy=mf.mo_energy,
+            mo_occ=mf.mo_occ,
+            xc="pbe0",
+            use_df=False,
+            mf=mf,
+            k_cache_max=0,  # force on-the-fly
+            verbose=False,
+        )
+        k_cpu = GTOKernel(**kwargs, use_gpu=False)
+        k_gpu = GTOKernel(**kwargs, use_gpu=True)
+        k_cpu.setup(tda=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            k_gpu.setup(tda=True)
+
+        rng = np.random.default_rng(1)
+        for _ in range(3):
+            v = rng.standard_normal(k_cpu.n_trans)
+            assert np.allclose(
+                k_gpu.apply_K(v), k_cpu.apply_K(v), rtol=1e-6, atol=1e-8
+            )
+
+    def test_gto_gpu4pyscf_response_parity(self):
+        """When gpu4pyscf is present, GPU response must match CPU gen_response."""
+        pytest.importorskip("pyscf")
+        pytest.importorskip("gpu4pyscf")
+        cupy = pytest.importorskip("cupy")
+        try:
+            cupy.cuda.Device().compute_capability
+        except Exception:
+            pytest.skip("CuPy installed but no usable CUDA device")
+
+        from casidapy.kernels.gto import GTOKernel
+
+        mf = _h2_rks("pbe")
+        kwargs = dict(
+            mol=mf.mol,
+            mo_coeff=mf.mo_coeff,
+            mo_energy=mf.mo_energy,
+            mo_occ=mf.mo_occ,
+            xc="pbe",
+            use_df=True,
+            mf=mf,
+            k_cache_max=0,
+            verbose=False,
+        )
+        k_cpu = GTOKernel(**kwargs, use_gpu=False)
+        k_gpu = GTOKernel(**kwargs, use_gpu=True)
+        k_cpu.setup(tda=True)
+        k_gpu.setup(tda=True)
+        if not k_gpu._gpu_response:
+            pytest.skip("gpu4pyscf imported but gen_response did not activate")
+
+        rng = np.random.default_rng(2)
+        v = rng.standard_normal(k_cpu.n_trans)
+        assert np.allclose(
+            k_gpu.apply_K(v), k_cpu.apply_K(v), rtol=1e-5, atol=1e-7
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -9,6 +9,14 @@ from casidapy.casida_engine import (
 from casidapy.kernels import KernelBackend, PlaneWaveKernel, GTOKernel
 from casidapy.qepy_adapter import slice_active_space, build_uspp_map_from_driver
 from casidapy.pyscf_adapter import extract_gto_kernel
+from casidapy.qed import (
+    QEDOptions,
+    QEDResults,
+    build_qed_tda_matrix,
+    solve_qed_tda,
+    scan_qed_tda,
+    scan_qed_lambda,
+)
 from casidapy.stddft_bridge import STDDFTBridge
 from casidapy.subsystem_coupling import (
     compute_nadd_kernel,
@@ -41,6 +49,12 @@ __all__ = [
     "slice_active_space",
     "build_uspp_map_from_driver",
     "extract_gto_kernel",
+    "QEDOptions",
+    "QEDResults",
+    "build_qed_tda_matrix",
+    "solve_qed_tda",
+    "scan_qed_tda",
+    "scan_qed_lambda",
     "compute_nadd_kernel",
     "compute_coupling_block",
     "assemble_coupled_casida",

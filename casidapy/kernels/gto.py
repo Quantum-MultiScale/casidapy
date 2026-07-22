@@ -7,9 +7,19 @@ fitting is used when ``use_df`` is set (via ``mf.density_fit()``).
 
 Hybrids are supported in TDA only: the matrix-free RPA chain assumes
 ``A - B = diag(dE)``, which does not hold once exact exchange enters ``B``.
+
+With ``use_gpu=True`` (requires CuPy):
+
+* Active MO blocks and a cached dense ``K`` are uploaded once; cached
+  ``apply_K`` becomes a device DGEMM.
+* On-the-fly matvecs do AO↔MO contractions on the GPU.
+* If gpu4pyscf is available, ``mf`` is moved to the device so
+  ``gen_response`` (J + f_xc + hybrid K) also runs on GPU; otherwise the
+  response stays on CPU and only our contractions / cached matvecs use CuPy.
 """
 from __future__ import annotations
 
+import warnings
 from typing import Any, Optional, Sequence
 
 import numpy as np
@@ -43,6 +53,9 @@ class GTOKernel:
         (one AO-integral pass per chunk instead of one per solver iteration);
         ``apply_K`` then reduces to a DGEMM. Memory: ``n_trans**2 * 8`` bytes
         (4096 -> 134 MB). Set to 0 to always evaluate matvecs on the fly.
+    use_gpu : bool
+        Accelerate MO contractions and cached ``K @ v`` with CuPy. When
+        gpu4pyscf is installed, also run ``gen_response`` on the GPU.
     """
 
     def __init__(
@@ -61,6 +74,7 @@ class GTOKernel:
         mf=None,
         verbose: bool = False,
         k_cache_max: int = 4096,
+        use_gpu: bool = False,
     ):
         try:
             from pyscf import dft, scf  # noqa: F401
@@ -115,6 +129,22 @@ class GTOKernel:
         self.k_cache_max = int(k_cache_max)
         self._K = None  # cached dense coupling matrix (n_trans, n_trans)
 
+        self.use_gpu = bool(use_gpu)
+        self._cp = None
+        self._gpu_response = False
+        self._C_o_dev = None
+        self._C_v_dev = None
+        self._K_dev = None
+        if self.use_gpu:
+            try:
+                import cupy
+            except ImportError as exc:
+                raise ImportError(
+                    "use_gpu=True requires CuPy (pip install cupy-cuda11x or "
+                    "cupy-cuda12x matching your CUDA toolkit)."
+                ) from exc
+            self._cp = cupy
+
     @property
     def n_occ(self) -> int:
         return self._n_occ
@@ -131,6 +161,48 @@ class GTOKernel:
         if self._dE is None:
             self._dE = build_energy_differences(self._occ_e, self._unocc_e)
         return self._dE
+
+    def _as_numpy(self, arr) -> np.ndarray:
+        """Host ndarray from numpy or cupy array."""
+        if self._cp is not None and isinstance(arr, self._cp.ndarray):
+            return self._cp.asnumpy(arr)
+        return np.asarray(arr)
+
+    def _move_mf_to_gpu(self, mf):
+        """Return a GPU mean-field (gpu4pyscf) or ``None`` if unavailable."""
+        # Prefer the recursive to_gpu() hook (PySCF >= 2.x + gpu4pyscf).
+        to_gpu = getattr(mf, "to_gpu", None)
+        if callable(to_gpu):
+            try:
+                return to_gpu()
+            except Exception as exc:
+                if self.verbose:
+                    warnings.warn(
+                        f"mf.to_gpu() failed ({exc}); trying gpu4pyscf.dft.rks"
+                    )
+
+        try:
+            from gpu4pyscf.dft import rks as gpu_rks
+        except ImportError:
+            return None
+
+        try:
+            gmf = gpu_rks.RKS(self.mol)
+            gmf.xc = getattr(mf, "xc", self.xc)
+            # MO data: gpu4pyscf expects cupy arrays on the GPU object.
+            cp = self._cp
+            gmf.mo_coeff = cp.asarray(self.mo_coeff)
+            gmf.mo_energy = cp.asarray(self.mo_energy)
+            gmf.mo_occ = cp.asarray(self.mo_occ)
+            if self.use_df:
+                gmf = gmf.density_fit()
+            if getattr(gmf, "grids", None) is not None:
+                gmf.grids.build()
+            return gmf
+        except Exception as exc:
+            if self.verbose:
+                warnings.warn(f"gpu4pyscf RKS setup failed ({exc})")
+            return None
 
     def setup(self, tda: bool = True) -> None:
         from pyscf import dft
@@ -172,7 +244,31 @@ class GTOKernel:
                 "Set tda=True (CasidaOptions.tda)."
             )
 
-        self._vresp = mf.gen_response(singlet=True, hermi=0)
+        self._gpu_response = False
+        if self.use_gpu:
+            gmf = self._move_mf_to_gpu(mf)
+            if gmf is not None and hasattr(gmf, "gen_response"):
+                try:
+                    self._vresp = gmf.gen_response(singlet=True, hermi=0)
+                    self._mf = gmf
+                    self._gpu_response = True
+                except Exception as exc:
+                    warnings.warn(
+                        f"gpu4pyscf gen_response unavailable ({exc}); "
+                        "using CPU response with GPU contractions / cached K."
+                    )
+                    self._vresp = mf.gen_response(singlet=True, hermi=0)
+            else:
+                warnings.warn(
+                    "gpu4pyscf not available or mf.to_gpu() failed; "
+                    "using CPU response with GPU contractions / cached K. "
+                    "Install with: pip install gpu4pyscf"
+                )
+                self._vresp = mf.gen_response(singlet=True, hermi=0)
+            self._C_o_dev = self._cp.asarray(self._C_o)
+            self._C_v_dev = self._cp.asarray(self._C_v)
+        else:
+            self._vresp = mf.gen_response(singlet=True, hermi=0)
 
         self._ready = True
         if self.verbose:
@@ -185,6 +281,11 @@ class GTOKernel:
                 f"  XC: {getattr(mf, 'xc', 'HF')}, hybrid: {self.hybrid}, "
                 f"DF: {getattr(mf, 'with_df', None) is not None}, TDA: {tda}"
             )
+            if self.use_gpu:
+                print(
+                    f"  GPU: CuPy contractions"
+                    f"{' + gpu4pyscf response' if self._gpu_response else ' (CPU response)'}"
+                )
 
         # Precompute dense K with batched response calls: a handful of
         # AO-integral passes up front instead of one per solver iteration.
@@ -193,12 +294,15 @@ class GTOKernel:
 
             t0 = time.time()
             self._K = self.dense_K_rows(range(self._n_trans))
+            if self.use_gpu:
+                self._K_dev = self._cp.asarray(self._K)
             if self.verbose:
                 mem = self._n_trans ** 2 * 8 / 1e6
                 print(
                     f"  Cached dense K ({self._n_trans}x{self._n_trans}, "
                     f"{mem:.0f} MB) in {time.time() - t0:.1f}s; "
-                    "matvecs are now DGEMMs."
+                    "matvecs are now DGEMMs"
+                    + (" on GPU." if self.use_gpu else ".")
                 )
 
     def _pair_dms(self, indices) -> np.ndarray:
@@ -216,11 +320,87 @@ class GTOKernel:
 
     def apply_K_batch(self, indices) -> np.ndarray:
         """K columns for unit vectors e_ia, ia in ``indices`` — one response call."""
-        v_ao = self._vresp(self._pair_dms(indices))
+        dms = self._pair_dms(indices)
+        if self._gpu_response:
+            dms = self._cp.asarray(dms)
+        v_ao = self._vresp(dms)
+        v_ao = self._as_numpy(v_ao)
         v_ao = v_ao.reshape(len(indices), *v_ao.shape[-2:])
+        # Prefer GPU MO back-contraction when CuPy is active.
+        if self.use_gpu and self._C_o_dev is not None:
+            cp = self._cp
+            C_o = self._C_o_dev
+            C_v = self._C_v_dev
+            out = cp.empty((len(indices), self._n_trans), dtype=float)
+            v_dev = cp.asarray(v_ao)
+            for x in range(len(indices)):
+                out[x] = (C_o.T @ v_dev[x].T @ C_v).ravel()
+            return cp.asnumpy(out)
+
         out = np.empty((len(indices), self._n_trans), dtype=float)
         for x in range(len(indices)):
             out[x] = (self._C_o.T @ v_ao[x].T @ self._C_v).ravel()
+        return out
+
+    def _transition_dms_from_block(self, V: np.ndarray) -> np.ndarray:
+        """Stack of AO transition DMs for columns of ``V`` ``(n_trans, k)``.
+
+        ``dm[j] = 2 C_v @ V[:,j].reshape(n_occ, n_unocc).T @ C_o.T``
+        (PySCF closed-shell TDA convention).
+        """
+        n_o, n_v = self._n_occ, self._n_unocc
+        k = V.shape[1]
+        W = V.reshape(n_o, n_v, k)  # W[i,a,j]
+        # tmp[a,j,q] = Σ_i W[i,a,j] C_o[q,i]
+        tmp = np.einsum("iaj,qi->ajq", W, self._C_o, optimize=True)
+        # dm[j,p,q] = 2 Σ_a C_v[p,a] tmp[a,j,q]
+        return 2.0 * np.einsum("pa,ajq->jpq", self._C_v, tmp, optimize=True)
+
+    def apply_K_matmat(self, V: np.ndarray) -> np.ndarray:
+        """Apply ``K`` to a block ``V`` of shape ``(n_trans, k)``.
+
+        One batched ``gen_response`` call for the whole block (LOBPCG's natural
+        width). With a cached dense ``K`` this is a single DGEMM.
+        """
+        if not self._ready:
+            raise RuntimeError("Call setup() before apply_K_matmat().")
+
+        V = np.asarray(V, dtype=float)
+        if V.ndim == 1:
+            return self.apply_K(V)
+        if V.shape[0] != self._n_trans:
+            raise ValueError(
+                f"V has shape {V.shape}, expected ({self._n_trans}, k)"
+            )
+        k = V.shape[1]
+        if k == 0:
+            return np.zeros((self._n_trans, 0), dtype=float)
+        if k == 1:
+            return self.apply_K(V[:, 0]).reshape(self._n_trans, 1)
+
+        if self._K is not None:
+            if self.use_gpu and self._K_dev is not None:
+                cp = self._cp
+                return cp.asnumpy(self._K_dev @ cp.asarray(V))
+            return self._K @ V
+
+        dms = self._transition_dms_from_block(V)
+        if self._gpu_response:
+            dms = self._cp.asarray(dms)
+        v_ao = self._vresp(dms)
+        v_ao = self._as_numpy(v_ao).reshape(k, *v_ao.shape[-2:])
+
+        out = np.empty((self._n_trans, k), dtype=float)
+        if self.use_gpu and self._C_o_dev is not None:
+            cp = self._cp
+            v_dev = cp.asarray(v_ao)
+            C_o, C_v = self._C_o_dev, self._C_v_dev
+            for j in range(k):
+                out[:, j] = cp.asnumpy((C_o.T @ v_dev[j].T @ C_v).ravel())
+            return out
+
+        for j in range(k):
+            out[:, j] = (self._C_o.T @ v_ao[j].T @ self._C_v).ravel()
         return out
 
     def dense_K_rows(self, row_indices: Sequence[int], verbose: bool = False) -> np.ndarray:
@@ -246,19 +426,50 @@ class GTOKernel:
             K_rows[start:start + len(block)] = self.apply_K_batch(block)
         return K_rows
 
+    def _apply_K_gpu_cached(self, v: np.ndarray) -> np.ndarray:
+        cp = self._cp
+        return cp.asnumpy(self._K_dev @ cp.asarray(np.asarray(v, dtype=float).ravel()))
+
+    def _apply_K_gpu_onthefly(self, v: np.ndarray) -> np.ndarray:
+        """MO contractions on GPU; response on GPU if ``_gpu_response`` else CPU."""
+        cp = self._cp
+        V = cp.asarray(np.asarray(v, dtype=float).ravel()).reshape(
+            self._n_occ, self._n_unocc
+        )
+        # dm1 = 2 C_v @ V.T @ C_o.T
+        dm1 = 2.0 * (self._C_v_dev @ V.T @ self._C_o_dev.T)
+
+        if self._gpu_response:
+            v_ao = self._vresp(dm1)
+            if not isinstance(v_ao, cp.ndarray):
+                v_ao = cp.asarray(v_ao)
+        else:
+            v_ao = cp.asarray(self._vresp(cp.asnumpy(dm1)))
+
+        Kv = self._C_o_dev.T @ v_ao.T @ self._C_v_dev
+        return cp.asnumpy(Kv.ravel())
+
     def apply_K(self, v: np.ndarray) -> np.ndarray:
         if not self._ready:
             raise RuntimeError("Call setup() before apply_K().")
 
         v_arr = np.asarray(v, dtype=float)
+        if v_arr.ndim == 2:
+            return self.apply_K_matmat(v_arr)
+
         if self._K is not None:
+            if self.use_gpu and self._K_dev is not None:
+                return self._apply_K_gpu_cached(v_arr)
             return self._K @ v_arr.ravel()
+
+        if self.use_gpu and self._C_o_dev is not None:
+            return self._apply_K_gpu_onthefly(v_arr)
 
         V = v_arr.reshape(self._n_occ, self._n_unocc)
         # gen_response yields J + singlet f_xc (+ hybrid exact exchange), so K
         # reproduces the off-diagonal of the PySCF singlet A matrix exactly.
         dm1 = 2.0 * (self._C_v @ V.T @ self._C_o.T)
-        v_ao = self._vresp(dm1)
+        v_ao = self._as_numpy(self._vresp(dm1))
         # (K v)_ov = Σ_pq v_ao[p,q] C_o[q,o] C_v[p,v]
         Kv = self._C_o.T @ v_ao.T @ self._C_v
         return Kv.ravel()

@@ -1,6 +1,7 @@
 """Plane-wave / real-space FFT-grid Casida kernel (QE / DFTpy path)."""
 from __future__ import annotations
 
+import warnings
 from typing import Any, List, Optional, Sequence
 
 import numpy as np
@@ -23,6 +24,12 @@ class PlaneWaveKernel:
 
     Transition densities are ``φ_ia(r) = ψ_i*(r) ψ_a(r)`` (+ USPP augmentation).
     Matrix-free ``apply_K`` uses BLAS DGEMMs and DFTpy FFT Hartree.
+
+    With ``use_gpu=True`` (requires CuPy) the orbitals, f_xc, and the
+    reciprocal-space Coulomb kernel are uploaded to the device once in
+    ``setup()``; each ``apply_K`` then runs entirely on the GPU (DGEMMs,
+    elementwise grid ops, and a cuFFT spectral Hartree solve) — only the
+    small transition vector crosses the PCIe bus per matvec.
     """
 
     def __init__(
@@ -40,6 +47,7 @@ class PlaneWaveKernel:
         qij_augmentation=None,
         use_eDFTpy: bool = False,
         verbose: bool = False,
+        use_gpu: bool = False,
     ):
         self.rho = rho_ks
         self.grid = rho_ks.grid
@@ -51,6 +59,25 @@ class PlaneWaveKernel:
         self.beta_projectors = beta_projectors
         self.qij_augmentation = qij_augmentation
         self.use_eDFTpy = bool(use_eDFTpy)
+
+        self.use_gpu = bool(use_gpu)
+        self._cp = None
+        if self.use_gpu and self.use_uspp:
+            # USPP augmentation is per-pair Python loops; not ported to GPU.
+            warnings.warn(
+                "use_gpu=True is not supported with USPP augmentation yet; "
+                "falling back to the CPU path."
+            )
+            self.use_gpu = False
+        if self.use_gpu:
+            try:
+                import cupy
+            except ImportError as exc:
+                raise ImportError(
+                    "use_gpu=True requires CuPy (pip install cupy-cuda11x or "
+                    "cupy-cuda12x matching your CUDA toolkit)."
+                ) from exc
+            self._cp = cupy
 
         self.hartree = Functional(type="HARTREE")
         self.functional = xc_functional
@@ -95,6 +122,13 @@ class PlaneWaveKernel:
         self._proj_unocc = None
         self._ready = False
         self.tda = False
+
+        # Spectral Hartree kernel (4π/G²) and GPU-resident caches
+        self._coulG = None
+        self._psi_occ_dev = None
+        self._psi_unocc_dev = None
+        self._fkxc_dev = None
+        self._coulG_dev = None
 
     @property
     def n_occ(self) -> int:
@@ -147,6 +181,61 @@ class PlaneWaveKernel:
             rho = rho.real
         return self.hartree(rho, calcType=["V"]).potential
 
+    def _reciprocal_coulomb_kernel(self) -> np.ndarray:
+        """4π/G² on the rfftn half-grid (Hartree a.u.), G=0 component zeroed.
+
+        Prefers DFTpy's own reciprocal grid (guaranteed-consistent lattice
+        conventions); falls back to building G vectors from ``grid.lattice``.
+        The kernel is defined so that ``irfftn(coulG * rfftn(rho))`` equals the
+        periodic Hartree potential: the dV factor of the forward transform and
+        the 1/(N dV) of the inverse cancel for the numpy/cupy FFT convention.
+        """
+        nr = tuple(int(n) for n in self._grid_shape)
+        half_shape = (nr[0], nr[1], nr[2] // 2 + 1)
+
+        gg = None
+        try:
+            gg = np.asarray(self.grid.get_reciprocal().gg, dtype=float)
+            if gg.shape != half_shape:
+                gg = None
+        except Exception:
+            gg = None
+
+        if gg is None:
+            lattice = np.asarray(self.grid.lattice, dtype=float)
+            b = 2.0 * np.pi * np.linalg.inv(lattice).T  # rows = reciprocal vectors
+            fx = np.fft.fftfreq(nr[0]) * nr[0]
+            fy = np.fft.fftfreq(nr[1]) * nr[1]
+            fz = np.fft.rfftfreq(nr[2]) * nr[2]
+            mx, my, mz = np.meshgrid(fx, fy, fz, indexing="ij")
+            gx = mx * b[0, 0] + my * b[1, 0] + mz * b[2, 0]
+            gy = mx * b[0, 1] + my * b[1, 1] + mz * b[2, 1]
+            gz = mx * b[0, 2] + my * b[1, 2] + mz * b[2, 2]
+            gg = gx * gx + gy * gy + gz * gz
+
+        coulG = np.zeros_like(gg)
+        mask = gg > 1e-12
+        coulG[mask] = 4.0 * np.pi / gg[mask]
+        return coulG
+
+    def _ensure_coulG(self) -> np.ndarray:
+        if self._coulG is None:
+            self._coulG = self._reciprocal_coulomb_kernel()
+        return self._coulG
+
+    def _hartree_spectral(self, rho, xp=np, coulG=None):
+        """Periodic Hartree potential via a direct 4π/G² spectral solve.
+
+        Works with either numpy or cupy as ``xp``; ``rho`` must be a real 3-D
+        array on the same module. Used by the GPU path (numpy version is kept
+        for validation against DFTpy's Hartree functional).
+        """
+        if coulG is None:
+            coulG = self._ensure_coulG()
+        nr = tuple(int(n) for n in self._grid_shape)
+        rho_G = xp.fft.rfftn(rho)
+        return xp.fft.irfftn(coulG * rho_G, s=nr, axes=(0, 1, 2))
+
     def setup(self, tda: bool = False) -> None:
         if self.polarized:
             raise NotImplementedError("Spin-polarized Casida not implemented.")
@@ -180,6 +269,13 @@ class PlaneWaveKernel:
         for a, p in enumerate(self._psi_unocc):
             self._psi_unocc_arr[a] = np.asarray(p).ravel()
 
+        if self.use_gpu:
+            cp = self._cp
+            self._psi_occ_dev = cp.asarray(self._psi_occ_arr)
+            self._psi_unocc_dev = cp.asarray(self._psi_unocc_arr)
+            self._fkxc_dev = cp.asarray(self._fkxc_ndarray)
+            self._coulG_dev = cp.asarray(self._ensure_coulG())
+
         self._ready = True
         if self.verbose:
             n_grid = n_flat
@@ -192,10 +288,39 @@ class PlaneWaveKernel:
             print(f"  Grid: {self._grid_shape} = {n_grid:,} points")
             print(f"  Wavefunction memory: {wfn_mem:.2f} GB")
             print(f"  TDA: {tda}")
+            if self.use_gpu:
+                dev = self._cp.cuda.Device()
+                print(f"  GPU: enabled (device {dev.id}, "
+                      f"orbitals + f_xc + Coulomb kernel resident on device)")
+
+    def _apply_K_gpu(self, v: np.ndarray) -> np.ndarray:
+        """GPU matvec: DGEMMs + elementwise grid ops + cuFFT Hartree on device.
+
+        Only ``v`` (n_trans doubles) is uploaded and ``Kv`` downloaded per call.
+        """
+        cp = self._cp
+        v_dev = cp.asarray(np.asarray(v, dtype=np.float64).ravel())
+        V = v_dev.reshape(self._n_occ, self._n_unocc)
+
+        w = V @ self._psi_unocc_dev
+        rho_v_flat = (self._psi_occ_dev * w).sum(axis=0)
+        rho_v = rho_v_flat.reshape(tuple(int(n) for n in self._grid_shape))
+
+        if self.triplet:
+            response_flat = (self._fkxc_dev * rho_v).ravel()
+        else:
+            vh_v = self._hartree_spectral(rho_v, xp=cp, coulG=self._coulG_dev)
+            response_flat = (vh_v + self._fkxc_dev * rho_v).ravel()
+
+        Kv = (self._psi_occ_dev * response_flat) @ self._psi_unocc_dev.T * self._dV
+        return cp.asnumpy(Kv.ravel())
 
     def apply_K(self, v: np.ndarray) -> np.ndarray:
         if not self._ready:
             raise RuntimeError("Call setup() before apply_K().")
+
+        if self.use_gpu:
+            return self._apply_K_gpu(v)
 
         n_occ = self._n_occ
         n_unocc = self._n_unocc

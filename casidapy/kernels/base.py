@@ -29,7 +29,11 @@ class KernelBackend(Protocol):
         ...
 
     def apply_K(self, v: np.ndarray) -> np.ndarray:
-        """Apply the eh-coupling block ``K`` to a transition vector ``v``."""
+        """Apply the eh-coupling block ``K`` to ``v``.
+
+        ``v`` may be ``(n_trans,)`` or a LOBPCG block ``(n_trans, k)``.
+        Backends may also expose ``apply_K_matmat`` for an explicit batch path.
+        """
         ...
 
     def dipole_matrix(self) -> np.ndarray:

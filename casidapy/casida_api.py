@@ -35,7 +35,7 @@ class CasidaOptions:
     solver_method: str = "lobpcg"  # matrix-free iterative diagonalization (lobpcg or eigsh)
     solver_tol: float = 1e-8
     solver_maxiter: int = 200
-    use_gpu: bool = False  # reserved; GPU not wired yet (CPU only)
+    use_gpu: bool = False  # PW: CuPy FFT Hartree; GTO: CuPy matvecs (+ gpu4pyscf response)
 
     xc: str = "PBE"
     spin_state: str = "singlet"  # or "triplet" (requires libxc component map in the engine)

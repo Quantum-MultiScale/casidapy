@@ -22,6 +22,9 @@ qepy = ["qepy"]
 libxc = ["pylibxc"]
 plotting = ["matplotlib"]
 pyscf = ["pyscf"]
+# CuPy wheels are CUDA-version specific — install manually, e.g. cupy-cuda12x.
+# gpu4pyscf pulls the GPU response (J + f_xc + hybrid K) for GTOKernel.
+gpu4pyscf = ["gpu4pyscf"]
 all = ["qepy", "pylibxc", "matplotlib", "pyscf"]
 
 [project.scripts]

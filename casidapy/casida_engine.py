@@ -64,6 +64,7 @@ class CasidaKS_MPI:
                 qij_augmentation=qij_augmentation,
                 use_eDFTpy=use_eDFTpy,
                 verbose=(self.rank == 0),
+                use_gpu=use_gpu,
             )
 
         # Mirror kernel attributes for backward-compatible access
@@ -217,10 +218,24 @@ class CasidaKS_MPI:
                 print(f"  Grid: {self._grid_shape} = {n_grid:,} points")
                 print(f"  Wavefunction memory: {wfn_mem:.2f} GB")
             print(f"  (Full matrix would be: {matrix_mem:.2f} GB)")
-            print(f"  TDA: {tda}, CPU only")
+            backend = "GPU (CuPy)" if getattr(self._kernel, "use_gpu", False) else "CPU"
+            print(f"  TDA: {tda}, {backend}")
 
     def _apply_K_matvec(self, v):
-        """Apply eh coupling ``K`` via the active kernel backend."""
+        """Apply eh coupling ``K`` via the active kernel backend.
+
+        Accepts a vector ``(n_trans,)`` or a block ``(n_trans, k)``.  When the
+        kernel exposes ``apply_K_matmat`` (GTO), a block uses one batched
+        response call instead of ``k`` serial ones — important for LOBPCG.
+        """
+        v = np.asarray(v, dtype=float)
+        if v.ndim == 2 and hasattr(self._kernel, "apply_K_matmat"):
+            return self._kernel.apply_K_matmat(v)
+        if v.ndim == 2:
+            # Fallback: column loop (PlaneWaveKernel / older backends)
+            return np.column_stack(
+                [self._kernel.apply_K(v[:, j]) for j in range(v.shape[1])]
+            )
         return self._kernel.apply_K(v)
 
     def _apply_C_matvec(self, v):
@@ -231,35 +246,47 @@ class CasidaKS_MPI:
         ``C v = S ( 2 K S v + Δε ⊙ S v )``, i.e. the similarity-transformed RPA chain so the
         eigenproblem matches ``solve_matrix_free`` / dense ``C`` for the same physics.
         """
-        v = np.asarray(v)
+        v = np.asarray(v, dtype=float)
         input_shape = v.shape
-        v_flat = v.flatten()
+        if v.ndim == 1:
+            w1 = self._sqrt_dE * v
+            Kw1 = self._apply_K_matvec(w1)
+            w2 = 2.0 * Kw1 + self._dE * w1
+            return (self._sqrt_dE * w2).reshape(input_shape)
 
-        w1 = self._sqrt_dE * v_flat
+        # Block: (n_trans, k)
+        w1 = self._sqrt_dE[:, None] * v
         Kw1 = self._apply_K_matvec(w1)
-        w2 = 2.0 * Kw1 + self._dE * w1
-        result = self._sqrt_dE * w2
-        return result.reshape(input_shape)
+        w2 = 2.0 * Kw1 + self._dE[:, None] * w1
+        return self._sqrt_dE[:, None] * w2
 
     def _apply_A_matvec(self, v):
         """
         Matrix-free multiply by ``A = K + diag(Δε)`` for **TDA** (solve ``A X = ω X``).
         """
-        v = np.asarray(v)
-        input_shape = v.shape
-        v_flat = v.flatten()
-        Kv = self._apply_K_matvec(v_flat)
-        result = Kv + self._dE * v_flat
-        return result.reshape(input_shape)
+        v = np.asarray(v, dtype=float)
+        if v.ndim == 1:
+            return self._apply_K_matvec(v) + self._dE * v
+        return self._apply_K_matvec(v) + self._dE[:, None] * v
 
     def _get_linear_operator(self):
-        """SciPy ``LinearOperator`` for LOBPCG/eigsh: TDA uses ``A``, full Casida uses ``C``."""
+        """SciPy ``LinearOperator`` for LOBPCG/eigsh: TDA uses ``A``, full Casida uses ``C``.
+
+        ``matmat`` is set explicitly so LOBPCG's block updates hit one batched
+        kernel call (GTO ``apply_K_matmat``) instead of SciPy's default
+        column-by-column ``matvec`` loop.
+        """
         Ntrans = self._n_trans
         if self.tda:
             matvec = self._apply_A_matvec
         else:
             matvec = self._apply_C_matvec
-        return LinearOperator(shape=(Ntrans, Ntrans), matvec=matvec, dtype=np.float64)
+        return LinearOperator(
+            shape=(Ntrans, Ntrans),
+            matvec=matvec,
+            matmat=matvec,  # same callable handles (n,) and (n, k)
+            dtype=np.float64,
+        )
 
     def solve_matrix_free(self, k, tol=1e-8, maxiter=200, verbose=1, method="lobpcg"):
         if not hasattr(self, "_matrix_free") or not self._matrix_free:
@@ -700,6 +727,7 @@ def _run_casida_plane_wave(inputs: CasidaInputs, options: CasidaOptions, comm=No
         use_uspp=options.use_uspp,
         beta_projectors=inputs.beta_projectors,
         qij_augmentation=inputs.qij_augmentation,
+        use_gpu=options.use_gpu,
         comm=comm,
     )
     if eigs.ndim == 2:
