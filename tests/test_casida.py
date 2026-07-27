@@ -277,6 +277,113 @@ class TestKernelBackends:
         assert np.allclose(KV_block, KV_cols, atol=1e-9)
 
 
+class TestSpinFlipGTO:
+    """Collinear exchange-only (Route A) SF-TDDFT in the GTO backend."""
+
+    @staticmethod
+    def _triplet_mf(xc="bhandhlyp"):
+        from pyscf import gto, dft
+
+        mol = gto.M(atom="C 0 0 0; H 0 0 1.08; H 1.0 0 -0.4",
+                    basis="sto-3g", spin=2, charge=0, verbose=0)
+        mf = dft.UKS(mol)
+        mf.xc = xc
+        mf.grids.level = 1  # keep the test fast
+        mf.kernel()
+        return mol, mf
+
+    @staticmethod
+    def _explicit_sf_coupling(mf, hyb):
+        """Reference: A_coupling[ia,jb] = -hyb (a b | j i), a,b β-virt; i,j α-occ."""
+        mol = mf.mol
+        Ca, Cb = mf.mo_coeff
+        occa, occb = mf.mo_occ
+        C_o = Ca[:, occa > 1e-6]      # alpha occupied
+        C_v = Cb[:, occb < 1e-6]      # beta virtual
+        no, nv = C_o.shape[1], C_v.shape[1]
+        eri = mol.intor("int2e")
+        M = np.einsum("pqrs,pa,qb,rj,si->abji", eri, C_v, C_v, C_o, C_o,
+                      optimize=True)
+        ntr = no * nv
+        K = np.zeros((ntr, ntr))
+        for i in range(no):
+            for a in range(nv):
+                for j in range(no):
+                    for b in range(nv):
+                        K[i * nv + a, j * nv + b] = -hyb * M[a, b, j, i]
+        return K
+
+    def test_sf_apply_K_matches_explicit_exchange(self):
+        """SF matvec must equal an independent 4-index exchange build."""
+        pytest.importorskip("pyscf")
+        from casidapy.kernels.gto import GTOKernel
+
+        mol, mf = self._triplet_mf("bhandhlyp")
+        kernel = GTOKernel.build_spin_flip(mol, xc="bhandhlyp", use_df=False, mf=mf)
+        kernel.setup(tda=True)
+        ntr = kernel.n_trans
+
+        K = np.column_stack([kernel.apply_K(np.eye(ntr)[:, j]) for j in range(ntr)])
+        assert np.allclose(K, K.T, atol=1e-9)  # real orbitals -> symmetric
+        _, _, hyb = kernel._rsh
+        K_ref = self._explicit_sf_coupling(mf, hyb)
+        np.testing.assert_allclose(K, K_ref, atol=1e-9)
+
+        # Positive spin-flip gaps and a sane cached-K / block path.
+        assert np.all(kernel.diagonal_dE() > 0)
+        np.testing.assert_allclose(kernel._K, K, atol=1e-9)
+        V = np.random.default_rng(0).standard_normal((ntr, 3))
+        np.testing.assert_allclose(
+            kernel.apply_K_matmat(V),
+            np.column_stack([kernel.apply_K(V[:, j]) for j in range(3)]),
+            atol=1e-9,
+        )
+
+    def test_sf_dipole_is_zero(self):
+        """Spin-flip transitions are dipole-forbidden (⟨α|β⟩ = 0)."""
+        pytest.importorskip("pyscf")
+        from casidapy.kernels.gto import GTOKernel
+
+        mol, mf = self._triplet_mf("bhandhlyp")
+        kernel = GTOKernel.build_spin_flip(mol, xc="bhandhlyp", use_df=False, mf=mf)
+        kernel.setup(tda=True)
+        mu = kernel.dipole_matrix()
+        assert mu.shape == (kernel.n_trans, 3)
+        assert np.count_nonzero(mu) == 0
+
+    def test_sf_pure_functional_rejected(self):
+        """A pure functional gives zero exchange coupling -> must raise."""
+        pytest.importorskip("pyscf")
+        from casidapy.kernels.gto import GTOKernel
+
+        mol, mf = self._triplet_mf("pbe")
+        kernel = GTOKernel.build_spin_flip(mol, xc="pbe", use_df=False, mf=mf)
+        with pytest.raises(ValueError, match="hybrid"):
+            kernel.setup(tda=True)
+
+    def test_sf_rpa_rejected(self):
+        """SF-TDDFT is TDA-only; non-TDA must raise."""
+        pytest.importorskip("pyscf")
+        from casidapy.kernels.gto import GTOKernel
+
+        mol, mf = self._triplet_mf("bhandhlyp")
+        kernel = GTOKernel.build_spin_flip(mol, xc="bhandhlyp", use_df=False, mf=mf)
+        with pytest.raises(NotImplementedError, match="TDA"):
+            kernel.setup(tda=False)
+
+    def test_sf_xc_route_b_not_implemented(self):
+        """The transverse-kernel path (Route B) is gated off for now."""
+        pytest.importorskip("pyscf")
+        from casidapy.kernels.gto import GTOKernel
+
+        mol, mf = self._triplet_mf("bhandhlyp")
+        kernel = GTOKernel.build_spin_flip(
+            mol, xc="bhandhlyp", use_df=False, mf=mf, sf_xc=True
+        )
+        with pytest.raises(NotImplementedError, match="sf_xc"):
+            kernel.setup(tda=True)
+
+
 def _make_synthetic_pw_kernel(use_gpu=False):
     """Small PlaneWaveKernel on a non-cubic DFTpy grid with Gaussian orbitals.
 

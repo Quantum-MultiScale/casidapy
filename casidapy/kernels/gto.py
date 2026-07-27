@@ -8,6 +8,16 @@ fitting is used when ``use_df`` is set (via ``mf.density_fit()``).
 Hybrids are supported in TDA only: the matrix-free RPA chain assumes
 ``A - B = diag(dE)``, which does not hold once exact exchange enters ``B``.
 
+**Spin-flip TDDFT** (``spin_flip=True``, built via :meth:`GTOKernel.build_spin_flip`)
+runs the collinear Mₛ = −1 manifold (α-occupied → β-virtual) on a high-spin
+unrestricted (UKS/UHF) reference. In the spin-flip block the Hartree term and
+the spin-diagonal ``f_xc`` vanish; only the exact-exchange kernel survives, so
+the coupling is ``K = -c_x · get_k(dm_αβ)`` on the off-spin transition density.
+This is exchange-only ("Route A") collinear SF-TDDFT: it requires a hybrid
+(pure functionals give zero coupling) and is intrinsically TDA. The transverse
+DFT kernel (non-collinear ``f_xc``, "Route B") is gated behind ``sf_xc=True``
+and not yet implemented.
+
 With ``use_gpu=True`` (requires CuPy):
 
 * Active MO blocks and a cached dense ``K`` are uploaded once; cached
@@ -75,6 +85,8 @@ class GTOKernel:
         verbose: bool = False,
         k_cache_max: int = 4096,
         use_gpu: bool = False,
+        spin_flip: bool = False,
+        sf_xc: bool = False,
     ):
         try:
             from pyscf import dft, scf  # noqa: F401
@@ -91,40 +103,68 @@ class GTOKernel:
         self.use_df = use_df
         self.verbose = verbose
         self._mf = mf
+        self._spin_flip = bool(spin_flip)
+        self._sf_xc = bool(sf_xc)
 
-        occ_mask = self.mo_occ > 1e-6
-        virt_mask = self.mo_occ < 1e-6
-        if occ_indices is None:
-            occ_all = np.where(occ_mask)[0]
-            n_o = n_occ if n_occ is not None else len(occ_all)
-            if n_o > len(occ_all):
-                raise ValueError(f"n_occ={n_o} exceeds occupied count {len(occ_all)}")
-            # top of valence: last n_o occupied
-            occ_indices = occ_all[-n_o:]
-        if virt_indices is None:
-            virt_all = np.where(virt_mask)[0]
-            n_u = n_unocc if n_unocc is not None else len(virt_all)
-            if n_u > len(virt_all):
+        if self._spin_flip:
+            # Unrestricted high-spin reference: MO arrays are (alpha, beta).
+            # Manifold is alpha-occupied -> beta-virtual (Ms = -1).
+            if occ_indices is None or virt_indices is None:
                 raise ValueError(
-                    f"n_unocc={n_u} exceeds virtual count {len(virt_all)}"
+                    "spin_flip mode requires explicit occ_indices (alpha-occ) "
+                    "and virt_indices (beta-virt); use GTOKernel.build_spin_flip()."
                 )
-            virt_indices = virt_all[:n_u]
+            if self.mo_coeff.ndim != 3 or self.mo_coeff.shape[0] != 2:
+                raise ValueError(
+                    "spin_flip mode expects mo_coeff of shape (2, nao, nmo)."
+                )
+            self._occ_idx = np.asarray(occ_indices, dtype=int)
+            self._virt_idx = np.asarray(virt_indices, dtype=int)
+            Ca, Cb = self.mo_coeff[0], self.mo_coeff[1]
+            ea, eb = self.mo_energy[0], self.mo_energy[1]
+            self._C_o = Ca[:, self._occ_idx]      # alpha occupied
+            self._C_v = Cb[:, self._virt_idx]     # beta virtual
+            self._occ_e = ea[self._occ_idx]
+            self._unocc_e = eb[self._virt_idx]
+        else:
+            occ_mask = self.mo_occ > 1e-6
+            virt_mask = self.mo_occ < 1e-6
+            if occ_indices is None:
+                occ_all = np.where(occ_mask)[0]
+                n_o = n_occ if n_occ is not None else len(occ_all)
+                if n_o > len(occ_all):
+                    raise ValueError(f"n_occ={n_o} exceeds occupied count {len(occ_all)}")
+                # top of valence: last n_o occupied
+                occ_indices = occ_all[-n_o:]
+            if virt_indices is None:
+                virt_all = np.where(virt_mask)[0]
+                n_u = n_unocc if n_unocc is not None else len(virt_all)
+                if n_u > len(virt_all):
+                    raise ValueError(
+                        f"n_unocc={n_u} exceeds virtual count {len(virt_all)}"
+                    )
+                virt_indices = virt_all[:n_u]
 
-        self._occ_idx = np.asarray(occ_indices, dtype=int)
-        self._virt_idx = np.asarray(virt_indices, dtype=int)
+            self._occ_idx = np.asarray(occ_indices, dtype=int)
+            self._virt_idx = np.asarray(virt_indices, dtype=int)
+            self._C_o = self.mo_coeff[:, self._occ_idx]
+            self._C_v = self.mo_coeff[:, self._virt_idx]
+            self._occ_e = self.mo_energy[self._occ_idx]
+            self._unocc_e = self.mo_energy[self._virt_idx]
+
         self._n_occ = len(self._occ_idx)
         self._n_unocc = len(self._virt_idx)
         self._n_trans = self._n_occ * self._n_unocc
-
-        self._C_o = self.mo_coeff[:, self._occ_idx]
-        self._C_v = self.mo_coeff[:, self._virt_idx]
-        self._occ_e = self.mo_energy[self._occ_idx]
-        self._unocc_e = self.mo_energy[self._virt_idx]
+        # Closed-shell transition DMs carry a factor 2 (double occupancy); the
+        # single-spin spin-flip transition DM does not.
+        self._dm_factor = 1.0 if self._spin_flip else 2.0
         self._dE = None
         self._ready = False
         self.tda = True  # GTO path defaults to TDA; RPA uses same K
 
         self._vresp = None
+        self._rsh = None   # (omega, alpha, hyb) exact-exchange split, SF only
+        self._cx = None    # global-hybrid exchange fraction, SF only
         self.hybrid = False
         self.k_cache_max = int(k_cache_max)
         self._K = None  # cached dense coupling matrix (n_trans, n_trans)
@@ -144,6 +184,99 @@ class GTOKernel:
                     "cupy-cuda12x matching your CUDA toolkit)."
                 ) from exc
             self._cp = cupy
+
+    @classmethod
+    def build_spin_flip(
+        cls,
+        mol,
+        *,
+        xc: str = "bhandhlyp",
+        spin: Optional[int] = None,
+        charge: Optional[int] = None,
+        n_occ: Optional[int] = None,
+        n_unocc: Optional[int] = None,
+        use_df: bool = True,
+        sf_xc: bool = False,
+        mf=None,
+        conv_tol: float = 1e-9,
+        verbose: bool = False,
+        use_gpu: bool = False,
+    ) -> "GTOKernel":
+        """Build a collinear SF-TDDFT kernel from a high-spin UKS/UHF reference.
+
+        Converges (or accepts) a spin-unrestricted high-spin reference and sets
+        up the Mₛ = −1 spin-flip manifold (α-occupied → β-virtual). Requires a
+        hybrid ``xc`` for nonzero coupling (exchange-only, Route A). Pass an
+        already-converged unrestricted ``mf`` to skip the internal SCF.
+
+        Parameters
+        ----------
+        mol : pyscf.gto.Mole
+            Its ``spin`` (= 2·Mₛ) and ``charge`` are used unless overridden.
+        spin, charge : optional
+            Override ``mol.spin`` / ``mol.charge`` for the reference (a fresh
+            copy is built so ``mol`` is left untouched).
+        n_occ, n_unocc : optional active-window sizes (top α-occ / first β-virt).
+        sf_xc : bool
+            Reserved for the non-collinear transverse XC kernel (Route B);
+            ``True`` raises ``NotImplementedError`` in ``setup``.
+        """
+        from pyscf import dft
+
+        if mf is None:
+            m = mol
+            if spin is not None or charge is not None:
+                m = mol.copy()
+                if spin is not None:
+                    m.spin = int(spin)
+                if charge is not None:
+                    m.charge = int(charge)
+                m.build(False, False)
+            if m.spin == 0:
+                raise ValueError(
+                    "SF-TDDFT needs a high-spin (open-shell) reference; set "
+                    "spin>=2 (spin = 2·Mₛ)."
+                )
+            mf = dft.UKS(m)
+            mf.xc = xc
+            if use_df:
+                mf = mf.density_fit()
+            mf.conv_tol = conv_tol
+            mf.kernel()
+            if not getattr(mf, "converged", True):
+                warnings.warn("SF-TDDFT reference UKS SCF did not converge.")
+
+        mo_c = np.asarray(mf.mo_coeff, dtype=float)
+        mo_e = np.asarray(mf.mo_energy, dtype=float)
+        mo_o = np.asarray(mf.mo_occ, dtype=float)
+        if mo_c.ndim != 3 or mo_c.shape[0] != 2:
+            raise ValueError(
+                "build_spin_flip requires an unrestricted (UKS/UHF) reference "
+                "with (2, nao, nmo) MO coefficients."
+            )
+
+        occ_a = np.where(mo_o[0] > 1e-6)[0]   # alpha occupied
+        vir_b = np.where(mo_o[1] < 1e-6)[0]   # beta virtual
+        if n_occ is not None:
+            occ_a = occ_a[-int(n_occ):]
+        if n_unocc is not None:
+            vir_b = vir_b[:int(n_unocc)]
+
+        return cls(
+            mf.mol,
+            mo_c,
+            mo_e,
+            mo_o,
+            occ_indices=occ_a,
+            virt_indices=vir_b,
+            xc=getattr(mf, "xc", xc),
+            use_df=use_df,
+            mf=mf,
+            verbose=verbose,
+            use_gpu=use_gpu,
+            spin_flip=True,
+            sf_xc=sf_xc,
+        )
 
     @property
     def n_occ(self) -> int:
@@ -213,6 +346,10 @@ class GTOKernel:
             raise ValueError(
                 "Found non-positive excitation energies. Check orbital ordering."
             )
+
+        if self._spin_flip:
+            self._setup_spin_flip(tda)
+            return
 
         # Build (or reuse) an RKS handle; its gen_response provides the full
         # singlet TDDFT coupling: J + singlet f_xc + exact exchange for hybrids.
@@ -287,8 +424,11 @@ class GTOKernel:
                     f"{' + gpu4pyscf response' if self._gpu_response else ' (CPU response)'}"
                 )
 
-        # Precompute dense K with batched response calls: a handful of
-        # AO-integral passes up front instead of one per solver iteration.
+        self._maybe_cache_dense_K()
+
+    def _maybe_cache_dense_K(self) -> None:
+        """Precompute dense K with batched response calls: a handful of
+        AO-integral passes up front instead of one per solver iteration."""
         if self._K is None and 0 < self._n_trans <= self.k_cache_max:
             import time
 
@@ -305,17 +445,99 @@ class GTOKernel:
                     + (" on GPU." if self.use_gpu else ".")
                 )
 
+    def _setup_spin_flip(self, tda: bool) -> None:
+        """Collinear exchange-only (Route A) SF-TDDFT setup.
+
+        Extracts the exact-exchange split from the hybrid and prepares the
+        ``-c_x·get_k`` coupling. No ``gen_response`` is built: Hartree and the
+        spin-diagonal f_xc do not contribute to the spin-flip block.
+        """
+        from pyscf import dft
+
+        if not tda:
+            raise NotImplementedError(
+                "SF-TDDFT is TDA-only in this backend (the RPA A-B=diag(dE) "
+                "factorization does not apply to the spin-flip block)."
+            )
+        if self._sf_xc:
+            raise NotImplementedError(
+                "sf_xc=True (non-collinear transverse XC kernel, Route B) is "
+                "not implemented; use sf_xc=False for exchange-only SF-TDDFT."
+            )
+        mf = self._mf
+        if mf is None:
+            raise ValueError(
+                "spin_flip mode requires an unrestricted reference mf "
+                "(use GTOKernel.build_spin_flip())."
+            )
+
+        if hasattr(mf, "xc"):
+            ni = getattr(mf, "_numint", dft.numint.NumInt())
+            omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=self.mol.spin)
+        else:
+            omega, alpha, hyb = 0.0, 1.0, 1.0  # plain UHF: full exact exchange
+        self._rsh = (float(omega), float(alpha), float(hyb))
+        self._cx = float(hyb)
+        self.hybrid = True
+        if abs(hyb) < 1e-10 and abs(alpha) < 1e-10:
+            raise ValueError(
+                "Collinear exchange-only SF-TDDFT needs a hybrid functional: a "
+                "pure functional gives zero spin-flip coupling. Use e.g. "
+                "xc='bhandhlyp' (or sf_xc=True once the transverse kernel lands)."
+            )
+
+        self._vresp = None  # SF coupling is get_k-based, not gen_response
+        if self.use_gpu:
+            # Contractions/cached K on GPU; the get_k response stays on CPU.
+            self._C_o_dev = self._cp.asarray(self._C_o)
+            self._C_v_dev = self._cp.asarray(self._C_v)
+
+        self._ready = True
+        if self.verbose:
+            print("GTOKernel setup (spin-flip, collinear exchange-only):")
+            print(
+                f"  SF transitions: {self._n_occ} α-occ × {self._n_unocc} β-virt "
+                f"= {self._n_trans}"
+            )
+            print(
+                f"  XC: {getattr(mf, 'xc', 'HF')}, exact-exchange split "
+                f"(omega, alpha, hyb)={self._rsh}, TDA: {tda}"
+            )
+        self._maybe_cache_dense_K()
+
+    def _sf_exchange(self, dm):
+        """Exact-exchange response ``c_x·K[dm]`` on an off-spin transition DM.
+
+        Handles global hybrids and range-separated hybrids using the PySCF
+        ``(omega, alpha, hyb)`` convention: ``hyb·K + (alpha-hyb)·K(omega)``.
+        Accepts a single ``(nao, nao)`` DM or a stack ``(k, nao, nao)``.
+        """
+        omega, alpha, hyb = self._rsh
+        mf = self._mf
+        k = hyb * mf.get_k(self.mol, dm, hermi=0)
+        if abs(omega) > 1e-12 and abs(alpha - hyb) > 1e-12:
+            k = k + (alpha - hyb) * mf.get_k(self.mol, dm, hermi=0, omega=omega)
+        return k
+
+    def _response(self, dm):
+        """Dispatch the AO response: singlet gen_response (RKS) or, for the
+        spin-flip block, ``-c_x·get_k`` (Hartree and spin-diagonal f_xc vanish)."""
+        if self._spin_flip:
+            return -self._sf_exchange(dm)
+        return self._vresp(dm)
+
     def _pair_dms(self, indices) -> np.ndarray:
         """Stack of AO transition DMs for the given ia indices.
 
         PySCF TDA convention (tdscf.rhf vind): dm[p,q] = 2 C_v[p,a] C_o[q,i];
-        the factor 2 is the closed-shell double occupancy.
+        the factor 2 is the closed-shell double occupancy. The spin-flip block
+        uses a single-spin off-spin DM (``_dm_factor == 1``, C_v=β, C_o=α).
         """
         nao = self._C_o.shape[0]
         dms = np.empty((len(indices), nao, nao), dtype=float)
         for x, ia in enumerate(indices):
             i, a = divmod(int(ia), self._n_unocc)
-            dms[x] = 2.0 * np.outer(self._C_v[:, a], self._C_o[:, i])
+            dms[x] = self._dm_factor * np.outer(self._C_v[:, a], self._C_o[:, i])
         return dms
 
     def apply_K_batch(self, indices) -> np.ndarray:
@@ -323,7 +545,7 @@ class GTOKernel:
         dms = self._pair_dms(indices)
         if self._gpu_response:
             dms = self._cp.asarray(dms)
-        v_ao = self._vresp(dms)
+        v_ao = self._response(dms)
         v_ao = self._as_numpy(v_ao)
         v_ao = v_ao.reshape(len(indices), *v_ao.shape[-2:])
         # Prefer GPU MO back-contraction when CuPy is active.
@@ -353,8 +575,8 @@ class GTOKernel:
         W = V.reshape(n_o, n_v, k)  # W[i,a,j]
         # tmp[a,j,q] = Σ_i W[i,a,j] C_o[q,i]
         tmp = np.einsum("iaj,qi->ajq", W, self._C_o, optimize=True)
-        # dm[j,p,q] = 2 Σ_a C_v[p,a] tmp[a,j,q]
-        return 2.0 * np.einsum("pa,ajq->jpq", self._C_v, tmp, optimize=True)
+        # dm[j,p,q] = f Σ_a C_v[p,a] tmp[a,j,q]  (f = 2 closed-shell, 1 spin-flip)
+        return self._dm_factor * np.einsum("pa,ajq->jpq", self._C_v, tmp, optimize=True)
 
     def apply_K_matmat(self, V: np.ndarray) -> np.ndarray:
         """Apply ``K`` to a block ``V`` of shape ``(n_trans, k)``.
@@ -387,7 +609,7 @@ class GTOKernel:
         dms = self._transition_dms_from_block(V)
         if self._gpu_response:
             dms = self._cp.asarray(dms)
-        v_ao = self._vresp(dms)
+        v_ao = self._response(dms)
         v_ao = self._as_numpy(v_ao).reshape(k, *v_ao.shape[-2:])
 
         out = np.empty((self._n_trans, k), dtype=float)
@@ -462,19 +684,25 @@ class GTOKernel:
                 return self._apply_K_gpu_cached(v_arr)
             return self._K @ v_arr.ravel()
 
-        if self.use_gpu and self._C_o_dev is not None:
+        if self.use_gpu and self._C_o_dev is not None and not self._spin_flip:
             return self._apply_K_gpu_onthefly(v_arr)
 
         V = v_arr.reshape(self._n_occ, self._n_unocc)
-        # gen_response yields J + singlet f_xc (+ hybrid exact exchange), so K
-        # reproduces the off-diagonal of the PySCF singlet A matrix exactly.
-        dm1 = 2.0 * (self._C_v @ V.T @ self._C_o.T)
-        v_ao = self._as_numpy(self._vresp(dm1))
+        # RKS: gen_response yields J + singlet f_xc (+ hybrid exact exchange), so
+        # K reproduces the off-diagonal of the PySCF singlet A matrix exactly.
+        # SF: _response returns -c_x·get_k on the off-spin (β-virt × α-occ) DM.
+        dm1 = self._dm_factor * (self._C_v @ V.T @ self._C_o.T)
+        v_ao = self._as_numpy(self._response(dm1))
         # (K v)_ov = Σ_pq v_ao[p,q] C_o[q,o] C_v[p,v]
         Kv = self._C_o.T @ v_ao.T @ self._C_v
         return Kv.ravel()
 
     def dipole_matrix(self) -> np.ndarray:
+        if self._spin_flip:
+            # Spin-flip transitions are dipole-forbidden through the (spin-
+            # conserving) electric-dipole operator: ⟨α|β⟩ = 0. Oscillator
+            # strengths require a spin-orbit treatment not modeled here.
+            return np.zeros((self._n_trans, 3), dtype=float)
         # μ_AO: (3, nao, nao); then μ_ia = C_o† μ C_v
         with self.mol.with_common_orig((0.0, 0.0, 0.0)):
             dip_ao = self.mol.intor("int1e_r", comp=3)

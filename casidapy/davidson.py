@@ -354,6 +354,217 @@ def solve_eigsh(
     return eigenvalues, eigenvectors
 
 
+def _orthonormalize_against(basis: np.ndarray, new: np.ndarray,
+                            thresh: float = 1e-8) -> np.ndarray:
+    """Columns of ``new`` orthonormalized against ``basis`` and each other.
+
+    Uses two-pass (iterated) Gram-Schmidt for numerical stability and drops
+    columns that become linearly dependent (norm below ``thresh``). ``basis``
+    is assumed to already have orthonormal columns; it may be empty.
+    """
+    n = new.shape[0]
+    kept: list = []
+    for j in range(new.shape[1]):
+        t = np.array(new[:, j], dtype=float, copy=True)
+        for _ in range(2):  # iterated MGS: one pass is not enough near-dependence
+            if basis is not None and basis.shape[1]:
+                t -= basis @ (basis.T @ t)
+            for u in kept:
+                t -= u * (u @ t)
+        nrm = np.linalg.norm(t)
+        if nrm > thresh:
+            kept.append(t / nrm)
+    if kept:
+        return np.column_stack(kept)
+    return np.zeros((n, 0), dtype=float)
+
+
+def solve_davidson(
+    A: Union[np.ndarray, LinearOperator, Callable],
+    nroots: int = 1,
+    X0: Optional[np.ndarray] = None,
+    diagonal: Optional[np.ndarray] = None,
+    tol: float = 1e-8,
+    maxiter: int = 100,
+    largest: bool = False,
+    max_subspace: Optional[int] = None,
+    verbose: int = 1,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Block Davidson-Liu solver for a few extreme eigenpairs of a symmetric op.
+
+    Purpose-built for Casida/TDDFT: it expands the subspace one **block** per
+    iteration (all unconverged roots at once) so a matrix-free backend does a
+    single batched matvec per iteration — critical for the GTO
+    ``apply_K_matmat`` (one ``gen_response`` per step) and the plane-wave FFT
+    path — instead of one matvec per vector as a naive Davidson would.
+
+    Robustness features versus the scipy LOBPCG default:
+
+    * diagonal (Davidson) preconditioner with a safe denominator, matched to
+      the operator (``dE`` for TDA ``A``, ``dE**2`` for the RPA ``C``);
+    * thick restart: when the subspace hits ``max_subspace`` it collapses to the
+      current Ritz vectors (+ unconverged directions), bounding memory and the
+      Rayleigh-Ritz cost while preserving convergence;
+    * iterated Gram-Schmidt with linear-dependence dropping, so a stagnating
+      correction never corrupts the basis;
+    * a bullet-proof dense fallback for small problems (``n`` small or
+      ``nroots`` close to ``n``), where iterative schemes are fragile.
+
+    Only the ``matvec`` / ``matmat`` interface of ``A`` is used, so the solver
+    stays basis-agnostic (shared by the GTO and plane-wave kernels).
+
+    Parameters mirror :func:`solve_lobpcg`. ``largest`` finds the algebraically
+    largest eigenvalues (the operator is negated internally).
+    """
+    # --- Resolve operator and size ---
+    if isinstance(A, np.ndarray):
+        n = A.shape[0]
+        matmat = lambda V: A @ V
+    elif isinstance(A, LinearOperator):
+        n = A.shape[0]
+        matmat = A.matmat
+    elif callable(A):
+        if X0 is not None:
+            n = X0.shape[0]
+        elif diagonal is not None:
+            n = len(diagonal)
+        else:
+            raise ValueError("Cannot determine matrix size; provide X0 or diagonal.")
+        A_op = create_linear_operator(A, n)
+        matmat = A_op.matmat
+    else:
+        A_op = A
+        n = A.shape[0]
+        matmat = A_op.matmat
+
+    sign = -1.0 if largest else 1.0
+
+    def apply(V):
+        # Always feed a 2-D block so backends hit their batched path.
+        W = np.asarray(matmat(np.asarray(V, dtype=float)))
+        if W.ndim == 1:
+            W = W.reshape(-1, 1)
+        return sign * W
+
+    nroots = int(nroots)
+    if nroots < 1:
+        raise ValueError("nroots must be >= 1")
+
+    # --- Dense fallback: small n or nroots close to n (iterative is fragile) ---
+    if n <= max(2 * nroots + 4, 32) or nroots >= n - 1:
+        Adense = apply(np.eye(n))
+        Adense = 0.5 * (Adense + Adense.T)
+        w, V = np.linalg.eigh(Adense)
+        w = sign * w
+        idx = np.argsort(w)
+        w, V = w[idx][:nroots], V[:, idx][:, :nroots]
+        if verbose >= 1:
+            print(f"Davidson: dense fallback (n={n}, nroots={nroots})")
+        return w, V
+
+    if max_subspace is None:
+        max_subspace = min(n, max(6 * nroots, nroots + 30))
+    max_subspace = min(int(max_subspace), n)
+
+    # --- Preconditioner diagonal (for A - theta I) ---
+    if diagonal is not None:
+        diag = sign * np.asarray(diagonal, dtype=float).ravel()
+    else:
+        diag = None
+
+    # --- Initial guess block ---
+    if X0 is not None:
+        V0 = np.asarray(X0, dtype=float)
+        if V0.ndim == 1:
+            V0 = V0.reshape(-1, 1)
+    elif diag is not None:
+        order = np.argsort(diag)[:nroots]
+        V0 = np.zeros((n, nroots))
+        V0[order, np.arange(nroots)] = 1.0
+    else:
+        rng = np.random.default_rng(0)
+        V0 = rng.standard_normal((n, nroots))
+    # Guarantee at least nroots starting directions.
+    if V0.shape[1] < nroots:
+        pad = np.zeros((n, nroots - V0.shape[1]))
+        order = np.argsort(diag)[:nroots] if diag is not None else np.arange(nroots)
+        for c, r in enumerate(order[V0.shape[1]:]):
+            pad[r, c] = 1.0
+        V0 = np.hstack([V0, pad])
+
+    V = _orthonormalize_against(np.zeros((n, 0)), V0)
+    W = apply(V)  # A @ V
+
+    if verbose >= 1:
+        print("Davidson block solver:")
+        print(f"  Matrix size: {n},  roots: {nroots},  max subspace: {max_subspace}")
+        print(f"  tol: {tol},  maxiter: {maxiter},  preconditioner: "
+              f"{'diagonal' if diag is not None else 'none'}")
+
+    theta = np.zeros(nroots)
+    X = V[:, :nroots].copy()
+    for it in range(1, maxiter + 1):
+        # Rayleigh-Ritz in the current subspace.
+        H = V.T @ W
+        H = 0.5 * (H + H.T)
+        evals, evecs = np.linalg.eigh(H)
+        theta = evals[:nroots]
+        S = evecs[:, :nroots]
+        X = V @ S            # Ritz vectors
+        AX = W @ S           # A @ Ritz vectors
+        R = AX - X * theta   # residuals (n, nroots)
+        rnorm = np.linalg.norm(R, axis=0)
+        n_conv = int(np.sum(rnorm < tol))
+        if verbose >= 2:
+            print(f"  iter {it:3d}: subspace={V.shape[1]:4d}  converged={n_conv}/{nroots}"
+                  f"  max|r|={rnorm.max():.2e}")
+        if n_conv == nroots:
+            if verbose >= 1:
+                print(f"  converged in {it} iterations (max|r|={rnorm.max():.2e})")
+            break
+
+        # Preconditioned correction vectors for the unconverged roots only.
+        unconv = np.where(rnorm >= tol)[0]
+        T = np.empty((n, len(unconv)))
+        for c, j in enumerate(unconv):
+            if diag is not None:
+                d = diag - theta[j]
+                d = np.where(np.abs(d) < 1e-8, np.sign(d) * 1e-8 + 1e-30, d)
+                T[:, c] = R[:, j] / d
+            else:
+                T[:, c] = R[:, j]
+
+        # Thick restart before the subspace overflows.
+        if V.shape[1] + len(unconv) > max_subspace:
+            V = _orthonormalize_against(np.zeros((n, 0)), X)
+            W = apply(V)
+
+        Tn = _orthonormalize_against(V, T)
+        if Tn.shape[1] == 0:
+            # No new directions (stagnation). Try a random restart once; else stop.
+            if verbose >= 1:
+                warnings.warn(
+                    f"Davidson stagnated at iter {it} (max|r|={rnorm.max():.2e}); "
+                    "returning best Ritz estimates."
+                )
+            break
+        V = np.hstack([V, Tn])
+        W = np.hstack([W, apply(Tn)])
+    else:
+        if verbose >= 1:
+            warnings.warn(
+                f"Davidson did not fully converge in {maxiter} iterations "
+                f"(max|r|={rnorm.max():.2e})."
+            )
+
+    order = np.argsort(theta)
+    theta = theta[order]
+    X = X[:, order]
+    if verbose >= 1:
+        print(f"  eigenvalues: {theta}")
+    return theta, X
+
+
 def davidson(
     matrix: Union[np.ndarray, LinearOperator, Callable],
     nroots: int = 1,
@@ -419,8 +630,12 @@ def davidson(
         solver = solve_lobpcg
     elif method.lower() == 'eigsh':
         solver = solve_eigsh
+    elif method.lower() == 'davidson':
+        solver = solve_davidson
     else:
-        raise ValueError(f"Unknown method: {method}. Use 'lobpcg' or 'eigsh'.")
+        raise ValueError(
+            f"Unknown method: {method}. Use 'davidson', 'lobpcg', or 'eigsh'."
+        )
     
     # Use diagonal for preconditioning only if requested
     diag = diagonal if precondition else None

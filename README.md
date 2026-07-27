@@ -189,7 +189,30 @@ kernel, opts = extract_gto_kernel(
 results = run_casida(kernel, opts)
 ```
 
-`GTOKernel` delegates the coupling to PySCF `mf.gen_response`, so it matches PySCF TDDFT exactly: Coulomb, singlet-adapted adiabatic f_xc, and exact exchange for hybrid / range-separated functionals (e.g. `pbe0`, `b3lyp`, `cam-b3lyp`). A plain RHF ground state gives CIS. Hybrids require `tda=True` (the matrix-free RPA chain assumes `A - B = diag(dE)`, which exact exchange breaks); pure functionals support both TDA and full Casida. Density fitting is used when `use_df=True`. GPU support is deferred.
+`GTOKernel` delegates the coupling to PySCF `mf.gen_response`, so it matches PySCF TDDFT exactly: Coulomb, singlet-adapted adiabatic f_xc, and exact exchange for hybrid / range-separated functionals (e.g. `pbe0`, `b3lyp`, `cam-b3lyp`). A plain RHF ground state gives CIS. Hybrids require `tda=True` (the matrix-free RPA chain assumes `A - B = diag(dE)`, which exact exchange breaks); pure functionals support both TDA and full Casida. Density fitting is used when `use_df=True`.
+
+**Spin-flip TDDFT (GTO, Route A)** — collinear Mₛ = −1 manifold on a high-spin UKS/UHF reference (α-occupied → β-virtual). In that block the Hartree term and spin-diagonal `f_xc` vanish; only exact exchange survives (`K = -c_x · get_k(dm_αβ)`). That implies:
+
+- **hybrid XC required** (e.g. `bhandhlyp`, `bhhlyp`, `pbe0`); pure functionals give zero coupling and are rejected
+- **TDA only** (no RPA / full Casida)
+- **dipole-forbidden** in the one-electron picture (`⟨α|r|β⟩ = 0`), so oscillator strengths are zero
+- Route B (non-collinear transverse `f_xc`, `sf_xc=True`) is not implemented yet
+
+```python
+from casidapy import extract_sf_gto_kernel, run_casida, GTOKernel
+
+# Convenience: UKS SCF + SF kernel + CasidaOptions (tda=True)
+kernel, opts = extract_sf_gto_kernel(
+    mol, xc="bhandhlyp", n_states=10, use_df=False,
+)
+opts.solver_method = "davidson"  # or "eigsh" / "lobpcg"
+results = run_casida(kernel, opts)
+
+# Or build the kernel only (pass a converged unrestricted mf to skip SCF):
+kernel = GTOKernel.build_spin_flip(mol, xc="bhandhlyp", mf=mf)
+```
+
+Driver: `scripts/run_sf_tda.py` (CH₂ triplet or 90°-twisted ethylene).
 
 **Performance:** when `n_trans <= k_cache_max` (default 4096), `setup()` precomputes the full K matrix using batched `gen_response` calls — a few AO-integral passes total instead of one per solver iteration — after which every matvec is a DGEMM. For larger active spaces, matvecs are evaluated on the fly. PySCF's integrals and grid quadrature are OpenMP-threaded; set `OMP_NUM_THREADS` to the core count for intra-node parallelism (MPI does not help the GTO path). `GTOKernel.dense_K_rows` also plugs into the engine's MPI dense build (`build_matrices`), same as the plane-wave backend.
 
@@ -292,16 +315,17 @@ casidapy/
     plane_wave.py        # PlaneWaveKernel (FFT grid / QE)
     gto.py               # GTOKernel (PySCF AO/MO)
   qepy_adapter.py        # extract_casida_inputs_from_qepy_driver, slice_active_space
-  pyscf_adapter.py       # extract_gto_kernel
+  pyscf_adapter.py       # extract_gto_kernel, extract_sf_gto_kernel
   subsystem_coupling.py  # Pavanello coupling, run_subsystem_casida
   run_casida_parallel_generic.py  # casidapy-run CLI
   generate_inputs_qepy.py         # SCF export for standalone workflow
   plot_casida_spectrum.py         # casidapy-plot
   uspp.py                # ultrasoft projectors and augmentation
-  davidson.py            # Davidson diagonalization (large dense matrices)
+  davidson.py            # Davidson / LOBPCG / eigsh (matrix-free)
   polariton_handler.py   # optional polariton extensions
-scripts/                 # SLURM wrappers (run_scf.sh, run_casida.sh, run_full_pipeline.sh)
-tutorials/               # H₂O Jupyter notebooks
+  qed.py                 # Pauli–Fierz QED-TDA (closed-shell GTO)
+scripts/                 # run_sf_tda.py, run_qed_formaldehyde.py, SLURM wrappers
+tutorials/               # H₂O + QED-TDA Jupyter notebooks
 tests/                   # pytest unit tests
 ```
 

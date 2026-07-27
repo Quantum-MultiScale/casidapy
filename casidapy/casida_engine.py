@@ -23,7 +23,7 @@ from casidapy.casida_utils import (
     normalize_wavefunctions,
     psi_to_fields,
 )
-from casidapy.davidson import davidson, solve_eigsh, solve_lobpcg
+from casidapy.davidson import davidson, solve_davidson, solve_eigsh, solve_lobpcg
 from casidapy.kernels.plane_wave import PlaneWaveKernel
 from casidapy.qepy_adapter import slice_active_space
 
@@ -303,7 +303,12 @@ class CasidaKS_MPI:
 
         X0 = build_initial_guess(self._dE, k)
 
-        if method.lower() == "lobpcg":
+        if method.lower() == "davidson":
+            eigenvalues, eigenvectors = solve_davidson(
+                A_op, nroots=k, X0=X0, diagonal=diagonal, tol=tol, maxiter=maxiter,
+                largest=False, verbose=verbose if self.rank == 0 else 0
+            )
+        elif method.lower() == "lobpcg":
             eigenvalues, eigenvectors = solve_lobpcg(
                 A_op, nroots=k, X0=X0, diagonal=diagonal, tol=tol, maxiter=maxiter,
                 largest=False, verbose=verbose if self.rank == 0 else 0
@@ -314,7 +319,9 @@ class CasidaKS_MPI:
                 largest=False, verbose=verbose if self.rank == 0 else 0
             )
         else:
-            raise ValueError(f"Unknown method: {method}. Use 'lobpcg' or 'eigsh'.")
+            raise ValueError(
+                f"Unknown method: {method}. Use 'davidson', 'lobpcg', or 'eigsh'."
+            )
 
         if self.tda:
             omega = eigenvalues

@@ -89,3 +89,55 @@ def extract_gto_kernel(
         use_eDFTpy=False,
     )
     return kernel, opts
+
+
+def extract_sf_gto_kernel(
+    mol,
+    *,
+    xc: str = "bhandhlyp",
+    spin: Optional[int] = None,
+    charge: Optional[int] = None,
+    n_occ: Optional[int] = None,
+    n_unocc: Optional[int] = None,
+    n_states: int = 20,
+    use_df: bool = True,
+    sf_xc: bool = False,
+    mf=None,
+    verbose: bool = False,
+    use_gpu: bool = False,
+) -> Tuple[GTOKernel, CasidaOptions]:
+    """Build a collinear SF-TDDFT :class:`GTOKernel` (+ options) from ``mol``.
+
+    Converges a high-spin unrestricted (UKS/UHF) reference — Mₛ = spin/2 — and
+    sets up the α-occupied → β-virtual spin-flip manifold. Exchange-only (Route
+    A): needs a hybrid ``xc`` and is TDA-only. Pass a converged unrestricted
+    ``mf`` to skip the internal SCF. See :meth:`GTOKernel.build_spin_flip`.
+    """
+    kernel = GTOKernel.build_spin_flip(
+        mol,
+        xc=xc,
+        spin=spin,
+        charge=charge,
+        n_occ=n_occ,
+        n_unocc=n_unocc,
+        use_df=use_df,
+        sf_xc=sf_xc,
+        mf=mf,
+        verbose=verbose,
+        use_gpu=use_gpu,
+    )
+    opts = CasidaOptions(
+        n_occ=kernel.n_occ,
+        n_unocc=kernel.n_unocc,
+        n_states=n_states,
+        n_total_occ=kernel.n_occ,
+        tda=True,  # SF-TDDFT is TDA-only in this backend
+        matrix_free=True,
+        solver_method="eigsh",
+        use_gpu=use_gpu,
+        xc=str(xc),
+        basis="gto",
+        use_uspp=False,
+        use_eDFTpy=False,
+    )
+    return kernel, opts

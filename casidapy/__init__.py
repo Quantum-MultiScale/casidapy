@@ -8,7 +8,7 @@ from casidapy.casida_engine import (
 )
 from casidapy.kernels import KernelBackend, PlaneWaveKernel, GTOKernel
 from casidapy.qepy_adapter import slice_active_space, build_uspp_map_from_driver
-from casidapy.pyscf_adapter import extract_gto_kernel
+from casidapy.pyscf_adapter import extract_gto_kernel, extract_sf_gto_kernel
 from casidapy.qed import (
     QEDOptions,
     QEDResults,
@@ -49,6 +49,7 @@ __all__ = [
     "slice_active_space",
     "build_uspp_map_from_driver",
     "extract_gto_kernel",
+    "extract_sf_gto_kernel",
     "QEDOptions",
     "QEDResults",
     "build_qed_tda_matrix",
