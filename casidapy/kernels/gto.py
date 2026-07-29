@@ -2,11 +2,14 @@
 
 RKS + adiabatic XC response, delegated to PySCF ``mf.gen_response`` so the
 coupling matches PySCF TDDFT exactly: Coulomb, exact exchange for (range-
-separated) hybrids, and the singlet-adapted f_xc are all included. Density
-fitting is used when ``use_df`` is set (via ``mf.density_fit()``).
+separated) hybrids, and the spin-adapted f_xc (singlet or triplet via
+``spin_state``) are all included. Density fitting is used when ``use_df``
+is set (via ``mf.density_fit()``).
 
-Hybrids are supported in TDA only: the matrix-free RPA chain assumes
-``A - B = diag(dE)``, which does not hold once exact exchange enters ``B``.
+Pure functionals support TDA and full TDDFT/RPA (matrix-free Casida ``C``
+chain with ``A - B = diag(dE)``). Hybrids support TDA matrix-free and full
+TDDFT via dense ``A,B`` from PySCF ``get_ab()`` (exact exchange makes
+``A - B`` non-diagonal, so the cheap matrix-free RPA chain does not apply).
 
 **Spin-flip TDDFT** (``spin_flip=True``, built via :meth:`GTOKernel.build_spin_flip`)
 runs the collinear Mₛ = −1 manifold (α-occupied → β-virtual) on a high-spin
@@ -52,8 +55,8 @@ class GTOKernel:
         virtuals (by occupation) are used.
     xc : str
         XC functional name understood by PySCF (e.g. ``"pbe"``, ``"pbe0"``,
-        ``"b3lyp"``). Hybrids and range-separated hybrids are supported
-        (TDA only); plain RHF ground states give CIS.
+        ``"b3lyp"``).         Hybrids and range-separated hybrids are supported (TDA matrix-free
+        or full TDDFT via dense ``build_AB``); plain RHF gives CIS / TDHF.
     use_df : bool
         Use density fitting for the response (``mf.density_fit()``) when the
         mean-field object is not already density-fitted.
@@ -87,6 +90,7 @@ class GTOKernel:
         use_gpu: bool = False,
         spin_flip: bool = False,
         sf_xc: bool = False,
+        spin_state: str = "singlet",
     ):
         try:
             from pyscf import dft, scf  # noqa: F401
@@ -105,6 +109,18 @@ class GTOKernel:
         self._mf = mf
         self._spin_flip = bool(spin_flip)
         self._sf_xc = bool(sf_xc)
+        spin_state = str(spin_state).lower().strip()
+        if spin_state not in ("singlet", "triplet"):
+            raise ValueError(
+                f"spin_state must be 'singlet' or 'triplet', got {spin_state!r}"
+            )
+        if self._spin_flip and spin_state != "singlet":
+            raise ValueError(
+                "spin_flip mode is a separate Ms=−1 manifold; do not set "
+                "spin_state='triplet' on an SF kernel."
+            )
+        self.spin_state = spin_state
+        self.triplet = spin_state == "triplet"
 
         if self._spin_flip:
             # Unrestricted high-spin reference: MO arrays are (alpha, beta).
@@ -352,7 +368,7 @@ class GTOKernel:
             return
 
         # Build (or reuse) an RKS handle; its gen_response provides the full
-        # singlet TDDFT coupling: J + singlet f_xc + exact exchange for hybrids.
+        # spin-adapted TDDFT coupling (singlet or triplet f_xc + J + hybrid K).
         if self._mf is not None:
             mf = self._mf
         else:
@@ -374,19 +390,37 @@ class GTOKernel:
             self.hybrid = bool(ni.libxc.is_hybrid_xc(mf.xc))
         else:
             self.hybrid = True  # plain RHF: response includes full exact exchange
+
+        singlet = not self.triplet
+
+        # Hybrid full TDDFT uses dense A/B (build_AB); skip gen_response setup.
         if self.hybrid and not tda:
-            raise NotImplementedError(
-                "Hybrid XC in the GTO backend requires TDA: the matrix-free RPA "
-                "chain assumes A - B = diag(dE), which exact exchange breaks. "
-                "Set tda=True (CasidaOptions.tda)."
-            )
+            self._mf = mf
+            self._vresp = None
+            self._K = None
+            self._K_dev = None
+            self._gpu_response = False
+            self._ready = True
+            if self.verbose:
+                print("GTOKernel setup:")
+                print(
+                    f"  Transitions: {self._n_occ} occ × {self._n_unocc} unocc "
+                    f"= {self._n_trans}"
+                )
+                print(
+                    f"  XC: {getattr(mf, 'xc', 'HF')}, hybrid: True, "
+                    f"spin: {self.spin_state}, "
+                    f"DF: {getattr(mf, 'with_df', None) is not None}, "
+                    f"TDA: False (dense A/B full TDDFT)"
+                )
+            return
 
         self._gpu_response = False
         if self.use_gpu:
             gmf = self._move_mf_to_gpu(mf)
             if gmf is not None and hasattr(gmf, "gen_response"):
                 try:
-                    self._vresp = gmf.gen_response(singlet=True, hermi=0)
+                    self._vresp = gmf.gen_response(singlet=singlet, hermi=0)
                     self._mf = gmf
                     self._gpu_response = True
                 except Exception as exc:
@@ -394,18 +428,18 @@ class GTOKernel:
                         f"gpu4pyscf gen_response unavailable ({exc}); "
                         "using CPU response with GPU contractions / cached K."
                     )
-                    self._vresp = mf.gen_response(singlet=True, hermi=0)
+                    self._vresp = mf.gen_response(singlet=singlet, hermi=0)
             else:
                 warnings.warn(
                     "gpu4pyscf not available or mf.to_gpu() failed; "
                     "using CPU response with GPU contractions / cached K. "
                     "Install with: pip install gpu4pyscf"
                 )
-                self._vresp = mf.gen_response(singlet=True, hermi=0)
+                self._vresp = mf.gen_response(singlet=singlet, hermi=0)
             self._C_o_dev = self._cp.asarray(self._C_o)
             self._C_v_dev = self._cp.asarray(self._C_v)
         else:
-            self._vresp = mf.gen_response(singlet=True, hermi=0)
+            self._vresp = mf.gen_response(singlet=singlet, hermi=0)
 
         self._ready = True
         if self.verbose:
@@ -416,6 +450,7 @@ class GTOKernel:
             )
             print(
                 f"  XC: {getattr(mf, 'xc', 'HF')}, hybrid: {self.hybrid}, "
+                f"spin: {self.spin_state}, "
                 f"DF: {getattr(mf, 'with_df', None) is not None}, TDA: {tda}"
             )
             if self.use_gpu:
@@ -697,14 +732,76 @@ class GTOKernel:
         Kv = self._C_o.T @ v_ao.T @ self._C_v
         return Kv.ravel()
 
-    def dipole_matrix(self) -> np.ndarray:
+    def build_AB(self) -> tuple:
+        """Active-space Casida ``A``, ``B`` matrices (n_trans × n_trans).
+
+        Uses PySCF ``TDDFT.get_ab()`` so hybrid exact exchange enters ``A`` and
+        ``B`` correctly (``A - B`` is *not* ``diag(dE)``). Orbital-energy
+        gaps are already included on the diagonal of ``A``.
+
+        Intended for full TDDFT/RPA with hybrids (and as a dense reference for
+        pure functionals). Spin-flip remains TDA-only.
+        """
+        if self._spin_flip:
+            raise NotImplementedError(
+                "SF-TDDFT is TDA-only; build_AB is for spin-conserving TDDFT."
+            )
+        if not self._ready:
+            self.setup(tda=self.tda)
+        if self._mf is None:
+            raise RuntimeError("build_AB requires a mean-field object (mf).")
+
+        from pyscf import tdscf
+
+        td = tdscf.TDDFT(self._mf)
+        # PySCF selects singlet vs triplet kernels via the ``singlet`` attribute
+        # (``get_ab`` does not accept a ``singlet=`` keyword on current PySCF).
+        td.singlet = not self.triplet
+        A4, B4 = td.get_ab()
+        A4 = np.asarray(A4, dtype=float)
+        B4 = np.asarray(B4, dtype=float)
+        if A4.ndim != 4 or B4.ndim != 4:
+            raise RuntimeError(
+                f"Unexpected get_ab shapes: A={A4.shape}, B={B4.shape} "
+                "(expected nocc × nvir × nocc × nvir)."
+            )
+
+        mo_occ = np.asarray(self.mo_occ, dtype=float)
+        if mo_occ.ndim != 1:
+            raise ValueError(
+                "build_AB expects a restricted (RKS/RHF) reference with 1-D mo_occ."
+            )
+        occ_all = np.where(mo_occ > 1e-6)[0]
+        virt_all = np.where(mo_occ < 1e-6)[0]
+        occ_map = {int(m): i for i, m in enumerate(occ_all)}
+        virt_map = {int(m): a for a, m in enumerate(virt_all)}
+        try:
+            o_loc = np.array([occ_map[int(i)] for i in self._occ_idx], dtype=int)
+            v_loc = np.array([virt_map[int(a)] for a in self._virt_idx], dtype=int)
+        except KeyError as exc:
+            raise ValueError(
+                "Active MO index is not in the occupied/virtual set used by get_ab."
+            ) from exc
+
+        A_act = A4[np.ix_(o_loc, v_loc, o_loc, v_loc)]
+        B_act = B4[np.ix_(o_loc, v_loc, o_loc, v_loc)]
+        ntr = self._n_trans
+        return A_act.reshape(ntr, ntr), B_act.reshape(ntr, ntr)
+
+    def dipole_matrix(
+        self, origin: Sequence[float] = (0.0, 0.0, 0.0)
+    ) -> np.ndarray:
         if self._spin_flip:
             # Spin-flip transitions are dipole-forbidden through the (spin-
             # conserving) electric-dipole operator: ⟨α|β⟩ = 0. Oscillator
             # strengths require a spin-orbit treatment not modeled here.
             return np.zeros((self._n_trans, 3), dtype=float)
+        if self.triplet:
+            # ⟨S0|μ|T⟩ = 0 without SOC (spin forbidden).
+            return np.zeros((self._n_trans, 3), dtype=float)
         # μ_AO: (3, nao, nao); then μ_ia = C_o† μ C_v
-        with self.mol.with_common_orig((0.0, 0.0, 0.0)):
+        orig = tuple(np.asarray(origin, dtype=float).ravel())
+        with self.mol.with_common_orig(orig):
             dip_ao = self.mol.intor("int1e_r", comp=3)
         mu = np.empty((self._n_trans, 3), dtype=float)
         for alpha in range(3):

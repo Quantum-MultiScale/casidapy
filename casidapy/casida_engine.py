@@ -195,8 +195,20 @@ class CasidaKS_MPI:
 
     def setup_matrix_free(self, tda: bool = False):
         self._kernel.setup(tda=tda)
+        if (
+            not tda
+            and getattr(self._kernel, "hybrid", False)
+            and type(self._kernel).__name__ == "GTOKernel"
+        ):
+            raise NotImplementedError(
+                "Hybrid full TDDFT is not available matrix-free (A-B ≠ diag(dE)). "
+                "Use run_casida(), which builds dense A/B via PySCF get_ab(), "
+                "or set tda=True."
+            )
         self.tda = tda
         self._n_trans = self._kernel.n_trans
+        self._n_occ = self._kernel.n_occ
+        self._n_unocc = self._kernel.n_unocc
         self._dE = self._kernel.diagonal_dE()
         self._sqrt_dE = np.sqrt(self._dE)
         self._dV = getattr(self._kernel, "_dV", None)
@@ -604,30 +616,73 @@ def run_casida(
     n_states_actual = min(options.n_states, n_trans)
 
     t0 = MPI.Wtime()
-    if not options.matrix_free and isinstance(kernel, GTOKernel):
-        # Dense GTO not implemented — force matrix-free
-        if rank == 0:
-            print("GTO backend: forcing matrix_free=True")
-        options.matrix_free = True
 
-    if options.matrix_free:
-        casida.setup_matrix_free(tda=options.tda)
+    # Hybrid full TDDFT: A-B ≠ diag(dE) → dense A/B via PySCF get_ab.
+    # Pure-functional RPA stays matrix-free (fast C-chain).
+    hybrid_rpa = False
+    if isinstance(kernel, GTOKernel) and not options.tda:
+        kernel.setup(tda=False)
+        hybrid_rpa = bool(getattr(kernel, "hybrid", False))
+
+    if hybrid_rpa:
+        if rank == 0:
+            print(
+                "GTO hybrid full TDDFT: dense A/B from PySCF get_ab() "
+                f"(n_trans={n_trans})"
+            )
+        A, B = kernel.build_AB()
+        casida.A = np.asarray(A, dtype=float)
+        casida.B = np.asarray(B, dtype=float)
+        casida.tda = False
+        casida._n_trans = n_trans
+        casida._n_occ = kernel.n_occ
+        casida._n_unocc = kernel.n_unocc
+        casida._dE = kernel.diagonal_dE()
+        casida._sqrt_dE = np.sqrt(casida._dE)
+        AmB = casida.A - casida.B
+        ApB = casida.A + casida.B
+        s, U = scipy_eigh(AmB)
+        threshold = 1e-10
+        s_clip = np.maximum(s, threshold)
+        sqrt_AmB = (U * np.sqrt(s_clip)) @ U.T
+        casida.C = sqrt_AmB @ ApB @ sqrt_AmB
+        casida._AmB_evals = s
+        casida._AmB_evecs = U
+        casida._matrix_free = False
         t_build = MPI.Wtime() - t0
         t1 = MPI.Wtime()
-        omega, Z = casida.solve_matrix_free(
+        omega, Z = casida.solve(
             k=n_states_actual,
-            tol=options.solver_tol,
-            maxiter=options.solver_maxiter,
+            use_davidson=False,
             verbose=1 if rank == 0 else 0,
-            method=options.solver_method,
         )
         t_solve = MPI.Wtime() - t1
+        options.matrix_free = False
     else:
-        casida.build_matrices(tda=options.tda)
-        t_build = MPI.Wtime() - t0
-        t1 = MPI.Wtime()
-        omega, Z = casida.solve(k=n_states_actual)
-        t_solve = MPI.Wtime() - t1
+        if not options.matrix_free and isinstance(kernel, GTOKernel):
+            # Pure GTO TDA/RPA: matrix-free is the supported fast path
+            if rank == 0:
+                print("GTO backend: forcing matrix_free=True")
+            options.matrix_free = True
+
+        if options.matrix_free:
+            casida.setup_matrix_free(tda=options.tda)
+            t_build = MPI.Wtime() - t0
+            t1 = MPI.Wtime()
+            omega, Z = casida.solve_matrix_free(
+                k=n_states_actual,
+                tol=options.solver_tol,
+                maxiter=options.solver_maxiter,
+                verbose=1 if rank == 0 else 0,
+                method=options.solver_method,
+            )
+            t_solve = MPI.Wtime() - t1
+        else:
+            casida.build_matrices(tda=options.tda)
+            t_build = MPI.Wtime() - t0
+            t1 = MPI.Wtime()
+            omega, Z = casida.solve(k=n_states_actual)
+            t_solve = MPI.Wtime() - t1
 
     f = casida.oscillator_strengths(k=n_states_actual)
     rho_state = None
@@ -649,6 +704,7 @@ def run_casida(
             "n_states": n_states_actual,
             "tda": options.tda,
             "matrix_free": options.matrix_free,
+            "hybrid_rpa_dense": hybrid_rpa,
             "t_build": t_build,
             "t_solve": t_solve,
         },

@@ -235,8 +235,9 @@ class TestKernelBackends:
         n = min(len(results.omega), len(e_ref))
         np.testing.assert_allclose(results.omega[:n], e_ref[:n], atol=1e-6)
 
-    def test_gto_kernel_hybrid_rejects_rpa(self):
-        """Hybrid XC + full Casida (non-TDA) is unsupported and must raise."""
+    @pytest.mark.parametrize("xc", ["lda,vwn", "pbe"])
+    def test_gto_kernel_matches_pyscf_rpa(self, xc):
+        """Pure-functional full TDDFT (matrix-free RPA) must match PySCF TDDFT."""
         pytest.importorskip("pyscf")
         from pyscf import gto, dft
         from casidapy.pyscf_adapter import extract_gto_kernel
@@ -244,14 +245,80 @@ class TestKernelBackends:
 
         mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="6-31g", verbose=0)
         mf = dft.RKS(mol)
-        mf.xc = "pbe0"
+        mf.xc = xc
         mf.kernel()
+
+        td = mf.TDDFT()
+        td.nstates = 2
+        e_ref = td.kernel()[0]
+
         kernel, opts = extract_gto_kernel(
             mf, n_states=2, tda=False, use_df=False, verbose=False
         )
         opts.solver_method = "eigsh"
-        with pytest.raises(NotImplementedError, match="requires TDA"):
-            run_casida(kernel, opts)
+        opts.solver_maxiter = 300
+        results = run_casida(kernel, opts)
+
+        n = min(len(results.omega), len(e_ref))
+        np.testing.assert_allclose(results.omega[:n], e_ref[:n], atol=1e-6)
+        assert results.xpy is not None
+        assert results.xpy.shape[1] == n
+        assert results.metadata.get("hybrid_rpa_dense") is False
+
+    @pytest.mark.parametrize("xc", ["pbe0", "b3lyp", "hf"])
+    def test_gto_kernel_matches_pyscf_hybrid_rpa(self, xc):
+        """Hybrid/HF full TDDFT via dense A/B must match PySCF TDDFT/TDHF."""
+        pytest.importorskip("pyscf")
+        from pyscf import gto, dft, scf, tdscf
+        from casidapy.pyscf_adapter import extract_gto_kernel
+        from casidapy.casida_engine import run_casida
+
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="6-31g", verbose=0)
+        if xc.lower() == "hf":
+            mf = scf.RHF(mol)
+        else:
+            mf = dft.RKS(mol)
+            mf.xc = xc
+        mf.kernel()
+
+        td = tdscf.TDDFT(mf)  # dispatches to TDHF for RHF
+        td.nstates = 2
+        e_ref = td.kernel()[0]
+
+        kernel, opts = extract_gto_kernel(
+            mf, n_states=2, tda=False, use_df=False, verbose=False,
+            xc=("hf" if xc.lower() == "hf" else xc),
+        )
+        results = run_casida(kernel, opts)
+
+        n = min(len(results.omega), len(e_ref))
+        np.testing.assert_allclose(results.omega[:n], e_ref[:n], atol=1e-6)
+        assert results.metadata.get("hybrid_rpa_dense") is True
+        assert results.xpy is not None
+
+    def test_gto_hybrid_rpa_rejects_matrix_free_direct(self):
+        """Direct matrix-free hybrid RPA must still raise (dense path only)."""
+        pytest.importorskip("pyscf")
+        from pyscf import gto, dft
+        from casidapy.pyscf_adapter import extract_gto_kernel
+        from casidapy.casida_engine import CasidaKS_MPI
+
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="6-31g", verbose=0)
+        mf = dft.RKS(mol)
+        mf.xc = "pbe0"
+        mf.kernel()
+        kernel, _ = extract_gto_kernel(
+            mf, n_states=2, tda=False, use_df=False, verbose=False
+        )
+        casida = object.__new__(CasidaKS_MPI)
+        casida.comm = __import__("mpi4py").MPI.COMM_WORLD
+        casida.rank = 0
+        casida.size = 1
+        casida._kernel = kernel
+        casida._n_occ = kernel.n_occ
+        casida._n_unocc = kernel.n_unocc
+        with pytest.raises(NotImplementedError, match="not available matrix-free"):
+            casida.setup_matrix_free(tda=False)
 
     def test_gto_apply_K_matmat_matches_columns(self):
         """Batched matmat must match column-wise apply_K (LOBPCG block path)."""
@@ -382,6 +449,389 @@ class TestSpinFlipGTO:
         )
         with pytest.raises(NotImplementedError, match="sf_xc"):
             kernel.setup(tda=True)
+
+
+class TestQEDClosedShellMPI:
+    """MPI-aware closed-shell QED-TDA matrix build (row distribution)."""
+
+    @staticmethod
+    def _h2_kernel(*, k_cache_max=0):
+        from pyscf import gto, dft
+        from casidapy.kernels.gto import GTOKernel
+
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="6-31g", verbose=0)
+        mf = dft.RKS(mol)
+        mf.xc = "pbe"
+        mf.kernel()
+        kernel = GTOKernel(
+            mol, mf.mo_coeff, mf.mo_energy, mf.mo_occ,
+            xc="pbe", use_df=False, mf=mf, k_cache_max=k_cache_max, verbose=False,
+        )
+        kernel.setup(tda=True)
+        return kernel
+
+    def test_dse_exchange_rows_match_full(self):
+        from casidapy.qed import dse_exchange_matrix, dse_exchange_rows
+
+        rng = np.random.default_rng(0)
+        n_o, n_v = 3, 4
+        Q_oo = rng.standard_normal((n_o, n_o))
+        Q_oo = 0.5 * (Q_oo + Q_oo.T)
+        Q_vv = rng.standard_normal((n_v, n_v))
+        Q_vv = 0.5 * (Q_vv + Q_vv.T)
+        full = dse_exchange_matrix(Q_oo, Q_vv)
+        rows = [0, 2, 5, 11]
+        part = dse_exchange_rows(Q_oo, Q_vv, rows)
+        np.testing.assert_allclose(part, full[rows], atol=1e-12)
+
+    def test_partitioned_A_rows_match_serial_M(self):
+        """Simulated multi-rank row ownership must reproduce serial A = M[:n,:n]."""
+        pytest.importorskip("pyscf")
+        from casidapy.qed import (
+            build_qed_tda_matrix,
+            dipole_blocks,
+            qed_electronic_A_rows,
+            _mpi_round_robin_rows,
+        )
+
+        kernel = self._h2_kernel(k_cache_max=0)
+        lam = (0.0, 0.0, 0.05)
+        omega_c = 0.2
+        M = build_qed_tda_matrix(kernel, lam, omega_c, include_dse=True)
+        n = kernel.n_trans
+        q, Q_oo, Q_vv = dipole_blocks(kernel, lam)
+
+        for size in (2, 3, 4):
+            A = np.zeros((n, n), dtype=float)
+            for rank in range(size):
+                rows = _mpi_round_robin_rows(n, rank, size)
+                A_loc = qed_electronic_A_rows(
+                    kernel, rows, q, Q_oo, Q_vv, include_dse=True,
+                )
+                for k, ia in enumerate(rows):
+                    A[ia, :] = A_loc[k]
+            np.testing.assert_allclose(A, M[:n, :n], atol=1e-9)
+
+    def test_mpi_comm_world_size1_matches_serial(self):
+        pytest.importorskip("pyscf")
+        pytest.importorskip("mpi4py")
+        from mpi4py import MPI
+        from casidapy.qed import build_qed_tda_matrix, solve_qed_tda
+
+        kernel = self._h2_kernel(k_cache_max=0)
+        lam = (0.0, 0.0, 0.04)
+        omega_c = 0.15
+        M_serial = build_qed_tda_matrix(kernel, lam, omega_c)
+        M_mpi = build_qed_tda_matrix(kernel, lam, omega_c, comm=MPI.COMM_WORLD)
+        np.testing.assert_allclose(M_mpi, M_serial, atol=1e-10)
+
+        res = solve_qed_tda(
+            kernel, lam_vec=lam, omega_c=omega_c, nstates=4, comm=MPI.COMM_WORLD,
+        )
+        assert res.omega.shape == (4,)
+        assert res.meta["mpi_size"] == MPI.COMM_WORLD.Get_size()
+        assert np.all(np.isfinite(res.omega))
+
+
+class TestQEDSpinFlip:
+    """QED-SF-TDA: Δd coupling on the collinear SF manifold."""
+
+    def test_delta_matrix_structure_and_symmetry(self):
+        pytest.importorskip("pyscf")
+        from casidapy.kernels.gto import GTOKernel
+        from casidapy.qed import sf_dipole_difference_matrix
+
+        mol, mf = TestSpinFlipGTO._triplet_mf("bhandhlyp")
+        kernel = GTOKernel.build_spin_flip(mol, xc="bhandhlyp", use_df=False, mf=mf)
+        kernel.setup(tda=True)
+        lam = np.array([0.0, 0.0, 0.05])
+        delta = sf_dipole_difference_matrix(kernel, lam)
+        n = kernel.n_trans
+        assert delta.shape == (n, n)
+        assert np.allclose(delta, delta.T, atol=1e-10)
+
+        # Explicit check of a few Slater–Condon cases
+        n_o, n_v = kernel.n_occ, kernel.n_unocc
+        C_o, C_v = kernel._C_o, kernel._C_v
+        with mol.with_common_orig((0.0, 0.0, 0.0)):
+            dip_ao = mol.intor("int1e_r", comp=3)
+        Q_oo = np.einsum("x,xpq,pi,qj->ij", lam, dip_ao, C_o, C_o)
+        Q_vv = np.einsum("x,xpq,pa,qb->ab", lam, dip_ao, C_v, C_v)
+        # diagonal ia=ia: Q_vv[a,a] - Q_oo[i,i]
+        for i in range(n_o):
+            for a in range(n_v):
+                ia = i * n_v + a
+                assert abs(delta[ia, ia] - (Q_vv[a, a] - Q_oo[i, i])) < 1e-10
+
+    def test_lambda_zero_recovers_electronic_sf_and_shift(self):
+        """λ=0 → eigenvalues are {ω_SF} ∪ {ω_SF + ω_c}."""
+        pytest.importorskip("pyscf")
+        from casidapy.kernels.gto import GTOKernel
+        from casidapy.qed import solve_qed_sf_tda
+
+        mol, mf = TestSpinFlipGTO._triplet_mf("bhandhlyp")
+        kernel = GTOKernel.build_spin_flip(mol, xc="bhandhlyp", use_df=False, mf=mf)
+        kernel.setup(tda=True)
+        n = kernel.n_trans
+        A = kernel._K + np.diag(kernel.diagonal_dE())
+        w_sf = np.sort(np.linalg.eigvalsh(A))
+
+        omega_c = 0.15
+        res = solve_qed_sf_tda(
+            kernel,
+            lam_vec=(0.0, 0.0, 0.0),
+            omega_c=omega_c,
+            nstates=2 * n,
+        )
+        expected = np.sort(np.concatenate([w_sf, w_sf + omega_c]))
+        np.testing.assert_allclose(res.omega, expected, atol=1e-8)
+        # Pure electronic roots (lowest n if ω_c large enough vs gaps): photon ~0
+        # With ω_c=0.15, check that photon_frac is ~0 or ~1 for each root
+        assert np.all((res.photon_frac < 1e-8) | (res.photon_frac > 1.0 - 1e-8))
+        assert res.meta["spin_flip"] is True
+        assert res.X.shape == (2 * n, 2 * n)
+
+    def test_qed_sf_smoke_and_guards(self):
+        pytest.importorskip("pyscf")
+        from casidapy.kernels.gto import GTOKernel
+        from casidapy.qed import (
+            build_qed_tda_matrix,
+            solve_qed_sf_tda,
+            solve_qed_tda,
+            scan_qed_sf_lambda,
+        )
+
+        mol, mf = TestSpinFlipGTO._triplet_mf("bhandhlyp")
+        kernel = GTOKernel.build_spin_flip(mol, xc="bhandhlyp", use_df=False, mf=mf)
+        kernel.setup(tda=True)
+
+        res = solve_qed_sf_tda(
+            kernel,
+            lam_vec=(0.0, 0.0, 0.05),
+            omega_c=0.1,
+            nstates=4,
+        )
+        assert res.omega.shape == (4,)
+        assert np.all(np.isfinite(res.omega))
+        assert np.all(res.omega[:-1] <= res.omega[1:] + 1e-12)
+        assert np.allclose(res.f, 0.0)
+        assert np.all(res.photon_frac >= -1e-12)
+        assert np.all(res.photon_frac <= 1.0 + 1e-12)
+
+        with pytest.raises(ValueError, match="spin-flip"):
+            solve_qed_tda(kernel, lam_vec=(0, 0, 0.05), omega_c=0.1)
+        with pytest.raises(ValueError, match="spin-flip"):
+            build_qed_tda_matrix(kernel, (0, 0, 0.05), 0.1)
+
+        scan = scan_qed_sf_lambda(
+            kernel,
+            lam_scalars=[0.0, 0.03],
+            polarization=(0, 0, 1),
+            omega_c=0.1,
+            nstates=3,
+            track=True,
+        )
+        assert scan["omega_tracked"].shape == (2, 3)
+
+
+class TestTrackStates:
+    """Geometry vs λ tracking without a full SCF."""
+
+    @staticmethod
+    def _res(omega, phot, X=None):
+        from casidapy.qed import QEDResults
+
+        omega = np.asarray(omega, dtype=float)
+        n = omega.shape[0]
+        if X is None:
+            X = np.eye(n)
+        return QEDResults(
+            omega=omega,
+            X=np.asarray(X, dtype=float),
+            m=np.zeros(n),
+            f=np.zeros(n),
+            photon_frac=np.asarray(phot, dtype=float),
+        )
+
+    def test_energy_tracking_follows_adiabatic_order(self):
+        from casidapy.qed import track_states
+
+        pts = [
+            self._res([1.0, 2.0], [0.0, 1.0]),
+            self._res([1.05, 2.1], [0.0, 1.0]),
+            self._res([1.9, 2.05], [1.0, 0.0]),
+        ]
+        omega_t, phot_t = track_states(pts, method="energy", photon_weight=0.0)
+        np.testing.assert_allclose(omega_t[:, 0], [1.0, 1.05, 1.9])
+        np.testing.assert_allclose(omega_t[:, 1], [2.0, 2.1, 2.05])
+        # With photon weight, prefer character continuity across the crossing
+        omega_p, phot_p = track_states(pts, method="energy", photon_weight=1.0)
+        np.testing.assert_allclose(phot_p[:, 0], [0.0, 0.0, 0.0])
+        np.testing.assert_allclose(phot_p[:, 1], [1.0, 1.0, 1.0])
+
+    def test_auto_falls_back_on_garbage_overlap(self):
+        from casidapy.qed import track_states
+
+        rng = np.random.default_rng(1)
+        X1 = rng.normal(size=(2, 2))
+        X1, _ = np.linalg.qr(X1)
+        pts = [
+            self._res([1.0, 2.0], [0.0, 1.0]),
+            self._res([1.05, 2.1], [0.0, 1.0], X=X1),
+        ]
+        with pytest.warns(UserWarning, match="energy"):
+            omega_t, _ = track_states(pts, method="auto", overlap_floor=0.99)
+        np.testing.assert_allclose(omega_t[:, 0], [1.0, 1.05])
+
+
+class TestTripletGTO:
+    """Closed-shell GTO triplet TDA vs PySCF."""
+
+    def test_triplet_tda_matches_pyscf(self):
+        pytest.importorskip("pyscf")
+        from pyscf import gto, dft
+        from casidapy.pyscf_adapter import extract_gto_kernel
+        from casidapy.casida_engine import run_casida
+
+        mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="6-31g", verbose=0)
+        mf = dft.RKS(mol)
+        mf.xc = "pbe"
+        mf.kernel()
+
+        td = mf.TDA()
+        td.singlet = False
+        td.nstates = 2
+        e_ref = td.kernel()[0]
+
+        kernel, opts = extract_gto_kernel(
+            mf, n_states=2, tda=True, use_df=False, spin_state="triplet",
+        )
+        opts.solver_method = "eigsh"
+        results = run_casida(kernel, opts)
+        n = min(len(results.omega), len(e_ref))
+        np.testing.assert_allclose(results.omega[:n], e_ref[:n], atol=1e-6)
+        assert np.allclose(results.f[:n], 0.0, atol=1e-12)
+        assert kernel.triplet is True
+
+
+class TestSOC:
+    """One-electron SI-SOC helpers."""
+
+    def test_soc_ao_hermitian(self):
+        pytest.importorskip("pyscf")
+        from pyscf import gto
+        from casidapy.soc import soc_ao_integrals
+
+        mol = gto.M(atom="C 0 0 0; O 0 0 1.2", basis="sto-3g", verbose=0)
+        h = soc_ao_integrals(mol)
+        assert h.shape[0] == 3
+        for k in range(3):
+            assert np.allclose(h[k], h[k].conj().T, atol=1e-10)
+
+    def test_si_recovers_uncoupled_when_h_zero(self):
+        from casidapy.soc import build_soc_si_matrix
+
+        omega_s = np.array([0.1, 0.2])
+        omega_t = np.array([0.15])
+        H_st = np.zeros((3, 2, 1), dtype=complex)
+        H, meta = build_soc_si_matrix(omega_s, omega_t, H_st)
+        w = np.linalg.eigvalsh(H)
+        expected = np.sort([0.1, 0.2, 0.15, 0.15, 0.15])
+        np.testing.assert_allclose(w, expected, atol=1e-12)
+        assert meta["n_s"] == 2 and meta["n_t"] == 1
+
+    def test_soc_si_h2co_smoke(self):
+        """Formaldehyde: SOC mixes S/T; few-level QED sees borrowed dipoles."""
+        pytest.importorskip("pyscf")
+        from pyscf import gto, dft
+        from casidapy.pyscf_adapter import extract_gto_kernel
+        from casidapy.casida_engine import run_casida
+        from casidapy.soc import solve_soc_si, solve_soc_qed_levels
+
+        mol = gto.M(
+            atom="""
+            C  0.000000  0.000000  0.000000
+            O  0.000000  0.000000  1.210000
+            H  0.000000  0.940000 -0.580000
+            H  0.000000 -0.940000 -0.580000
+            """,
+            basis="sto-3g",
+            verbose=0,
+        )
+        mf = dft.RKS(mol)
+        mf.xc = "pbe"
+        mf.grids.level = 1
+        mf.kernel()
+
+        ks, opts_s = extract_gto_kernel(
+            mf, n_states=3, tda=True, use_df=False, spin_state="singlet",
+        )
+        kt, opts_t = extract_gto_kernel(
+            mf, n_states=3, tda=True, use_df=False, spin_state="triplet",
+        )
+        opts_s.solver_method = opts_t.solver_method = "eigsh"
+        res_s = run_casida(ks, opts_s)
+        res_t = run_casida(kt, opts_t)
+
+        soc = solve_soc_si(res_s, res_t, ks, include_ground=False)
+        assert soc.omega.size == 3 + 3 * 3  # S + 3 Cartesian T
+        assert np.all(np.isfinite(soc.omega))
+        assert np.all(soc.singlet_weight + soc.triplet_weight > 0.99)
+
+        qed = solve_soc_qed_levels(
+            soc, lam_vec=(0.0, 0.0, 0.05), omega_c=float(res_s.omega[0]),
+            nstates=4,
+        )
+        assert qed["omega"].shape[0] == 5  # 4 electronic + |S0,1⟩
+        assert np.all(np.isfinite(qed["omega"]))
+        # Bright root should mix with the cavity (non-trivial photon weight)
+        assert float(np.max(qed["photon_frac"])) > 0.01
+
+        from casidapy.soc import solve_soc_qed_pf, build_soc_qed_pf_matrix
+
+        # λ→0 PF recovers {0, E_k, ω_c, E_k+ω_c}
+        e = np.array([0.0, 0.1, 0.2])
+        d = np.zeros((3, 3))
+        M0 = build_soc_qed_pf_matrix(e, d, omega_c=0.15, include_dse=False)
+        w0 = np.linalg.eigvalsh(M0)
+        expected = np.sort([0.0, 0.1, 0.2, 0.15, 0.25, 0.35])
+        np.testing.assert_allclose(w0, expected, atol=1e-12)
+
+        pf = solve_soc_qed_pf(
+            soc,
+            lam_vec=(0.0, 0.0, 0.05),
+            omega_c=float(res_s.omega[0]),
+            nstates=4,
+            include_dse=True,
+            prefer_bright=True,
+        )
+        # N = 1 (S0) + 4 SOC → 2N = 10
+        assert pf["omega"].shape[0] == 10
+        assert pf["model"] == "pauli-fierz"
+        assert abs(pf["omega"][0]) < 1e-10
+        assert float(np.max(pf["photon_frac"])) > 0.01
+        assert np.all(np.isfinite(pf["omega"]))
+        assert "f" in pf and pf["f"].shape == pf["omega"].shape
+        # Dark / nearly-pure photonic roots must not dominate the spectrum
+        assert float(np.max(pf["f"])) > 0.0
+        bright_mask = pf["f"] > 0.05 * float(np.max(pf["f"]))
+        # At least one bright root; not every root is bright
+        assert np.any(bright_mask)
+        assert np.count_nonzero(bright_mask) < pf["f"].size
+
+        # λ=0: electronic f matches SI-SOC; pure 1-photon replicas are dark
+        pf0 = solve_soc_qed_pf(
+            soc,
+            lam_vec=(0.0, 0.0, 0.0),
+            omega_c=float(res_s.omega[0]),
+            nstates=3,
+            include_dse=False,
+            prefer_bright=False,
+        )
+        # Highest photon-weight states should carry negligible oscillator strength
+        phot_dom = pf0["photon_frac"] > 0.9
+        if np.any(phot_dom):
+            assert float(np.max(pf0["f"][phot_dom])) < 1e-8
 
 
 def _make_synthetic_pw_kernel(use_gpu=False):

@@ -21,6 +21,7 @@ def extract_gto_kernel(
     tda: bool = True,
     verbose: bool = False,
     use_gpu: bool = False,
+    spin_state: str = "singlet",
 ) -> Tuple[GTOKernel, CasidaOptions]:
     """Create a :class:`GTOKernel` and matching :class:`CasidaOptions` from ``mf``.
 
@@ -32,6 +33,9 @@ def extract_gto_kernel(
     - virtual window  = ``[n_total_occ, n_total_occ + n_unocc)``
 
     Defaults use the full occupied / virtual spaces.
+
+    ``spin_state`` is ``\"singlet\"`` (default) or ``\"triplet\"`` (closed-shell
+    RKS/RHF reference with triplet-adapted response).
 
     ``use_gpu=True`` enables CuPy MO contractions / cached ``K @ v`` and, when
     gpu4pyscf is installed, a GPU ``gen_response``.
@@ -73,6 +77,7 @@ def extract_gto_kernel(
         mf=mf,
         verbose=verbose,
         use_gpu=use_gpu,
+        spin_state=spin_state,
     )
     opts = CasidaOptions(
         n_occ=kernel.n_occ,
@@ -87,6 +92,7 @@ def extract_gto_kernel(
         basis="gto",
         use_uspp=False,
         use_eDFTpy=False,
+        spin_state=str(spin_state).lower().strip(),
     )
     return kernel, opts
 

@@ -455,37 +455,129 @@ class PlaneWaveKernel:
                     )
         return K_rows
 
-    def dipole_matrix(self) -> np.ndarray:
+    def position_operator(
+        self, origin: Sequence[float] = (0.0, 0.0, 0.0)
+    ) -> tuple:
+        """Cartesian ``r − R₀`` on the FFT grid, each flat ``(n_grid,)``."""
+        orig = np.asarray(origin, dtype=float).ravel()
+        if orig.shape != (3,):
+            raise ValueError(f"origin must have shape (3,), got {orig.shape}")
+        rx = np.asarray(self.grid.r[0]).ravel() - orig[0]
+        ry = np.asarray(self.grid.r[1]).ravel() - orig[1]
+        rz = np.asarray(self.grid.r[2]).ravel() - orig[2]
+        return rx, ry, rz
+
+    def mo_dipole_blocks(
+        self, origin: Sequence[float] = (0.0, 0.0, 0.0)
+    ) -> tuple:
+        """One-body dipole MO blocks in the active space.
+
+        Returns
+        -------
+        d_oo : (3, n_occ, n_occ)
+        d_vv : (3, n_unocc, n_unocc)
+        d_ov : (3, n_occ, n_unocc)
+            ``d[α,p,q] = ∫ ψ_p (r_α − R₀) ψ_q dV`` (+ USPP when enabled).
+        """
         if not self._psi_occ:
             raise RuntimeError("Call set_active_orbitals() first.")
-
-        n_o = self._n_occ
-        n_u = self._n_unocc
+        rxyz = self.position_operator(origin)
         dV = float(self.grid.dV)
         psi_o = np.stack([np.asarray(p).ravel() for p in self._psi_occ])
         psi_u = np.stack([np.asarray(p).ravel() for p in self._psi_unocc])
-        rx = np.asarray(self.grid.r[0]).ravel()
-        ry = np.asarray(self.grid.r[1]).ravel()
-        rz = np.asarray(self.grid.r[2]).ravel()
+        n_o, n_u = self._n_occ, self._n_unocc
 
-        mu_x = (psi_o * rx) @ psi_u.T * dV
-        mu_y = (psi_o * ry) @ psi_u.T * dV
-        mu_z = (psi_o * rz) @ psi_u.T * dV
-        mu = np.stack([mu_x.ravel(), mu_y.ravel(), mu_z.ravel()], axis=-1)
+        d_oo = np.empty((3, n_o, n_o), dtype=float)
+        d_vv = np.empty((3, n_u, n_u), dtype=float)
+        d_ov = np.empty((3, n_o, n_u), dtype=float)
+        for alpha, r in enumerate(rxyz):
+            d_oo[alpha] = (psi_o * r) @ psi_o.T * dV
+            d_vv[alpha] = (psi_u * r) @ psi_u.T * dV
+            d_ov[alpha] = (psi_o * r) @ psi_u.T * dV
 
-        if self.use_uspp and self._proj_occ is not None:
+        if (
+            self.use_uspp
+            and self.qij_augmentation is not None
+            and self._proj_occ is not None
+        ):
+            for i in range(n_o):
+                for j in range(i, n_o):
+                    rho_a = rho_aug(
+                        self.grid,
+                        self.qij_augmentation,
+                        self._proj_occ[:, i],
+                        self._proj_occ[:, j],
+                    )
+                    rho_arr = np.asarray(rho_a).ravel()
+                    aug = np.array(
+                        [float(np.dot(r, rho_arr).real * dV) for r in rxyz]
+                    )
+                    d_oo[:, i, j] += aug
+                    if i != j:
+                        d_oo[:, j, i] += aug
+            for a in range(n_u):
+                for b in range(a, n_u):
+                    rho_a = rho_aug(
+                        self.grid,
+                        self.qij_augmentation,
+                        self._proj_unocc[:, a],
+                        self._proj_unocc[:, b],
+                    )
+                    rho_arr = np.asarray(rho_a).ravel()
+                    aug = np.array(
+                        [float(np.dot(r, rho_arr).real * dV) for r in rxyz]
+                    )
+                    d_vv[:, a, b] += aug
+                    if a != b:
+                        d_vv[:, b, a] += aug
             for i in range(n_o):
                 for a in range(n_u):
-                    ia = i * n_u + a
-                    p_i = self._proj_occ[:, i]
-                    p_a = self._proj_unocc[:, a]
-                    rho_a = rho_aug(self.grid, self.qij_augmentation, p_i, p_a)
+                    rho_a = rho_aug(
+                        self.grid,
+                        self.qij_augmentation,
+                        self._proj_occ[:, i],
+                        self._proj_unocc[:, a],
+                    )
                     rho_arr = np.asarray(rho_a).ravel()
-                    mu[ia, 0] += float(np.dot(rx, rho_arr).real * dV)
-                    mu[ia, 1] += float(np.dot(ry, rho_arr).real * dV)
-                    mu[ia, 2] += float(np.dot(rz, rho_arr).real * dV)
-        return mu
+                    d_ov[:, i, a] += np.array(
+                        [float(np.dot(r, rho_arr).real * dV) for r in rxyz]
+                    )
+        return d_oo, d_vv, d_ov
 
+    def permanent_dipole_el(
+        self, origin: Sequence[float] = (0.0, 0.0, 0.0)
+    ) -> np.ndarray:
+        """Electronic permanent dipole ``∫ (r − R₀) ρ_KS(r) dV`` (a.u.).
+
+        Uses the full KS density on the grid (not only the active MO window),
+        matching the GTO ``Tr(D, r)`` coherent-state convention.
+        """
+        rxyz = self.position_operator(origin)
+        dV = float(self.grid.dV)
+        rho = np.asarray(self.rho).ravel()
+        return np.array(
+            [float(np.dot(r, rho) * dV) for r in rxyz], dtype=float
+        )
+
+    @property
+    def nelectron(self) -> float:
+        """Electron count from the KS density integral."""
+        return float(np.asarray(self.rho).integral())
+
+    def dipole_matrix(
+        self, origin: Sequence[float] = (0.0, 0.0, 0.0)
+    ) -> np.ndarray:
+        """Transition dipoles ``μ_ia`` with shape ``(n_trans, 3)``."""
+        if not self._psi_occ:
+            raise RuntimeError("Call set_active_orbitals() first.")
+        if getattr(self, "triplet", False):
+            return np.zeros((self._n_trans, 3), dtype=float)
+
+        _, _, d_ov = self.mo_dipole_blocks(origin=origin)
+        # d_ov: (3, n_o, n_u) → (n_trans, 3)
+        return np.stack(
+            [d_ov[0].ravel(), d_ov[1].ravel(), d_ov[2].ravel()], axis=-1
+        )
     def collapse_transition_densities_to_state_basis(
         self, amp: np.ndarray
     ) -> Optional[np.ndarray]:
