@@ -24,9 +24,12 @@ configurations (not the spin-forbidden ``⟨α|r|β⟩`` transition dipole).
 DSE / coherent-state are off by default (bilinear / JC-like form matching
 common QED-SF-CIS presentations).
 
-This is the physical (DSE-inclusive for closed-shell) route. The
-phenomenological Tavis–Cummings post-processing in
-:mod:`casidapy.polariton_handler` is a separate, cheaper path.
+This is the physical (DSE-inclusive for closed-shell) route in the
+**transition** basis. For a cheaper post-processing route that couples the
+cavity **after** electronic TDDFT diagonalization (JC / TC / truncated PF on
+the eigenstates), use :func:`solve_qed_post`. The phenomenological Tavis–
+Cummings path in :mod:`casidapy.polariton_handler` is a separate, even
+simpler model.
 
 Ground state: ordinary converged PySCF RKS/RHF or UKS (Level A — cavity
 terms enter the response only). Full QED-SCF is out of scope.
@@ -270,9 +273,11 @@ def _mpi_gatherv_matrix_rows(
     send = np.ascontiguousarray(local_data, dtype=np.float64).reshape(n_local, n_cols)
 
     all_rows = comm.gather(local_rows, root=root)
-    counts = np.asarray(comm.gather(n_local * n_cols, root=root), dtype="i")
+    # ``gather`` returns ``None`` on non-root — do not cast it to an array.
+    counts_raw = comm.gather(n_local * n_cols, root=root)
 
     if rank == root:
+        counts = np.asarray(counts_raw, dtype="i")
         recv = np.empty(int(n_rows) * int(n_cols), dtype=np.float64)
         displs = np.zeros(size, dtype="i")
         if size > 1:
@@ -443,6 +448,11 @@ def build_qed_tda_matrix(
         has_K = bool(comm.allreduce(bool(has_K), op=_MPI.LAND))
 
     if has_K:
+        if verbose and rank == 0:
+            print(
+                f"  using cached dense K ({n}×{n}) — no MPI row rebuild",
+                flush=True,
+            )
         if rank == 0:
             dE = kernel.diagonal_dE()
             A = np.array(kernel._K, dtype=float, copy=True)
@@ -458,6 +468,13 @@ def build_qed_tda_matrix(
         else:
             M = None
         return _mpi_bcast_array(comm, M, root=0)
+
+    if verbose and rank == 0:
+        n_local = (n + size - 1) // size
+        print(
+            f"  distributing ~{n_local} K rows / rank (hybrid response) …",
+            flush=True,
+        )
 
     local_rows = _mpi_round_robin_rows(n, rank, size)
     A_local = qed_electronic_A_rows(
@@ -1034,3 +1051,355 @@ def scan_qed_sf_lambda(
         out["omega_tracked"] = omega_t
         out["photon_frac_tracked"] = phot_t
     return out
+
+
+# ---------------------------------------------------------------------------
+# Post-processing QED on electronic TDDFT eigenstates (JC / TC / truncated PF)
+# ---------------------------------------------------------------------------
+
+
+def tddft_state_dipoles(res) -> np.ndarray:
+    """S₀→state transition dipoles ``(n_states, 3)`` from a Casida result."""
+    d_mode = getattr(res, "d_mode", None)
+    if d_mode is not None:
+        d = np.asarray(d_mode, dtype=float)
+        if d.ndim != 2:
+            raise ValueError(f"d_mode must be 2-D, got shape {d.shape}")
+        if d.shape[0] == 3:
+            return d.T.copy()
+        if d.shape[1] == 3:
+            return d.copy()
+        raise ValueError(f"d_mode shape {d.shape} is not (3,n) or (n,3)")
+
+    mu_ov = getattr(res, "mu_transition", None)
+    xpy = getattr(res, "xpy", None)
+    if xpy is None:
+        xpy = getattr(res, "Z", None)
+    if mu_ov is not None and xpy is not None:
+        mu = np.asarray(mu_ov, dtype=float)
+        X = np.asarray(xpy, dtype=float)
+        if mu.ndim != 2 or mu.shape[1] != 3:
+            raise ValueError(f"mu_transition must be (n_trans, 3), got {mu.shape}")
+        if X.ndim != 2 or X.shape[0] != mu.shape[0]:
+            raise ValueError(
+                f"xpy/Z shape {X.shape} incompatible with mu_transition {mu.shape}"
+            )
+        return X.T @ mu
+
+    raise ValueError(
+        "CasidaResults need d_mode or (mu_transition + xpy/Z) for QED post-processing"
+    )
+
+
+def _select_tddft_indices(
+    omega: np.ndarray,
+    f: Optional[np.ndarray],
+    mu: np.ndarray,
+    *,
+    nstates: Optional[int],
+    skip_ground: bool,
+    prefer_bright: bool,
+    lam: np.ndarray,
+    ground_tol: float = 1e-8,
+) -> np.ndarray:
+    """Indices into TDDFT roots for the few-level / PF electronic manifold."""
+    w = np.asarray(omega, dtype=float).ravel()
+    n = w.size
+    mask = np.ones(n, dtype=bool)
+    if skip_ground:
+        mask &= w > float(ground_tol)
+    idx = np.where(mask)[0]
+    if idx.size == 0:
+        raise ValueError("No TDDFT roots left after skip_ground filtering.")
+    if nstates is not None and int(nstates) < idx.size:
+        n_keep = int(nstates)
+        if prefer_bright:
+            strength = np.abs(mu[idx] @ lam)
+            if f is not None and float(np.max(strength)) < 1e-16:
+                strength = np.clip(np.asarray(f, dtype=float).ravel()[idx], 0.0, None)
+            order = np.argsort(-strength)[:n_keep]
+            idx = idx[np.sort(order)]
+        else:
+            idx = idx[:n_keep]
+    return idx
+
+
+def solve_qed_levels(
+    omega: np.ndarray,
+    mu: np.ndarray,
+    lam_vec: Sequence[float],
+    omega_c: float,
+    *,
+    f: Optional[np.ndarray] = None,
+    nstates: Optional[int] = None,
+    skip_ground: bool = True,
+    prefer_bright: bool = True,
+) -> Dict[str, Any]:
+    """Few-level Jaynes–Cummings / Tavis–Cummings on TDDFT eigenstates.
+
+    Basis (size ``n + 1``)::
+
+        {|S_k, 0⟩ for selected roots k}  ∪  {|S₀, 1⟩}
+
+    with couplings ``g_k = √(ω_c/2) (λ · μ_k)``. Probe oscillator strengths
+    use electronic dipoles from ``|S₀,0⟩`` (outside the TC space). Do **not**
+    use ``photon_frac`` as spectrum intensity.
+    """
+    omega_c = float(omega_c)
+    if omega_c <= 0.0:
+        raise ValueError(f"omega_c must be positive, got {omega_c}")
+    lam = np.asarray(lam_vec, dtype=float).ravel()
+    if lam.shape != (3,):
+        raise ValueError(f"lam_vec must have shape (3,), got {lam.shape}")
+    mu_arr = np.asarray(mu, dtype=float)
+    if mu_arr.ndim != 2 or mu_arr.shape[1] != 3:
+        raise ValueError(f"mu must have shape (n, 3), got {mu_arr.shape}")
+
+    idx = _select_tddft_indices(
+        omega,
+        f,
+        mu_arr,
+        nstates=nstates,
+        skip_ground=skip_ground,
+        prefer_bright=prefer_bright,
+        lam=lam,
+    )
+    e = np.asarray(omega, dtype=float).ravel()[idx]
+    mu_exc = mu_arr[idx]
+    g = np.sqrt(omega_c / 2.0) * (mu_exc @ lam)
+    n = e.size
+    M = np.zeros((n + 1, n + 1), dtype=float)
+    M[:n, :n] = np.diag(e)
+    M[n, n] = omega_c
+    M[:n, n] = g
+    M[n, :n] = g
+    w, V = scipy.linalg.eigh(M)
+    photon_frac = V[n, :] ** 2
+    mu_pol = np.einsum("ka,kx->ax", V[:n, :], mu_exc, optimize=True)
+    f_out = np.zeros(w.size, dtype=float)
+    for a, wa in enumerate(w):
+        if wa <= 1e-12:
+            continue
+        f_out[a] = (2.0 / 3.0) * float(wa) * float(np.dot(mu_pol[a], mu_pol[a]))
+
+    return {
+        "omega": w,
+        "photon_frac": photon_frac,
+        "f": f_out,
+        "mu": mu_pol,
+        "electronic_omega": e,
+        "g": g,
+        "omega_c": omega_c,
+        "lam": lam,
+        "V": V,
+        "M": M,
+        "tddft_indices": idx,
+        "model": "jaynes-cummings" if n == 1 else "tavis-cummings",
+        "postprocess": True,
+    }
+
+
+def solve_qed_pf_post(
+    omega: np.ndarray,
+    mu: np.ndarray,
+    lam_vec: Sequence[float],
+    omega_c: float,
+    *,
+    f: Optional[np.ndarray] = None,
+    nstates: Optional[int] = None,
+    skip_ground: bool = True,
+    prefer_bright: bool = False,
+    include_ground_slot: bool = True,
+    include_dse: bool = True,
+    mu0_lam: float = 0.0,
+) -> Dict[str, Any]:
+    """Truncated Pauli–Fierz on the TDDFT electronic eigenbasis.
+
+    Electronic basis (length ``N``): ``{|S₀⟩, |S_k⟩}`` when
+    ``include_ground_slot`` (default), with ``E₀ = 0`` and selected TDDFT
+    roots. Dipole matrix is TDA-like (only S₀↔excited)::
+
+        (λ·μ)_{0k} = λ · μ_k ,   (λ·μ)_{kj} = 0 for excited–excited
+
+    Light–matter space: electronic ⊗ {0,1} photons (size ``2N``)::
+
+        H = H_el + ω_c a†a + √(ω_c/2) (λ·μ)(a+a†) + ½ (λ·μ)²
+
+    Returned ``omega`` is relative to the PF ground (``w - w[0]``). Probe
+    ``f`` uses ``μ ⊗ I``; do **not** use ``photon_frac`` as intensity.
+    """
+    from casidapy.soc import build_soc_qed_pf_matrix
+
+    omega_c = float(omega_c)
+    if omega_c <= 0.0:
+        raise ValueError(f"omega_c must be positive, got {omega_c}")
+    lam = np.asarray(lam_vec, dtype=float).ravel()
+    if lam.shape != (3,):
+        raise ValueError(f"lam_vec must have shape (3,), got {lam.shape}")
+    mu_arr = np.asarray(mu, dtype=float)
+    if mu_arr.ndim != 2 or mu_arr.shape[1] != 3:
+        raise ValueError(f"mu must have shape (n, 3), got {mu_arr.shape}")
+
+    idx = _select_tddft_indices(
+        omega,
+        f,
+        mu_arr,
+        nstates=nstates,
+        skip_ground=skip_ground,
+        prefer_bright=prefer_bright,
+        lam=lam,
+    )
+    e_exc = np.asarray(omega, dtype=float).ravel()[idx]
+    mu_exc = mu_arr[idx]
+    d_ov = mu_exc @ lam
+
+    if include_ground_slot:
+        e = np.concatenate([[0.0], e_exc])
+        n = e.size
+        d = np.zeros((n, n), dtype=float)
+        d[0, 0] = float(mu0_lam)
+        d[0, 1:] = d_ov
+        d[1:, 0] = d_ov
+    else:
+        e = e_exc
+        n = e.size
+        d = np.zeros((n, n), dtype=float)
+
+    M = build_soc_qed_pf_matrix(e, d, omega_c, include_dse=include_dse)
+    w_abs, V = scipy.linalg.eigh(M)
+    w = w_abs - w_abs[0]
+    photon_frac = np.sum(V[n:, :] ** 2, axis=0)
+
+    mu_el = np.zeros((n, n, 3), dtype=float)
+    if include_ground_slot:
+        mu_el[0, 1:, :] = mu_exc
+        mu_el[1:, 0, :] = mu_exc
+    mu_pol = (
+        np.einsum("i,ijx,jk->kx", V[:n, 0], mu_el, V[:n, :], optimize=True)
+        + np.einsum("i,ijx,jk->kx", V[n:, 0], mu_el, V[n:, :], optimize=True)
+    )
+    f_out = np.zeros(w.size, dtype=float)
+    for k, wk in enumerate(w):
+        if wk <= 1e-12:
+            continue
+        f_out[k] = (2.0 / 3.0) * float(wk) * float(np.dot(mu_pol[k], mu_pol[k]))
+
+    return {
+        "omega": w,
+        "omega_absolute": w_abs,
+        "photon_frac": photon_frac,
+        "f": f_out,
+        "mu": mu_pol,
+        "electronic_omega": e,
+        "d_mat": d,
+        "omega_c": omega_c,
+        "lam": lam,
+        "V": V,
+        "M": M,
+        "tddft_indices": idx,
+        "include_dse": bool(include_dse),
+        "include_ground_slot": bool(include_ground_slot),
+        "model": "pauli-fierz",
+        "postprocess": True,
+    }
+
+
+def solve_qed_post(
+    res,
+    lam_vec: Sequence[float],
+    omega_c: float,
+    *,
+    model: str = "pf",
+    mu: Optional[np.ndarray] = None,
+    nstates: Optional[int] = None,
+    skip_ground: bool = True,
+    prefer_bright: Optional[bool] = None,
+    include_ground_slot: bool = True,
+    include_dse: bool = True,
+    mu0_lam: float = 0.0,
+) -> Dict[str, Any]:
+    """Post-process QED on finished TDDFT / Casida results.
+
+    Couples a single cavity mode to the **electronic eigenstates** after
+    :func:`~casidapy.casida_engine.run_casida` — no rebuild of the Casida
+    matrix. Intended as a cheap alternative to :func:`solve_qed_tda`
+    (which builds PF in the transition basis).
+
+    Parameters
+    ----------
+    res
+        :class:`~casidapy.casida_api.CasidaResults` (needs ``omega`` and
+        dipoles via ``d_mode`` or ``mu_transition``+``xpy``).
+    model
+        ``\"jc\"`` — one bright root + ``|S₀,1⟩`` (Jaynes–Cummings).
+        ``\"tc\"`` — many roots + ``|S₀,1⟩`` (Tavis–Cummings).
+        ``\"pf\"`` — truncated Pauli–Fierz (electronic ⊗ {0,1} + optional DSE;
+        **default**).
+    mu
+        Optional ``(n, 3)`` S₀→state dipoles; default from ``res``.
+    nstates
+        Cap on electronic roots in the manifold (after ``skip_ground``).
+        ``None`` keeps all.
+    """
+    key = str(model).strip().lower().replace("_", "-")
+    aliases = {
+        "jc": "jc",
+        "jaynes-cummings": "jc",
+        "jaynes": "jc",
+        "tc": "tc",
+        "tavis-cummings": "tc",
+        "tavis": "tc",
+        "pf": "pf",
+        "pauli-fierz": "pf",
+        "pauli": "pf",
+    }
+    if key not in aliases:
+        raise ValueError(
+            f"Unknown qed-post model {model!r}; expected one of "
+            f"{sorted(set(aliases))}."
+        )
+    kind = aliases[key]
+
+    omega = np.asarray(res.omega, dtype=float).ravel()
+    f_arr = None if getattr(res, "f", None) is None else np.asarray(res.f, dtype=float).ravel()
+    mu_arr = tddft_state_dipoles(res) if mu is None else np.asarray(mu, dtype=float)
+    if mu_arr.shape[0] != omega.size:
+        raise ValueError(
+            f"mu rows ({mu_arr.shape[0]}) != number of TDDFT roots ({omega.size})"
+        )
+
+    if kind == "jc":
+        return solve_qed_levels(
+            omega,
+            mu_arr,
+            lam_vec=lam_vec,
+            omega_c=omega_c,
+            f=f_arr,
+            nstates=1 if nstates is None else nstates,
+            skip_ground=skip_ground,
+            prefer_bright=True if prefer_bright is None else prefer_bright,
+        )
+    if kind == "tc":
+        return solve_qed_levels(
+            omega,
+            mu_arr,
+            lam_vec=lam_vec,
+            omega_c=omega_c,
+            f=f_arr,
+            nstates=nstates,
+            skip_ground=skip_ground,
+            prefer_bright=True if prefer_bright is None else prefer_bright,
+        )
+    return solve_qed_pf_post(
+        omega,
+        mu_arr,
+        lam_vec=lam_vec,
+        omega_c=omega_c,
+        f=f_arr,
+        nstates=nstates,
+        skip_ground=skip_ground,
+        prefer_bright=False if prefer_bright is None else prefer_bright,
+        include_ground_slot=include_ground_slot,
+        include_dse=include_dse,
+        mu0_lam=mu0_lam,
+    )

@@ -23,14 +23,13 @@ basis. Triplet–triplet SOC is neglected in this first implementation.
 Oscillator strengths of mixed states are borrowed from the singlet
 components (electric dipole from the singlet GS).
 
-For cavity demos:
+For cavity demos (SOC first, then light–matter):
 
-* :func:`solve_soc_qed_levels` — few-level Tavis–Cummings
-  (SOC roots ⊕ |S₀,1⟩).
+* :func:`solve_soc_qed_levels` — few-level Jaynes– / Tavis–Cummings
+  (SOC roots ⊕ |S₀,1⟩); default for QED-TDDFT+SOC spectra.
 * :func:`solve_soc_qed_pf` — truncated Pauli–Fierz on the SI-SOC
-  electronic eigenbasis ⊗ {0,1} photons (bilinear + optional DSE),
-  with S₀ included so dark triplets can still feel DSE and bright
-  roots form polaritons via borrowed dipoles.
+  electronic eigenbasis ⊗ {0,1} photons (bilinear + optional DSE).
+* :func:`solve_soc_qed` — thin router: ``model="jc"|"tc"|"pf"``.
 """
 from __future__ import annotations
 
@@ -392,9 +391,18 @@ def solve_soc_qed_levels(
         ⟨φ_k, 0| H |S₀, 1⟩ = √(ω_c / 2) (λ · μ_k)
 
     where ``μ_k`` is the S₀→SOC transition dipole (singlet-borrowed).
+    With ``n = 1`` this is Jaynes–Cummings; with ``n > 1`` Tavis–Cummings.
 
-    For the truncated Pauli–Fierz treatment on the same manifold (electronic
-    ⊗ {0,1} photons + DSE), use :func:`solve_soc_qed_pf`.
+    Probe oscillator strengths use the electronic dipole from ``|S₀,0⟩``
+    (outside the TC space)::
+
+        μ_α = Σ_k V_{kα} μ_k ,   f_α = (2/3) ω_α |μ_α|²
+
+    so pure ``|S₀,1⟩`` stays dark and polaritons borrow intensity from
+    bright SOC parents. Do **not** use ``photon_frac`` as spectrum intensity.
+
+    For truncated Pauli–Fierz on the same manifold, use
+    :func:`solve_soc_qed_pf` or :func:`solve_soc_qed` with ``model="pf"``.
     """
     omega_c = float(omega_c)
     if omega_c <= 0.0:
@@ -411,7 +419,8 @@ def solve_soc_qed_levels(
         lam=lam,
     )
     e = np.asarray(soc.omega, dtype=float)[idx]
-    d = np.asarray(soc.mu, dtype=float)[idx] @ lam
+    mu_exc = np.asarray(soc.mu, dtype=float)[idx]
+    d = mu_exc @ lam
     g = np.sqrt(omega_c / 2.0) * d
     n = e.size
     M = np.zeros((n + 1, n + 1), dtype=float)
@@ -421,19 +430,110 @@ def solve_soc_qed_levels(
     M[n, :n] = g
     w, V = scipy.linalg.eigh(M)
     photon_frac = V[n, :] ** 2
+
+    # ⟨S₀,0|μ|Ψ_α⟩ = Σ_k V[k,α] μ_k  (photonic slot has no electronic μ)
+    mu_pol = np.einsum("ka,kx->ax", V[:n, :], mu_exc, optimize=True)
+    f = np.zeros(w.size, dtype=float)
+    for a, wa in enumerate(w):
+        if wa <= 1e-12:
+            continue
+        f[a] = (2.0 / 3.0) * float(wa) * float(np.dot(mu_pol[a], mu_pol[a]))
+
     return {
         "omega": w,
         "photon_frac": photon_frac,
+        "f": f,
+        "mu": mu_pol,
         "electronic_omega": e,
         "g": g,
         "omega_c": omega_c,
         "lam": lam,
         "V": V,
+        "M": M,
         "soc_indices": idx,
         "singlet_weight": soc.singlet_weight[idx],
         "triplet_weight": soc.triplet_weight[idx],
-        "model": "tavis-cummings",
+        "model": "jaynes-cummings" if n == 1 else "tavis-cummings",
     }
+
+
+def solve_soc_qed(
+    soc: SOCResults,
+    lam_vec: Sequence[float],
+    omega_c: float,
+    *,
+    model: str = "tc",
+    nstates: Optional[int] = None,
+    skip_ground: bool = True,
+    prefer_bright: Optional[bool] = None,
+    include_ground_slot: bool = True,
+    include_dse: bool = True,
+    mu0_lam: float = 0.0,
+) -> Dict[str, Any]:
+    """Route QED-on-SOC to Jaynes–Cummings, Tavis–Cummings, or Pauli–Fierz.
+
+    Intended workflow for **QED-TDDFT+SOC**: diagonalize SI-SOC first, then
+    couple the cavity on that electronic manifold. Default ``model="tc"``.
+
+    Parameters
+    ----------
+    model
+        ``\"jc\"`` — one bright SOC root + ``|S₀,1⟩`` (Jaynes–Cummings).
+        ``\"tc\"`` — many SOC roots + ``|S₀,1⟩`` (Tavis–Cummings; default).
+        ``\"pf\"`` — truncated Pauli–Fierz (electronic ⊗ {0,1} + optional DSE).
+    prefer_bright
+        Default ``True`` for ``jc``/``tc`` (keep brightest roots when
+        truncating), ``False`` for ``pf`` (energy order). Pass explicitly
+        to override.
+    """
+    key = str(model).strip().lower().replace("_", "-")
+    aliases = {
+        "jc": "jc",
+        "jaynes-cummings": "jc",
+        "jaynes": "jc",
+        "tc": "tc",
+        "tavis-cummings": "tc",
+        "tavis": "tc",
+        "pf": "pf",
+        "pauli-fierz": "pf",
+        "pauli": "pf",
+    }
+    if key not in aliases:
+        raise ValueError(
+            f"Unknown soc-qed model {model!r}; expected one of "
+            f"{sorted(set(aliases))}."
+        )
+    kind = aliases[key]
+
+    if kind == "jc":
+        return solve_soc_qed_levels(
+            soc,
+            lam_vec=lam_vec,
+            omega_c=omega_c,
+            nstates=1 if nstates is None else nstates,
+            skip_ground=skip_ground,
+            prefer_bright=True if prefer_bright is None else prefer_bright,
+        )
+    if kind == "tc":
+        return solve_soc_qed_levels(
+            soc,
+            lam_vec=lam_vec,
+            omega_c=omega_c,
+            nstates=nstates,
+            skip_ground=skip_ground,
+            prefer_bright=True if prefer_bright is None else prefer_bright,
+        )
+    return solve_soc_qed_pf(
+        soc,
+        lam_vec=lam_vec,
+        omega_c=omega_c,
+        nstates=nstates,
+        skip_ground=skip_ground,
+        prefer_bright=False if prefer_bright is None else prefer_bright,
+        include_ground_slot=include_ground_slot,
+        include_dse=include_dse,
+        mu0_lam=mu0_lam,
+    )
 
 
 def build_soc_qed_pf_matrix(

@@ -553,8 +553,24 @@ def run_casida(
     from casidapy.kernels.gto import GTOKernel
     from casidapy.kernels.plane_wave import PlaneWaveKernel
 
-    comm = MPI.COMM_WORLD if comm is None else comm
-    rank = mpi_comm_rank(comm)
+    # mpi4pyscf parks non-master ranks in a worker pool. Using COMM_WORLD for
+    # SPMD Casida/QED collectives would hang — treat as serial on the master.
+    try:
+        from casidapy.mpi_pyscf import is_mpi4pyscf_enabled
+        _mpi4 = is_mpi4pyscf_enabled() or bool(
+            getattr(kernel, "use_mpi_response", False)
+        )
+    except Exception:
+        _mpi4 = bool(getattr(kernel, "use_mpi_response", False))
+    if _mpi4:
+        comm = None
+    elif comm is None:
+        comm = MPI.COMM_WORLD
+    if comm is None:
+        rank, size = 0, 1
+    else:
+        rank = mpi_comm_rank(comm)
+        size = mpi_comm_size(comm)
 
     if not hasattr(kernel, "apply_K"):
         raise TypeError("kernel must implement apply_K (KernelBackend protocol)")
@@ -579,7 +595,7 @@ def run_casida(
         casida = object.__new__(CasidaKS_MPI)
         casida.comm = comm
         casida.rank = rank
-        casida.size = mpi_comm_size(comm)
+        casida.size = size
         casida._kernel = kernel
         casida.rho = None
         casida.grid = None

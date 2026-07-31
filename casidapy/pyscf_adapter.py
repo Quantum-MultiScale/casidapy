@@ -21,6 +21,7 @@ def extract_gto_kernel(
     tda: bool = True,
     verbose: bool = False,
     use_gpu: bool = False,
+    use_mpi_response: bool = False,
     spin_state: str = "singlet",
 ) -> Tuple[GTOKernel, CasidaOptions]:
     """Create a :class:`GTOKernel` and matching :class:`CasidaOptions` from ``mf``.
@@ -39,6 +40,13 @@ def extract_gto_kernel(
 
     ``use_gpu=True`` enables CuPy MO contractions / cached ``K @ v`` and, when
     gpu4pyscf is installed, a GPU ``gen_response``.
+
+    ``use_mpi_response=True`` promotes ``mf`` to ``mpi4pyscf.dft.RKS`` so
+    Davidson matvecs use MPI-parallel ``get_jk`` inside ``gen_response``.
+    Import ``mpi4pyscf`` (or call ``enable_mpi4pyscf()``) early under
+    ``mpirun`` so non-master ranks park in the worker pool. Forces
+    ``use_df=False`` for the response. Pass ``comm=None`` to
+    ``run_casida`` / QED (do not mix with SPMD Casida row builds).
     """
     mo_e = np.asarray(mf.mo_energy, dtype=float)
     mo_c = np.asarray(mf.mo_coeff, dtype=float)
@@ -64,6 +72,9 @@ def extract_gto_kernel(
             f"n_orb={len(mo_e)}"
         )
 
+    if use_mpi_response and use_df:
+        use_df = False
+
     xc_name = xc if xc is not None else getattr(mf, "xc", "pbe")
     kernel = GTOKernel(
         mf.mol,
@@ -77,6 +88,7 @@ def extract_gto_kernel(
         mf=mf,
         verbose=verbose,
         use_gpu=use_gpu,
+        use_mpi_response=use_mpi_response,
         spin_state=spin_state,
     )
     opts = CasidaOptions(
@@ -86,7 +98,7 @@ def extract_gto_kernel(
         n_total_occ=n_total_occ,
         tda=tda,
         matrix_free=True,
-        solver_method="eigsh",
+        solver_method="davidson",
         use_gpu=use_gpu,
         xc=str(xc_name),
         basis="gto",
@@ -139,7 +151,7 @@ def extract_sf_gto_kernel(
         n_total_occ=kernel.n_occ,
         tda=True,  # SF-TDDFT is TDA-only in this backend
         matrix_free=True,
-        solver_method="eigsh",
+        solver_method="davidson",
         use_gpu=use_gpu,
         xc=str(xc),
         basis="gto",

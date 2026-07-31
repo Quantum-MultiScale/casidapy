@@ -786,8 +786,38 @@ class TestSOC:
         assert np.all(np.isfinite(qed["omega"]))
         # Bright root should mix with the cavity (non-trivial photon weight)
         assert float(np.max(qed["photon_frac"])) > 0.01
+        assert "f" in qed and qed["f"].shape == qed["omega"].shape
+        assert qed["model"] == "tavis-cummings"
+        # Pure photonic character should not dominate oscillator strength
+        phot_dom = qed["photon_frac"] > 0.9
+        if np.any(phot_dom):
+            assert float(np.max(qed["f"][phot_dom])) < 1e-8
 
-        from casidapy.soc import solve_soc_qed_pf, build_soc_qed_pf_matrix
+        from casidapy.soc import (
+            solve_soc_qed,
+            solve_soc_qed_pf,
+            build_soc_qed_pf_matrix,
+        )
+
+        jc = solve_soc_qed(
+            soc,
+            lam_vec=(0.0, 0.0, 0.05),
+            omega_c=float(res_s.omega[0]),
+            model="jc",
+        )
+        assert jc["model"] == "jaynes-cummings"
+        assert jc["omega"].shape[0] == 2
+
+        tc = solve_soc_qed(
+            soc,
+            lam_vec=(0.0, 0.0, 0.05),
+            omega_c=float(res_s.omega[0]),
+            model="tc",
+            nstates=4,
+            prefer_bright=True,
+        )
+        assert tc["model"] == "tavis-cummings"
+        np.testing.assert_allclose(tc["omega"], qed["omega"], atol=1e-12)
 
         # λ→0 PF recovers {0, E_k, ω_c, E_k+ω_c}
         e = np.array([0.0, 0.1, 0.2])
@@ -832,6 +862,33 @@ class TestSOC:
         phot_dom = pf0["photon_frac"] > 0.9
         if np.any(phot_dom):
             assert float(np.max(pf0["f"][phot_dom])) < 1e-8
+
+    def test_qed_post_on_tddft_synthetic(self):
+        """JC/TC/PF post-processing on fake TDDFT eigenstates."""
+        from types import SimpleNamespace
+        from casidapy.qed import solve_qed_post
+
+        omega = np.array([0.15, 0.22, 0.30])
+        mu = np.array([[0.0, 0.0, 1.0], [0.5, 0.0, 0.0], [0.0, 0.1, 0.0]])
+        res = SimpleNamespace(omega=omega, f=np.array([0.5, 0.2, 0.01]), d_mode=mu.T)
+        lam = (0.0, 0.0, 0.05)
+        wc = 0.15
+
+        jc = solve_qed_post(res, lam, wc, model="jc")
+        assert jc["model"] == "jaynes-cummings"
+        assert jc["omega"].shape == (2,)
+        assert jc["postprocess"] is True
+
+        tc = solve_qed_post(res, lam, wc, model="tc", nstates=2)
+        assert tc["model"] == "tavis-cummings"
+        assert tc["omega"].shape == (3,)
+
+        pf = solve_qed_post(res, lam, wc, model="pf", nstates=2, include_dse=True)
+        assert pf["model"] == "pauli-fierz"
+        assert pf["omega"].shape == (6,)  # N=1+2 → 2N
+        assert np.all(np.isfinite(pf["f"]))
+        # Ground excitation energy is zero by construction
+        assert abs(float(pf["omega"][0])) < 1e-12
 
 
 def _make_synthetic_pw_kernel(use_gpu=False):

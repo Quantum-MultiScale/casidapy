@@ -69,6 +69,12 @@ class GTOKernel:
     use_gpu : bool
         Accelerate MO contractions and cached ``K @ v`` with CuPy. When
         gpu4pyscf is installed, also run ``gen_response`` on the GPU.
+    use_mpi_response : bool
+        Promote the mean-field to ``mpi4pyscf.dft.RKS`` so Davidson matvecs
+        call MPI-parallel ``get_jk`` inside ``gen_response``. Density fitting
+        is disabled (DF bypasses mpi4pyscf JK). Requires ``import mpi4pyscf``
+        (or ``enable_mpi4pyscf()``) **before** other work so non-master ranks
+        park in the worker pool. Incompatible with ``use_gpu``.
     """
 
     def __init__(
@@ -88,6 +94,7 @@ class GTOKernel:
         verbose: bool = False,
         k_cache_max: int = 4096,
         use_gpu: bool = False,
+        use_mpi_response: bool = False,
         spin_flip: bool = False,
         sf_xc: bool = False,
         spin_state: str = "singlet",
@@ -104,6 +111,18 @@ class GTOKernel:
         self.mo_energy = np.asarray(mo_energy, dtype=float)
         self.mo_occ = np.asarray(mo_occ, dtype=float)
         self.xc = xc
+        self.use_mpi_response = bool(use_mpi_response)
+        if self.use_mpi_response and use_gpu:
+            raise ValueError(
+                "use_mpi_response and use_gpu cannot be combined; "
+                "pick MPI JK (mpi4pyscf) or GPU response (gpu4pyscf)."
+            )
+        if self.use_mpi_response and use_df:
+            warnings.warn(
+                "use_mpi_response=True disables density fitting for the "
+                "response (mpi4pyscf MPI get_jk is direct / outcore)."
+            )
+            use_df = False
         self.use_df = use_df
         self.verbose = verbose
         self._mf = mf
@@ -353,6 +372,22 @@ class GTOKernel:
                 warnings.warn(f"gpu4pyscf RKS setup failed ({exc})")
             return None
 
+    def _ensure_mpi_mf(self, mf):
+        """Return an mpi4pyscf RKS with MO data for MPI ``get_jk`` response."""
+        mod = type(mf).__module__
+        if isinstance(mod, str) and mod.startswith("mpi4pyscf"):
+            # Drop DF wrapper if somehow present — it bypasses MPI JK.
+            if getattr(mf, "with_df", None) is not None:
+                warnings.warn(
+                    "mpi4pyscf mf has density fitting; promoting a direct "
+                    "MPI RKS so gen_response uses MPI get_jk."
+                )
+            else:
+                return mf
+        from casidapy.mpi_pyscf import promote_mf_to_mpi
+
+        return promote_mf_to_mpi(mf)
+
     def setup(self, tda: bool = True) -> None:
         from pyscf import dft
 
@@ -377,6 +412,9 @@ class GTOKernel:
             mf.mo_coeff = self.mo_coeff
             mf.mo_energy = self.mo_energy
             mf.mo_occ = self.mo_occ
+
+        if self.use_mpi_response:
+            mf = self._ensure_mpi_mf(mf)
 
         is_ks = hasattr(mf, "xc")
         if is_ks and (getattr(mf, "grids", None) is None or mf.grids.coords is None):
@@ -440,9 +478,17 @@ class GTOKernel:
             self._C_v_dev = self._cp.asarray(self._C_v)
         else:
             self._vresp = mf.gen_response(singlet=singlet, hermi=0)
+            self._mf = mf
 
         self._ready = True
         if self.verbose:
+            mpi_tag = ""
+            if self.use_mpi_response:
+                try:
+                    from mpi4pyscf.tools import mpi as _mpi
+                    mpi_tag = f", MPI JK pool size={_mpi.pool.size}"
+                except Exception:
+                    mpi_tag = ", MPI JK"
             print("GTOKernel setup:")
             print(
                 f"  Transitions: {self._n_occ} occ × {self._n_unocc} unocc "
@@ -452,6 +498,7 @@ class GTOKernel:
                 f"  XC: {getattr(mf, 'xc', 'HF')}, hybrid: {self.hybrid}, "
                 f"spin: {self.spin_state}, "
                 f"DF: {getattr(mf, 'with_df', None) is not None}, TDA: {tda}"
+                f"{mpi_tag}"
             )
             if self.use_gpu:
                 print(
