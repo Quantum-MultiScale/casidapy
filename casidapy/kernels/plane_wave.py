@@ -574,10 +574,12 @@ class PlaneWaveKernel:
             return np.zeros((self._n_trans, 3), dtype=float)
 
         _, _, d_ov = self.mo_dipole_blocks(origin=origin)
-        # d_ov: (3, n_o, n_u) → (n_trans, 3)
-        return np.stack(
+        # d_ov: (3, n_o, n_u) → (n_trans, 3); singlet factor √2 as in GTOKernel
+        mu = np.stack(
             [d_ov[0].ravel(), d_ov[1].ravel(), d_ov[2].ravel()], axis=-1
         )
+        return np.sqrt(2.0) * mu
+
     def collapse_transition_densities_to_state_basis(
         self, amp: np.ndarray
     ) -> Optional[np.ndarray]:

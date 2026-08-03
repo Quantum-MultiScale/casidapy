@@ -5,16 +5,19 @@ Length gauge, dipole approximation, single cavity mode, coherent-state
 consumed as-is from :class:`~casidapy.kernels.gto.GTOKernel` — this module
 does not modify ``apply_K`` or the Casida algebra.
 
-**MPI (closed-shell dense build):** ``build_qed_tda_matrix(..., comm=comm)``
-distributes electronic ``K`` / DSE rows over ranks (same round-robin scheme as
-``CasidaKS_MPI.build_matrices``). Dipole blocks are replicated (cheap); the
-full ``(n_trans+1)`` matrix is assembled on root and buffer-broadcast. Use
-this for large active spaces where building ``K`` dominates. Pass the same
-``comm`` to ``solve_qed_tda``.
+**Closed-shell solve (default matrix-free):** :func:`solve_qed_tda` applies
+``M v`` via ``apply_K`` + DSE + photon coupling and diagonalizes with
+Davidson/LOBPCG (no full ``K`` cache). Pass ``matrix_free=False`` for the
+legacy dense ``build_qed_tda_matrix`` + ``eigh`` path.
 
-**Closed-shell** path (``solve_qed_tda``): electronic singles ⊕ one photonic
-state, size ``(n_trans+1)``. Dipole self-energy (DSE) and coherent-state
-shifts are included by default.
+**MPI dense build (optional):** ``build_qed_tda_matrix(..., comm=comm)`` can
+still distribute electronic ``K`` / DSE rows when assembling a full matrix.
+Under ``--mpi-response`` / mpi4pyscf, matrix-free matvecs use MPI ``get_jk``
+inside ``apply_K`` with workers parked (same model as Casida).
+
+**Closed-shell** Hilbert space: electronic singles ⊕ one photonic state,
+size ``(n_trans+1)``. Dipole self-energy (DSE) and coherent-state shifts are
+included by default.
 
 **Spin-flip** path (``solve_qed_sf_tda``): QED-SF-TDA / QED-SF-CIS-style
 Hamiltonian on the collinear SF manifold (α-occ → β-virt). Basis is SF
@@ -22,7 +25,7 @@ singles with 0 and 1 cavity photons (size ``2 n_trans``). Light-matter
 coupling uses the one-body dipole *difference* ``Δd`` between SF
 configurations (not the spin-forbidden ``⟨α|r|β⟩`` transition dipole).
 DSE / coherent-state are off by default (bilinear / JC-like form matching
-common QED-SF-CIS presentations).
+common QED-SF-CIS presentations). Dense diagonalization only for SF.
 
 This is the physical (DSE-inclusive for closed-shell) route in the
 **transition** basis. For a cheaper post-processing route that couples the
@@ -41,6 +44,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import scipy.linalg
+from scipy.sparse.linalg import LinearOperator
 
 
 def _comm_rank(comm) -> int:
@@ -59,9 +63,11 @@ def _comm_size(comm) -> int:
     return int(comm.size)
 
 # ---------------------------------------------------------------------------
-# Convention constants (single edit site if DePrince/Foley vs Flick/Rubio
-# placement of closed-shell singlet factors differs). Unverified until a
-# published QED-TDA number is matched — see module tests / README.
+# Closed-shell singlet convention (must stay consistent across this module):
+#   μ_ia = √2 ⟨i|r|a⟩   (via GTOKernel.dipole_matrix)
+#   q_ia = λ · ⟨i|r|a⟩  (raw spatial; dipole_blocks — no √2)
+#   g    = √(ω/2) · √2 · q = √(ω/2) · (λ · μ)   ← matches post-process
+#   DSE direct = 2 q⊗q = (√2 q)⊗(√2 q)
 # ---------------------------------------------------------------------------
 SQRT2 = np.sqrt(2.0)
 DSE_DIRECT_FACTOR = 2.0
@@ -88,6 +94,8 @@ class QEDOptions:
     # The CS shift inside dipole_blocks uses electronic ⟨μ⟩₀ only (see there).
     include_nuclear: bool = False
     nstates: Optional[int] = None
+    matrix_free: bool = True
+    solver_method: str = "davidson"  # davidson | lobpcg (matrix-free only)
 
     def lam_vec(self) -> np.ndarray:
         e = np.asarray(self.polarization, dtype=float).ravel()
@@ -244,6 +252,136 @@ def dse_exchange_rows(
     return (Q_oo[i_idx][:, :, None] * Q_vv[a_idx][:, None, :]).reshape(
         rows.size, n_o * n_v
     )
+
+
+def dse_exchange_matvec(
+    Q_oo: np.ndarray,
+    Q_vv: np.ndarray,
+    v: np.ndarray,
+) -> np.ndarray:
+    """Apply DSE exchange ``(Q_oo ⊗ Q_vv) v`` without forming the full matrix.
+
+    For ``v`` shaped ``(n_o*n_v,)`` or ``(n_o*n_v, k)`` with ``ia = i*n_v + a``::
+
+        (A_exch v)_{ia} = Σ_{jb} Q_oo[i,j] Q_vv[a,b] v_{jb}
+                        = (Q_oo @ V @ Q_vv.T)_{ia} ,   V = reshape(v)
+    """
+    Q_oo = np.asarray(Q_oo, dtype=float)
+    Q_vv = np.asarray(Q_vv, dtype=float)
+    n_o, n_v = Q_oo.shape[0], Q_vv.shape[0]
+    n = n_o * n_v
+    v_arr = np.asarray(v, dtype=float)
+    if v_arr.ndim == 1:
+        if v_arr.size != n:
+            raise ValueError(f"v length {v_arr.size} != n_o*n_v={n}")
+        V = v_arr.reshape(n_o, n_v)
+        return (Q_oo @ V @ Q_vv.T).ravel()
+    if v_arr.ndim != 2 or v_arr.shape[0] != n:
+        raise ValueError(f"v shape {v_arr.shape} incompatible with n_trans={n}")
+    V = v_arr.reshape(n_o, n_v, -1)
+    out = np.einsum("ij,jbk,ab->iak", Q_oo, V, Q_vv, optimize=True)
+    return out.reshape(n, -1)
+
+
+def qed_tda_apply(
+    kernel,
+    v: np.ndarray,
+    *,
+    q: np.ndarray,
+    Q_oo: np.ndarray,
+    Q_vv: np.ndarray,
+    g: np.ndarray,
+    omega_c: float,
+    dE: np.ndarray,
+    include_dse: bool = True,
+) -> np.ndarray:
+    """Matrix-free ``M @ v`` for closed-shell Pauli–Fierz TDA.
+
+    ``v`` is ``(n+1,)`` or ``(n+1, k)`` with electronic amplitudes in ``[:n]``
+    and the photonic amplitude in ``[n]``. Matches :func:`build_qed_tda_matrix`::
+
+        y_e = K v_e + Δε ⊙ v_e + DSE[v_e] + g m
+        y_m = g · v_e + ω_c m
+    """
+    if not getattr(kernel, "_ready", False):
+        kernel.setup(tda=True)
+    n = int(kernel.n_trans)
+    q = np.asarray(q, dtype=float).ravel()
+    g = np.asarray(g, dtype=float).ravel()
+    dE = np.asarray(dE, dtype=float).ravel()
+    if q.size != n or g.size != n or dE.size != n:
+        raise ValueError(
+            f"q/g/dE length must be n_trans={n}, got "
+            f"{q.size}, {g.size}, {dE.size}"
+        )
+    omega_c = float(omega_c)
+
+    v_arr = np.asarray(v, dtype=float)
+    squeeze = False
+    if v_arr.ndim == 1:
+        if v_arr.size != n + 1:
+            raise ValueError(f"v length {v_arr.size} != n_trans+1={n + 1}")
+        v_arr = v_arr.reshape(n + 1, 1)
+        squeeze = True
+    elif v_arr.ndim != 2 or v_arr.shape[0] != n + 1:
+        raise ValueError(f"v shape {v_arr.shape} incompatible with n_trans+1={n + 1}")
+
+    ve = v_arr[:n, :]
+    m = v_arr[n, :]
+
+    if hasattr(kernel, "apply_K_matmat"):
+        Kve = kernel.apply_K_matmat(ve)
+    else:
+        Kve = np.column_stack(
+            [kernel.apply_K(ve[:, j]) for j in range(ve.shape[1])]
+        )
+
+    ye = Kve + dE[:, None] * ve
+    if include_dse:
+        # 2 q (q·v) − (Q_oo ⊗ Q_vv) v
+        ye = ye + DSE_DIRECT_FACTOR * np.outer(q, q @ ve)
+        ye = ye - dse_exchange_matvec(Q_oo, Q_vv, ve)
+    ye = ye + np.outer(g, m)
+
+    ym = g @ ve + omega_c * m
+    out = np.empty((n + 1, v_arr.shape[1]), dtype=float)
+    out[:n, :] = ye
+    out[n, :] = ym
+    if squeeze:
+        return out.ravel()
+    return out
+
+
+def _qed_tda_initial_guess(dE: np.ndarray, omega_c: float, nroots: int) -> np.ndarray:
+    """Unit vectors on lowest Δε singles plus a photonic seed."""
+    from casidapy.casida_utils import build_initial_guess
+
+    dE = np.asarray(dE, dtype=float).ravel()
+    n = dE.size
+    nroots = int(nroots)
+    X0 = np.zeros((n + 1, nroots), dtype=float)
+    n_el = min(nroots, n)
+    if n_el > 0:
+        X0[:n, :n_el] = build_initial_guess(dE, n_el)
+    if nroots > n_el:
+        X0[n, n_el:] = 1.0
+    elif nroots >= 2:
+        # Ensure the cavity mode is represented in the trial space.
+        X0[:, -1] = 0.0
+        X0[n, -1] = 1.0
+    elif nroots == 1:
+        # Mix a little photon into the lowest electronic guess when ω_c is near.
+        X0[n, 0] = 0.25
+        nrm = np.linalg.norm(X0[:, 0])
+        if nrm > 1e-15:
+            X0[:, 0] /= nrm
+    # Tiny photonic bleed on remaining electronic seeds near resonance.
+    if nroots >= 2 and omega_c > 0.0:
+        for j in range(nroots - 1):
+            if abs(dE[np.argmax(np.abs(X0[:n, j]))] - omega_c) < 0.05:
+                X0[n, j] = 0.1
+                X0[:, j] /= np.linalg.norm(X0[:, j]) + 1e-30
+    return X0
 
 
 def _mpi_round_robin_rows(n: int, rank: int, size: int) -> List[int]:
@@ -617,21 +755,31 @@ def solve_qed_tda(
     coherent_state: bool = True,
     include_nuclear: bool = False,
     nuclear_sign: Optional[float] = None,
+    matrix_free: Optional[bool] = None,
+    solver_method: Optional[str] = None,
     options: Optional[QEDOptions] = None,
     comm=None,
     verbose: bool = False,
 ) -> QEDResults:
-    """Diagonalize the dense closed-shell TDA-QED matrix.
+    """Diagonalize closed-shell TDA-QED (matrix-free by default).
 
-    Pass ``comm`` (mpi4py communicator) to build ``M`` with MPI-distributed
-    electronic rows — see :func:`build_qed_tda_matrix`. Diagonalization is
-    currently replicated on every rank after the matrix broadcast.
+    Default path applies ``M v`` via :func:`qed_tda_apply` (``apply_K`` + DSE +
+    photon coupling) and solves with Davidson/LOBPCG — no full ``K`` cache.
+
+    Pass ``matrix_free=False`` for the legacy dense
+    :func:`build_qed_tda_matrix` + ``eigh`` path (also used when ``comm`` has
+    ``size > 1`` for an explicit distributed dense build).
+
+    Under mpi4pyscf / ``--mpi-response``, leave ``comm=None`` so workers stay
+    parked; matrix-free ``apply_K`` uses the MPI JK pool.
     """
     if getattr(kernel, "_spin_flip", False):
         raise ValueError(
             "solve_qed_tda is closed-shell only; use solve_qed_sf_tda for "
             "spin-flip kernels."
         )
+    solver_method_eff = "davidson"
+    matrix_free_eff = True
     if options is not None:
         lam_vec = options.lam_vec()
         omega_c = options.omega_c
@@ -641,27 +789,122 @@ def solve_qed_tda(
         include_nuclear = options.include_nuclear
         if nstates is None:
             nstates = options.nstates
+        matrix_free_eff = bool(options.matrix_free)
+        solver_method_eff = str(options.solver_method)
+    if matrix_free is not None:
+        matrix_free_eff = bool(matrix_free)
+    if solver_method is not None:
+        solver_method_eff = str(solver_method)
     if lam_vec is None or omega_c is None:
         raise ValueError("lam_vec and omega_c are required (or pass options=QEDOptions(...))")
 
-    M = build_qed_tda_matrix(
-        kernel,
-        lam_vec,
-        omega_c,
-        origin=origin,
-        include_dse=include_dse,
-        coherent_state=coherent_state,
-        include_nuclear=include_nuclear,
-        nuclear_sign=nuclear_sign,
-        comm=comm,
-        verbose=verbose,
-    )
-    w, V = scipy.linalg.eigh(M)
-    n = kernel.n_trans
-    X, m = V[:n, :], V[n, :]
+    if not getattr(kernel, "_ready", False):
+        kernel.setup(tda=True)
 
-    mu = kernel.dipole_matrix()  # (n_trans, 3) unprojected
-    d = X.T @ mu  # (n+1, 3)
+    n = int(kernel.n_trans)
+    omega_c = float(omega_c)
+
+    # Explicit multi-rank dense assembly still uses the dense path.
+    if _comm_size(comm) > 1:
+        matrix_free_eff = False
+
+    if not matrix_free_eff:
+        M = build_qed_tda_matrix(
+            kernel,
+            lam_vec,
+            omega_c,
+            origin=origin,
+            include_dse=include_dse,
+            coherent_state=coherent_state,
+            include_nuclear=include_nuclear,
+            nuclear_sign=nuclear_sign,
+            comm=comm,
+            verbose=verbose,
+        )
+        w, V = scipy.linalg.eigh(M)
+        X, m = V[:n, :], V[n, :]
+        solver_method_eff = "eigh"
+    else:
+        from casidapy.davidson import solve_davidson, solve_lobpcg
+
+        q, Q_oo, Q_vv = dipole_blocks(
+            kernel,
+            lam_vec,
+            origin=origin,
+            include_nuclear=include_nuclear,
+            coherent_state=coherent_state,
+            nuclear_sign=nuclear_sign,
+        )
+        g = np.sqrt(omega_c / 2.0) * SQRT2 * np.asarray(q, dtype=float).ravel()
+        dE = kernel.diagonal_dE()
+        diag = np.concatenate([dE, [omega_c]])
+
+        def _apply(V):
+            return qed_tda_apply(
+                kernel,
+                V,
+                q=q,
+                Q_oo=Q_oo,
+                Q_vv=Q_vv,
+                g=g,
+                omega_c=omega_c,
+                dE=dE,
+                include_dse=include_dse,
+            )
+
+        A_op = LinearOperator(
+            shape=(n + 1, n + 1),
+            matvec=lambda x: _apply(x),
+            matmat=lambda V: _apply(V),
+            dtype=np.float64,
+        )
+
+        nroots = int(nstates) if nstates is not None else min(20, n + 1)
+        nroots = max(1, min(nroots, n + 1))
+        X0 = _qed_tda_initial_guess(dE, omega_c, nroots)
+        verb = 1 if verbose else 0
+        method = solver_method_eff.strip().lower()
+        if verbose:
+            print(
+                f"\nSolving QED-TDA matrix-free using {method.upper()}\n"
+                f"  Matrix size: {n + 1} x {n + 1}  (n_trans={n} + 1 photon)\n"
+                f"  Seeking {nroots} eigenvalues",
+                flush=True,
+            )
+        if method == "lobpcg":
+            w, V = solve_lobpcg(
+                A_op,
+                nroots=nroots,
+                X0=X0,
+                diagonal=diag,
+                tol=1e-8,
+                maxiter=200,
+                largest=False,
+                verbose=verb,
+            )
+        elif method in ("davidson", "eigsh"):
+            # eigsh routed to Davidson for a batched matmat path.
+            w, V = solve_davidson(
+                A_op,
+                nroots=nroots,
+                X0=X0,
+                diagonal=diag,
+                tol=1e-8,
+                maxiter=200,
+                largest=False,
+                verbose=verb,
+            )
+            solver_method_eff = "davidson" if method == "eigsh" else method
+        else:
+            raise ValueError(
+                f"Unknown QED solver_method {solver_method_eff!r}; "
+                "use 'davidson' or 'lobpcg' (or matrix_free=False)."
+            )
+        X, m = V[:n, :], V[n, :]
+        nstates = nroots  # already truncated
+
+    mu = kernel.dipole_matrix()  # (n_trans, 3)
+    d = X.T @ mu  # (nstates_or_all, 3)
     f = (2.0 / 3.0) * w * np.einsum("nx,nx->n", d, d)
 
     if nstates is not None:
@@ -683,6 +926,8 @@ def solve_qed_tda(
             "spin_flip": False,
             "include_dse": bool(include_dse),
             "coherent_state": bool(coherent_state),
+            "matrix_free": bool(matrix_free_eff),
+            "solver_method": str(solver_method_eff),
             "origin": list(np.asarray(origin, dtype=float).ravel()),
             "nuclear_dipole_sign": (
                 NUCLEAR_DIPOLE_SIGN if nuclear_sign is None else float(nuclear_sign)

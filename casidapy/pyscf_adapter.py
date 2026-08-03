@@ -23,6 +23,7 @@ def extract_gto_kernel(
     use_gpu: bool = False,
     use_mpi_response: bool = False,
     spin_state: str = "singlet",
+    k_cache_max: int = 4096,
 ) -> Tuple[GTOKernel, CasidaOptions]:
     """Create a :class:`GTOKernel` and matching :class:`CasidaOptions` from ``mf``.
 
@@ -47,6 +48,10 @@ def extract_gto_kernel(
     ``mpirun`` so non-master ranks park in the worker pool. Forces
     ``use_df=False`` for the response. Pass ``comm=None`` to
     ``run_casida`` / QED (do not mix with SPMD Casida row builds).
+
+    ``k_cache_max``: if ``n_trans <= k_cache_max``, ``setup()`` builds a dense
+    ``K`` for DGEMM matvecs. Use ``0`` for large active spaces so Casida and
+    matrix-free QED-TDA stay on-the-fly ``apply_K`` (avoids an O(n²) build).
     """
     mo_e = np.asarray(mf.mo_energy, dtype=float)
     mo_c = np.asarray(mf.mo_coeff, dtype=float)
@@ -90,6 +95,7 @@ def extract_gto_kernel(
         use_gpu=use_gpu,
         use_mpi_response=use_mpi_response,
         spin_state=spin_state,
+        k_cache_max=int(k_cache_max),
     )
     opts = CasidaOptions(
         n_occ=kernel.n_occ,

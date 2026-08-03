@@ -24,7 +24,9 @@ from casidapy.qed import (
     scan_qed_lambda,
     scan_qed_sf_lambda,
     dse_exchange_rows,
+    dse_exchange_matvec,
     qed_electronic_A_rows,
+    qed_tda_apply,
 )
 from casidapy.soc import (
     SOCResults,
@@ -82,7 +84,9 @@ __all__ = [
     "scan_qed_lambda",
     "scan_qed_sf_lambda",
     "dse_exchange_rows",
+    "dse_exchange_matvec",
     "qed_electronic_A_rows",
+    "qed_tda_apply",
     "SOCResults",
     "soc_ao_integrals",
     "solve_soc_si",

@@ -189,7 +189,20 @@ kernel, opts = extract_gto_kernel(
 results = run_casida(kernel, opts)
 ```
 
-`GTOKernel` delegates the coupling to PySCF `mf.gen_response`, so it matches PySCF TDDFT exactly: Coulomb, singlet-adapted adiabatic f_xc, and exact exchange for hybrid / range-separated functionals (e.g. `pbe0`, `b3lyp`, `cam-b3lyp`). A plain RHF ground state gives CIS. Hybrids require `tda=True` (the matrix-free RPA chain assumes `A - B = diag(dE)`, which exact exchange breaks); pure functionals support both TDA and full Casida. Density fitting is used when `use_df=True`.
+`GTOKernel` delegates the coupling to PySCF `mf.gen_response`, so it matches PySCF TDDFT exactly: Coulomb, singlet-adapted adiabatic f_xc, and exact exchange for hybrid / range-separated functionals (e.g. `pbe0`, `b3lyp`, `cam-b3lyp`). A plain RHF ground state gives CIS / TDHF.
+
+| Mode | Pure GGA / LDA | Hybrid / HF |
+|------|----------------|-------------|
+| **TDA** (`tda=True`) | matrix-free `A` | matrix-free `A` |
+| **Full TDDFT** (`tda=False`) | matrix-free Casida `C` (`A−B=diag(Δε)`) | dense `A,B` via PySCF `get_ab()` |
+
+```python
+# Full TDDFT / RPA (pure or hybrid)
+kernel, opts = extract_gto_kernel(mf, n_states=10, tda=False, xc="pbe0")
+results = run_casida(kernel, opts)  # hybrids automatically use dense A/B
+```
+
+Density fitting is used when `use_df=True`.
 
 **Spin-flip TDDFT (GTO, Route A)** — collinear Mₛ = −1 manifold on a high-spin UKS/UHF reference (α-occupied → β-virtual). In that block the Hartree term and spin-diagonal `f_xc` vanish; only exact exchange survives (`K = -c_x · get_k(dm_αβ)`). That implies:
 
@@ -213,6 +226,18 @@ kernel = GTOKernel.build_spin_flip(mol, xc="bhandhlyp", mf=mf)
 ```
 
 Driver: `scripts/run_sf_tda.py` (CH₂ triplet or 90°-twisted ethylene).
+
+**QED-SF-TDA** — cavity coupling on the SF manifold via the dipole-*difference* matrix `Δd` between SF configurations (Slater–Condon: `I⊗Q_vv − Q_oo⊗I`), not the spin-forbidden `⟨α|r|β⟩`. The Hamiltonian is the QED-SF-CIS block form on SF singles ⊗ {0,1} photons (`2 n_trans` dense matrix). DSE/CS are off by default.
+
+```python
+from casidapy import extract_sf_gto_kernel, solve_qed_sf_tda, QEDOptions
+
+kernel, _ = extract_sf_gto_kernel(mol, xc="bhandhlyp", use_df=False)
+kernel.setup(tda=True)
+opts = QEDOptions(lam_scalar=0.05, polarization=(0, 0, 1), omega_c=0.1, nstates=8)
+res = solve_qed_sf_tda(kernel, options=opts)
+# res.X[:n] = 0-photon SF amplitudes; res.X[n:] = 1-photon; res.photon_frac
+```
 
 **Performance:** when `n_trans <= k_cache_max` (default 4096), `setup()` precomputes the full K matrix using batched `gen_response` calls — a few AO-integral passes total instead of one per solver iteration — after which every matvec is a DGEMM. For larger active spaces, matvecs are evaluated on the fly. PySCF's integrals and grid quadrature are OpenMP-threaded; set `OMP_NUM_THREADS` to the core count for intra-node parallelism (MPI does not help the GTO path). `GTOKernel.dense_K_rows` also plugs into the engine's MPI dense build (`build_matrices`), same as the plane-wave backend.
 
@@ -324,8 +349,8 @@ casidapy/
   davidson.py            # Davidson / LOBPCG / eigsh (matrix-free)
   polariton_handler.py   # optional polariton extensions
   qed.py                 # Pauli–Fierz QED-TDA (closed-shell GTO)
-scripts/                 # run_sf_tda.py, run_qed_formaldehyde.py, SLURM wrappers
-tutorials/               # H₂O + QED-TDA Jupyter notebooks
+scripts/                 # run_sf_tda.py, run_qed_formaldehyde.py, SOC/QED PES, SLURM wrappers
+tutorials/               # H₂O, QED-TDA, QED-SF, SOC atoms, SOC+QED formaldehyde notebooks
 tests/                   # pytest unit tests
 ```
 

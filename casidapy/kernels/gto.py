@@ -846,12 +846,14 @@ class GTOKernel:
         if self.triplet:
             # ⟨S0|μ|T⟩ = 0 without SOC (spin forbidden).
             return np.zeros((self._n_trans, 3), dtype=float)
-        # μ_AO: (3, nao, nao); then μ_ia = C_o† μ C_v
+        # Singlet TDA/RPA: ⟨S₀|r|S⟩ = √2 Σ_ia X_ia ⟨i|r|a⟩ (spin-adapted).
+        # Matches PySCF oscillator strengths and the √2 in QED-TDA couplings.
         orig = tuple(np.asarray(origin, dtype=float).ravel())
         with self.mol.with_common_orig(orig):
             dip_ao = self.mol.intor("int1e_r", comp=3)
         mu = np.empty((self._n_trans, 3), dtype=float)
+        sqrt2 = np.sqrt(2.0)
         for alpha in range(3):
             mua = self._C_o.T @ dip_ao[alpha] @ self._C_v
-            mu[:, alpha] = mua.ravel()
+            mu[:, alpha] = sqrt2 * mua.ravel()
         return mu

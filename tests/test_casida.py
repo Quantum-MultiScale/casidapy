@@ -532,6 +532,110 @@ class TestQEDClosedShellMPI:
         assert res.meta["mpi_size"] == MPI.COMM_WORLD.Get_size()
         assert np.all(np.isfinite(res.omega))
 
+    def test_dse_exchange_matvec_matches_dense(self):
+        from casidapy.qed import dse_exchange_matrix, dse_exchange_matvec
+
+        rng = np.random.default_rng(1)
+        n_o, n_v = 3, 5
+        Q_oo = rng.standard_normal((n_o, n_o))
+        Q_oo = 0.5 * (Q_oo + Q_oo.T)
+        Q_vv = rng.standard_normal((n_v, n_v))
+        Q_vv = 0.5 * (Q_vv + Q_vv.T)
+        full = dse_exchange_matrix(Q_oo, Q_vv)
+        v = rng.standard_normal(n_o * n_v)
+        np.testing.assert_allclose(
+            dse_exchange_matvec(Q_oo, Q_vv, v), full @ v, atol=1e-12,
+        )
+        V = rng.standard_normal((n_o * n_v, 4))
+        np.testing.assert_allclose(
+            dse_exchange_matvec(Q_oo, Q_vv, V), full @ V, atol=1e-12,
+        )
+
+    def test_qed_tda_apply_matches_dense_matvec(self):
+        pytest.importorskip("pyscf")
+        from casidapy.qed import (
+            SQRT2,
+            build_qed_tda_matrix,
+            dipole_blocks,
+            qed_tda_apply,
+        )
+
+        kernel = self._h2_kernel(k_cache_max=0)
+        lam = (0.0, 0.0, 0.05)
+        omega_c = 0.2
+        for include_dse in (False, True):
+            M = build_qed_tda_matrix(
+                kernel, lam, omega_c, include_dse=include_dse,
+            )
+            q, Q_oo, Q_vv = dipole_blocks(kernel, lam)
+            g = np.sqrt(omega_c / 2.0) * SQRT2 * q
+            dE = kernel.diagonal_dE()
+            rng = np.random.default_rng(2)
+            v = rng.standard_normal(kernel.n_trans + 1)
+            y = qed_tda_apply(
+                kernel,
+                v,
+                q=q,
+                Q_oo=Q_oo,
+                Q_vv=Q_vv,
+                g=g,
+                omega_c=omega_c,
+                dE=dE,
+                include_dse=include_dse,
+            )
+            np.testing.assert_allclose(y, M @ v, atol=1e-9)
+            V = rng.standard_normal((kernel.n_trans + 1, 3))
+            Y = qed_tda_apply(
+                kernel,
+                V,
+                q=q,
+                Q_oo=Q_oo,
+                Q_vv=Q_vv,
+                g=g,
+                omega_c=omega_c,
+                dE=dE,
+                include_dse=include_dse,
+            )
+            np.testing.assert_allclose(Y, M @ V, atol=1e-9)
+
+    def test_matrix_free_solve_matches_dense_eigh(self):
+        pytest.importorskip("pyscf")
+        from casidapy.qed import build_qed_tda_matrix, solve_qed_tda
+
+        kernel = self._h2_kernel(k_cache_max=0)
+        lam = (0.0, 0.0, 0.05)
+        omega_c = 0.18
+        nstates = 4
+        M = build_qed_tda_matrix(kernel, lam, omega_c, include_dse=True)
+        w_ref = np.linalg.eigvalsh(M)[:nstates]
+
+        res_mf = solve_qed_tda(
+            kernel,
+            lam_vec=lam,
+            omega_c=omega_c,
+            nstates=nstates,
+            matrix_free=True,
+            include_dse=True,
+            verbose=False,
+        )
+        res_d = solve_qed_tda(
+            kernel,
+            lam_vec=lam,
+            omega_c=omega_c,
+            nstates=nstates,
+            matrix_free=False,
+            include_dse=True,
+            verbose=False,
+        )
+        np.testing.assert_allclose(res_mf.omega, w_ref, atol=1e-6)
+        np.testing.assert_allclose(res_d.omega, w_ref, atol=1e-8)
+        np.testing.assert_allclose(res_mf.omega, res_d.omega, atol=1e-6)
+        assert res_mf.meta["matrix_free"] is True
+        assert res_d.meta["matrix_free"] is False
+        assert res_d.meta["solver_method"] == "eigh"
+        assert np.all(np.isfinite(res_mf.f))
+        assert np.all((res_mf.photon_frac >= -1e-12) & (res_mf.photon_frac <= 1.0 + 1e-12))
+
 
 class TestQEDSpinFlip:
     """QED-SF-TDA: Δd coupling on the collinear SF manifold."""
