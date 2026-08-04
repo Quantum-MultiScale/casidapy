@@ -1,8 +1,8 @@
-"""Pauli–Fierz QED-TDDFT (TDA) on top of the GTO electronic kernel.
+"""Pauli-Fierz QED-TDDFT (TDA) on top of the GTO electronic kernel.
 
 Length gauge, dipole approximation, single cavity mode, coherent-state
 (relaxed-dipole) reference, TDA only. The electronic coupling ``K`` is
-consumed as-is from :class:`~casidapy.kernels.gto.GTOKernel` — this module
+consumed as-is from :class:`~casidapy.kernels.gto.GTOKernel`  this module
 does not modify ``apply_K`` or the Casida algebra.
 
 **Closed-shell solve (default matrix-free):** :func:`solve_qed_tda` applies

@@ -1327,3 +1327,329 @@ class TestFullCasidaWorkflow:
 
         assert len(omega) == n_occ * n_unocc
         assert np.all(omega > 0)
+
+
+# ---------------------------------------------------------------------------
+# Distributed subsystem-coupling scheduling logic (pure Python; no MPI/QE).
+#
+# These exercise the deterministic scheduling that drives the disk-free
+# distributed coupling. They import from casidapy.subsystem_coupling lazily so
+# collection never fails when heavy deps (dftpy/mpi4py) are unavailable.
+# ---------------------------------------------------------------------------
+
+class TestRoundRobinRounds:
+    def _all_pairs(self, items):
+        return {(min(a, b), max(a, b))
+                for i, a in enumerate(items) for b in items[i + 1:]}
+
+    @pytest.mark.parametrize("items", [
+        [0, 1],
+        [0, 1, 2],
+        [0, 1, 2, 3],
+        [2, 5, 7, 9, 11],       # non-contiguous fragment indices
+        list(range(8)),
+    ])
+    def test_covers_every_pair_exactly_once(self, items):
+        from casidapy.subsystem_coupling import round_robin_rounds
+
+        rounds = round_robin_rounds(items)
+        seen = []
+        for rnd in rounds:
+            # no fragment repeats within a round -> each owner in <=1 exchange
+            flat = [x for pair in rnd for x in pair]
+            assert len(flat) == len(set(flat)), f"repeat within round: {rnd}"
+            for (a, b) in rnd:
+                seen.append((min(a, b), max(a, b)))
+        assert set(seen) == self._all_pairs(items)
+        assert len(seen) == len(self._all_pairs(items))  # exactly once each
+
+    def test_trivial(self):
+        from casidapy.subsystem_coupling import round_robin_rounds
+        assert round_robin_rounds([]) == []
+        assert round_robin_rounds([3]) == []  # nothing to pair
+
+
+class TestBuildBlockSchedule:
+    def test_owner_is_an_endpoint_and_all_pairs_assigned(self):
+        from casidapy.subsystem_coupling import build_block_schedule
+
+        active = [0, 1, 2, 3]
+        owners = {0: 10, 1: 11, 2: 12, 3: 13}       # world rank per fragment
+        n_states = {0: 5, 1: 5, 2: 5, 3: 5}
+        sched = build_block_schedule(active, owners, n_states)
+
+        pairs = {(min(a, b), max(a, b))
+                 for i, a in enumerate(active) for b in active[i + 1:]}
+        assert set(sched.keys()) == pairs
+        for (i, j), owner in sched.items():
+            assert owner in (owners[i], owners[j])
+
+    def test_deterministic(self):
+        from casidapy.subsystem_coupling import build_block_schedule
+
+        active = [0, 1, 2, 3, 4]
+        owners = {f: 100 + f for f in active}
+        n_states = {0: 3, 1: 9, 2: 4, 3: 7, 4: 2}
+        s1 = build_block_schedule(active, owners, n_states)
+        s2 = build_block_schedule(active, owners, n_states)
+        assert s1 == s2
+
+    def test_load_is_balanced_when_uniform(self):
+        from casidapy.subsystem_coupling import build_block_schedule
+
+        active = list(range(6))
+        owners = {f: f for f in active}          # one rank per fragment
+        n_states = {f: 10 for f in active}       # uniform streamed cost
+        sched = build_block_schedule(active, owners, n_states)
+
+        # streamed FFT load = states of the partner that gets streamed
+        load = {}
+        for (i, j), owner in sched.items():
+            streamed = j if owner == owners[i] else i
+            load[owner] = load.get(owner, 0) + n_states[streamed]
+        # greedy LPT keeps owners within one block's worth of each other
+        assert max(load.values()) - min(load.values()) <= max(n_states.values())
+
+
+class TestSelectActiveFragments:
+    def _frag(self, omega):
+        w = np.asarray(omega, dtype=float)
+        n = len(w)
+        return {
+            "omega": w,
+            "f": np.ones(n),
+            "Z": np.eye(n),
+            "xpy": np.eye(n),
+            "dip_tran": np.zeros((n, 3)),
+        }
+
+    def test_zero_or_one_active_returns_final_dict(self):
+        from casidapy.subsystem_coupling import _select_active_fragments
+
+        assert isinstance(_select_active_fragments([None, None], None, False), dict)
+        one = _select_active_fragments([self._frag([0.2, 0.3]), None], None, False)
+        assert isinstance(one, dict)
+        assert one["K_coupling"] == {}
+
+    def test_two_active_returns_indices_and_results(self):
+        from casidapy.subsystem_coupling import _select_active_fragments
+
+        frags = [self._frag([0.2, 0.3]), self._frag([0.25, 0.4])]
+        sel = _select_active_fragments(frags, None, False)
+        assert isinstance(sel, tuple)
+        idx, res = sel
+        assert idx == [0, 1]
+        assert len(res) == 2
+
+    def test_omega_cap_drops_fragment_below_two(self):
+        from casidapy.subsystem_coupling import _select_active_fragments
+
+        # cap at 0.15 Ha: both fragments lose all states -> final (empty) dict
+        frags = [self._frag([0.2, 0.3]), self._frag([0.25, 0.4])]
+        sel = _select_active_fragments(frags, 0.15, False)
+        assert isinstance(sel, dict)
+
+
+# ---------------------------------------------------------------------------
+# NAC wrappers (gpu4pyscf TDDFT / pyscf SA-CASSCF)
+# ---------------------------------------------------------------------------
+
+
+class TestNACWrapper:
+    def test_import_and_missing_gpu4pyscf(self):
+        from casidapy.nac import solve_nac, NACResults, _require_gpu4pyscf
+        import importlib.util
+
+        if importlib.util.find_spec("gpu4pyscf") is None:
+            with pytest.raises(ImportError, match="gpu4pyscf"):
+                _require_gpu4pyscf()
+        # dataclass sanity
+        r = NACResults(states=(0, 1), de=np.zeros((2, 3)), omega=np.array([0.0, 0.1]))
+        assert r.omega_ev is not None
+        assert abs(r.omega_ev[1] - 0.1 * 27.211386245988) < 1e-10
+
+    def test_as_numpy_cupy_or_list(self):
+        from casidapy.nac import _as_numpy
+
+        assert _as_numpy(None) is None
+        a = _as_numpy([[1.0, 2.0, 3.0]])
+        assert a.shape == (1, 3)
+
+    def test_tddft_nac_h2o_ge_optional(self):
+        """Optional integration: GS–S1 NAC for water (needs gpu4pyscf + GPU)."""
+        pytest.importorskip("pyscf")
+        pytest.importorskip("gpu4pyscf")
+        cupy = pytest.importorskip("cupy")
+        try:
+            cupy.cuda.Device().compute_capability
+        except Exception:
+            pytest.skip("no usable CUDA device")
+
+        from pyscf import gto, dft
+        from casidapy import solve_nac
+
+        mol = gto.M(
+            atom="O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587",
+            basis="sto-3g",
+            verbose=0,
+        )
+        mf = dft.RKS(mol)
+        mf.xc = "pbe"
+        mf.kernel()
+        nac = solve_nac(mf, states=(0, 1), method="tda", nstates=3)
+        assert nac.de.shape == (mol.natm, 3)
+        assert nac.backend == "gpu4pyscf"
+        assert nac.method == "tda"
+        assert nac.de_etf is not None
+
+
+class TestProjectedQEDNAC:
+    def test_assemble_and_project_algebra(self):
+        from casidapy.nac import (
+            assemble_electronic_nac_tensor,
+            project_polariton_nac,
+            project_qed_nac,
+            electronic_weights_qed_post,
+            solve_qed_projected_nac,
+        )
+
+        natm = 2
+        # d_12 = ones; antisym fills d_21
+        d12 = np.ones((natm, 3))
+        d_el = assemble_electronic_nac_tensor(
+            {(1, 2): d12}, n_states=3, antisym=True,
+        )
+        assert d_el.shape == (3, 3, natm, 3)
+        assert np.allclose(d_el[2, 1], -d12)
+
+        # Polariton I = pure S1, J = pure S2 → projected NAC = d_12
+        C = np.zeros((3, 2))
+        C[1, 0] = 1.0
+        C[2, 1] = 1.0
+        de = project_polariton_nac(C, d_el, (0, 1))
+        assert np.allclose(de, d12)
+
+        # Equal mix on S1/S2 for both → cancellation if identical columns
+        C2 = np.zeros((3, 2))
+        C2[1, :] = 1.0 / np.sqrt(2)
+        C2[2, :] = 1.0 / np.sqrt(2)
+        de_same = project_polariton_nac(C2, d_el, (0, 1))
+        # Σ_ab c_a c_b d_ab with c1=c2=1/√2 → (d12+d21)/2 = 0
+        assert np.allclose(de_same, 0.0, atol=1e-12)
+
+        res = project_qed_nac(C, d_el, (0, 1), omega=np.array([0.1, 0.2]))
+        assert res.method == "qed-projected"
+        assert np.allclose(res.de, d12)
+
+    def test_jc_post_weights_and_projection(self):
+        from casidapy.nac import (
+            assemble_electronic_nac_tensor,
+            electronic_weights_qed_post,
+            solve_qed_projected_nac,
+        )
+
+        # Fake JC: one bright root (Casida index 0 → label 1), photon row
+        # Polaritons: LP ~ (S1 + ph)/√2, UP ~ (S1 - ph)/√2
+        s = 1.0 / np.sqrt(2)
+        V = np.array([
+            [s, s],   # electronic S1
+            [s, -s],  # photon
+        ])
+        qed = {
+            "V": V,
+            "omega": np.array([0.9, 1.1]),
+            "tddft_indices": np.array([0]),
+            "model": "jaynes-cummings",
+            "photon_frac": V[1] ** 2,
+            "postprocess": True,
+        }
+        C, labs = electronic_weights_qed_post(qed, n_label=2)
+        assert labs.tolist() == [1]
+        assert np.allclose(C[1], [s, s])
+        assert np.allclose(C[0], 0.0)
+
+        # Only one excited state → no excited–excited NAC; d_el with GS–S1
+        d01 = np.array([[0.1, 0.0, 0.0], [0.0, 0.2, 0.0], [0.0, 0.0, 0.3]])
+        d_el = assemble_electronic_nac_tensor({(0, 1): d01}, n_states=2)
+        # Both polaritons have same electronic weight on S1 → projected EE NAC = 0
+        # (no GS weight). GS–S1 does not contribute when C[0]=0.
+        nac = solve_qed_projected_nac(qed, d_el, states=(0, 1))
+        assert np.allclose(nac.de, 0.0, atol=1e-12)
+
+    def test_pf_post_weights_add_photon_sectors(self):
+        from casidapy.nac import electronic_weights_qed_post
+
+        # n_el=2 (GS + S1), 2 photon sectors → V shape (4, 1)
+        V = np.zeros((4, 1))
+        V[0, 0] = 0.1   # GS, 0ph
+        V[1, 0] = 0.6   # S1, 0ph
+        V[2, 0] = 0.2   # GS, 1ph
+        V[3, 0] = 0.3   # S1, 1ph
+        qed = {
+            "V": V,
+            "tddft_indices": np.array([0]),
+            "model": "pauli-fierz",
+            "include_ground_slot": True,
+            "postprocess": True,
+        }
+        C, labs = electronic_weights_qed_post(qed, n_label=2)
+        assert labs.tolist() == [0, 1]
+        assert abs(C[0, 0] - 0.3) < 1e-12  # 0.1+0.2
+        assert abs(C[1, 0] - 0.9) < 1e-12  # 0.6+0.3
+
+    def test_dense_weights_via_casida_Z(self):
+        from types import SimpleNamespace
+        from casidapy.nac import electronic_weights_qed_dense
+
+        rng = np.random.default_rng(0)
+        n_trans, n_cas, n_pol = 5, 3, 2
+        Z = rng.standard_normal((n_trans, n_cas))
+        Z, _ = np.linalg.qr(Z)
+        X = rng.standard_normal((n_trans, n_pol))
+        qed = SimpleNamespace(X=X, m=np.zeros(n_pol), omega=np.ones(n_pol))
+        cas = SimpleNamespace(Z=Z)
+        C = electronic_weights_qed_dense(qed, cas)
+        assert C.shape == (n_cas + 1, n_pol)
+        assert np.allclose(C[0], 0.0)
+        assert np.allclose(C[1:], Z.T @ X)
+
+    def test_sf_qed_weights_and_projection(self):
+        from types import SimpleNamespace
+        from casidapy.nac import (
+            assemble_electronic_nac_tensor,
+            electronic_weights_qed_sf,
+            solve_qed_projected_nac,
+        )
+
+        rng = np.random.default_rng(1)
+        n_trans, n_cas, n_pol = 6, 3, 2
+        Z, _ = np.linalg.qr(rng.standard_normal((n_trans, n_cas)))
+        X = rng.standard_normal((2 * n_trans, n_pol))
+        X /= np.linalg.norm(X, axis=0, keepdims=True)
+        qed = SimpleNamespace(
+            X=X,
+            m=np.zeros(n_pol),
+            omega=np.array([0.1, 0.2]),
+            photon_frac=np.sum(X[n_trans:] ** 2, axis=0),
+            meta={"spin_flip": True, "n_trans": n_trans},
+        )
+        cas = SimpleNamespace(Z=Z)
+        C = electronic_weights_qed_sf(qed, cas)
+        assert C.shape == (n_cas, n_pol)
+        assert np.allclose(C, Z.T @ X[:n_trans] + Z.T @ X[n_trans:])
+
+        d12 = np.ones((2, 3))
+        d_el = assemble_electronic_nac_tensor({(0, 1): d12}, n_states=n_cas)
+        C_pure = np.zeros((n_cas, 2))
+        C_pure[0, 0] = 1.0
+        C_pure[1, 1] = 1.0
+        qed2 = SimpleNamespace(
+            X=np.vstack([Z @ C_pure, np.zeros_like(Z @ C_pure)]),
+            m=np.zeros(2),
+            omega=np.array([0.1, 0.2]),
+            photon_frac=np.zeros(2),
+            meta={"spin_flip": True},
+        )
+        nac = solve_qed_projected_nac(qed2, d_el, states=(0, 1), casida=cas)
+        assert nac.meta.get("spin_flip") is True
+        assert np.allclose(nac.de, d12, atol=1e-10)

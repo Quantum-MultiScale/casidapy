@@ -748,7 +748,15 @@ def _run_casida_plane_wave(inputs: CasidaInputs, options: CasidaOptions, comm=No
     rank = comm.Get_rank()
 
     atoms = inputs.atoms
-    ions = Ions.from_ase(atoms)
+    # Accept an ASE Atoms, a dftpy Ions, or an eDFTpy SubCell (which carries a
+    # dftpy Ions on ``.ions``). The eDFTpy subsystem path passes a SubCell, which
+    # is not an ASE Atoms (no ``.symbols``), so ``Ions.from_ase`` cannot be used.
+    if isinstance(atoms, Ions):
+        ions = atoms
+    elif isinstance(getattr(atoms, "ions", None), Ions):
+        ions = atoms.ions
+    else:
+        ions = Ions.from_ase(atoms)
     grid = inputs.grid
     rho_ks = inputs.rho_ks
     eigs = np.asarray(inputs.eigs).copy()
@@ -757,7 +765,10 @@ def _run_casida_plane_wave(inputs: CasidaInputs, options: CasidaOptions, comm=No
     # Pseudo / core density
     core = None
     if options.pseudo_map:
-        missing = set(atoms.get_chemical_symbols()) - set(options.pseudo_map.keys())
+        symbols = getattr(ions, "symbols", None)
+        if symbols is None:
+            symbols = atoms.get_chemical_symbols()
+        missing = set(symbols) - set(options.pseudo_map.keys())
         if missing:
             raise ValueError(f"Missing pseudo_map entries for elements: {sorted(missing)}")
         pseudo = LocalPseudo(grid=rho_ks.grid, ions=ions, PP_list=options.pseudo_map)

@@ -575,79 +575,50 @@ def run_subsystem_casida(
     verbose: bool = True,
     fragment_stream_paths: Optional[List[Optional[str]]] = None,
     omega_coupling_max: Optional[float] = None,
+    comm=None,
+    graphtopo=None,
+    fragment_owners: Optional[List[int]] = None,
+    distributed: bool = False,
+    f_nadd: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
-    """Pavanello coupling on a serial ``gsystem`` (grid/density patched by eDFTpy on rank 0)."""
-    n_frag = len(fragment_results)
-    active_indices = [
-        i for i in range(n_frag) if fragment_results[i] is not None
-    ]
+    """Pavanello coupling on a serial ``gsystem`` (grid/density patched by eDFTpy).
+
+    Two backends:
+
+    * **Serial** (default): rank 0 holds every fragment's transition densities
+      (in memory or file-streamed via ``fragment_stream_paths``) and builds all
+      coupling blocks itself.
+    * **Distributed** (``distributed=True``): a *collective* call — every rank
+      participates. Each fragment's ``rho_transition`` stays resident on its
+      owner rank (``fragment_owners[idx]``); blocks are computed where the data
+      already lives and the partner's transition densities are streamed
+      state-by-state over ``graphtopo.comm``. No disk, no rank-0 gather of grids.
+      Requires ``graphtopo`` and ``fragment_owners``. Returns the coupled result
+      dict on rank 0 and ``None`` on all other ranks.
+    """
+    sel = _select_active_fragments(fragment_results, omega_coupling_max, verbose)
+    if not isinstance(sel, tuple):
+        return sel
+    active_indices, active_results = sel
     n_active = len(active_indices)
 
-    if n_active < 2:
-        if verbose:
-            print("Less than 2 active fragments — no coupling to compute.", flush=True)
-        if n_active == 1:
-            idx = active_indices[0]
-            res = fragment_results[idx]
-            return {
-                "omega": _res_array(res, "omega"),
-                "f": _res_optional(res, "f", "os_strength", default=np.array([])),
-                "Z": _res_optional(res, "Z", "eigenvectors", default=np.array([[]])),
-                "K_coupling": {},
-                "f_nadd": None,
-            }
-        return _empty_coupled_result()
-
-    # Drop fragments with zero states after active-space reduction
-    paired: List[Tuple[int, Dict[str, Any]]] = []
-    for idx in active_indices:
-        res = fragment_results[idx]
-        omega = _res_array(res, "omega")
-        if omega_coupling_max is not None:
-            keep = np.where(omega <= float(omega_coupling_max))[0]
-            if keep.size == 0:
-                if verbose:
-                    print(
-                        f"  Fragment {idx}: 0 states with omega <= "
-                        f"{float(omega_coupling_max)} Ha — skipped.",
-                        flush=True,
-                    )
-                continue
-            if keep.size < omega.size:
-                res = {
-                    **res,
-                    "omega": omega[keep],
-                    "f": np.asarray(_res_optional(res, "f", "os_strength", default=[]))[keep]
-                    if _res_optional(res, "f", "os_strength") is not None else None,
-                    "Z": np.eye(len(keep), dtype=float),
-                    "eigenvectors": np.eye(len(keep), dtype=float),
-                    "xpy": np.asarray(res["xpy"])[:, keep] if res.get("xpy") is not None else None,
-                    "dip_tran": np.asarray(res["dip_tran"])[keep]
-                    if res.get("dip_tran") is not None
-                    and np.asarray(res["dip_tran"]).shape[0] == omega.size
-                    else res.get("dip_tran"),
-                    "rho_transition": [
-                        res["rho_transition"][int(i)] for i in keep
-                    ] if res.get("rho_transition") is not None else None,
-                }
-                omega = res["omega"]
-        if len(omega) == 0:
-            if verbose:
-                print(f"  Fragment {idx}: 0 states in active space — skipped.", flush=True)
-            continue
-        paired.append((idx, res))
-
-    if len(paired) < 2:
-        if verbose:
-            print(
-                "Fewer than 2 fragments with excitations — no coupling to compute.",
-                flush=True,
-            )
-        return _empty_coupled_result()
-
-    active_indices = [idx for idx, _ in paired]
-    active_results = [res for _, res in paired]
-    n_active = len(active_indices)
+    if distributed:
+        return _run_subsystem_casida_distributed(
+            gsystem,
+            drivers,
+            active_indices,
+            active_results,
+            xc_functional,
+            ke_functional=ke_functional,
+            sub_densities=sub_densities,
+            tda=tda,
+            rho_cutoff=rho_cutoff,
+            fxc_max=fxc_max,
+            verbose=verbose,
+            graphtopo=graphtopo,
+            fragment_owners=fragment_owners,
+            f_nadd=f_nadd,
+        )
 
     if verbose:
         stream = fragment_stream_paths is not None
@@ -883,6 +854,462 @@ def run_subsystem_casida(
             )
         print(
             f"  Done. {len(omega_coupled)} coupled excitations computed.",
+            flush=True,
+        )
+
+    return {
+        "omega": omega_coupled,
+        "f": f_coupled,
+        "Z": Z_coupled,
+        "K_coupling": K_coupling,
+        "f_nadd": f_nadd,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Distributed (in-memory, disk-free) subsystem coupling
+# ---------------------------------------------------------------------------
+#
+# Each fragment's amplitude-basis ``rho_transition`` stack stays resident on its
+# owner rank. Coupling blocks are computed where the data already lives; the
+# partner fragment's transition densities are streamed one state at a time over
+# the world communicator. Peak per-rank memory is therefore one resident
+# fragment stack + one streamed grid + the (broadcast) ``f_nadd`` global field —
+# independent of fragment count and of every other fragment's state count.
+
+
+def _select_active_fragments(fragment_results, omega_coupling_max, verbose):
+    """Fragments with >=1 state (after the optional ``omega`` cap).
+
+    Returns ``(active_indices, active_results)`` when >=2 fragments couple, or a
+    final result dict when fewer remain (0 or 1 active). This is the shared
+    front-end for both the serial and distributed backends so they agree exactly
+    on which fragments/states enter the coupled problem.
+    """
+    n_frag = len(fragment_results)
+    active_indices = [i for i in range(n_frag) if fragment_results[i] is not None]
+    n_active = len(active_indices)
+
+    if n_active < 2:
+        if verbose:
+            print("Less than 2 active fragments — no coupling to compute.", flush=True)
+        if n_active == 1:
+            idx = active_indices[0]
+            res = fragment_results[idx]
+            return {
+                "omega": _res_array(res, "omega"),
+                "f": _res_optional(res, "f", "os_strength", default=np.array([])),
+                "Z": _res_optional(res, "Z", "eigenvectors", default=np.array([[]])),
+                "K_coupling": {},
+                "f_nadd": None,
+            }
+        return _empty_coupled_result()
+
+    # Drop fragments with zero states after active-space reduction
+    paired: List[Tuple[int, Dict[str, Any]]] = []
+    for idx in active_indices:
+        res = fragment_results[idx]
+        omega = _res_array(res, "omega")
+        if omega_coupling_max is not None:
+            keep = np.where(omega <= float(omega_coupling_max))[0]
+            if keep.size == 0:
+                if verbose:
+                    print(
+                        f"  Fragment {idx}: 0 states with omega <= "
+                        f"{float(omega_coupling_max)} Ha — skipped.",
+                        flush=True,
+                    )
+                continue
+            if keep.size < omega.size:
+                res = {
+                    **res,
+                    "omega": omega[keep],
+                    "f": np.asarray(_res_optional(res, "f", "os_strength", default=[]))[keep]
+                    if _res_optional(res, "f", "os_strength") is not None else None,
+                    "Z": np.eye(len(keep), dtype=float),
+                    "eigenvectors": np.eye(len(keep), dtype=float),
+                    "xpy": np.asarray(res["xpy"])[:, keep] if res.get("xpy") is not None else None,
+                    "dip_tran": np.asarray(res["dip_tran"])[keep]
+                    if res.get("dip_tran") is not None
+                    and np.asarray(res["dip_tran"]).shape[0] == omega.size
+                    else res.get("dip_tran"),
+                    "rho_transition": [
+                        res["rho_transition"][int(i)] for i in keep
+                    ] if res.get("rho_transition") is not None else None,
+                }
+                omega = res["omega"]
+        if len(omega) == 0:
+            if verbose:
+                print(f"  Fragment {idx}: 0 states in active space — skipped.", flush=True)
+            continue
+        paired.append((idx, res))
+
+    if len(paired) < 2:
+        if verbose:
+            print(
+                "Fewer than 2 fragments with excitations — no coupling to compute.",
+                flush=True,
+            )
+        return _empty_coupled_result()
+
+    return [idx for idx, _ in paired], [res for _, res in paired]
+
+
+def round_robin_rounds(items):
+    """Circle-method schedule: list of rounds, each a set of disjoint pairs.
+
+    Every unordered pair of ``items`` appears in exactly one round, and within a
+    round no item repeats. Used so that in each communication round every owner
+    rank is involved in at most one point-to-point exchange — which keeps the
+    streaming deadlock-free (each pair is an independent producer→consumer link).
+    """
+    items = list(items)
+    if len(items) % 2:
+        items = items + [None]  # bye
+    n = len(items)
+    arr = items[:]
+    rounds = []
+    for _ in range(max(n - 1, 0)):
+        pairs = []
+        for i in range(n // 2):
+            a, b = arr[i], arr[n - 1 - i]
+            if a is not None and b is not None:
+                pairs.append((a, b))
+        rounds.append(pairs)
+        arr = [arr[0]] + [arr[-1]] + arr[1:-1]  # rotate, fixing the first slot
+    return rounds
+
+
+def build_block_schedule(active_indices, fragment_owners, n_states_by_frag):
+    """Assign each fragment pair to the owner that will *compute* its block.
+
+    The computing owner keeps its own fragment resident (all states) and streams
+    the partner state-by-state, so its added cost is the partner's state count
+    (one Hartree FFT per streamed state). Greedy LPT balancing of that streamed
+    FFT load across owner ranks. Deterministic given identical inputs, so every
+    rank derives the same schedule without communication.
+    """
+    load: Dict[int, int] = {}
+    sched: Dict[Tuple[int, int], int] = {}
+    pairs = [
+        (active_indices[a], active_indices[b])
+        for a in range(len(active_indices))
+        for b in range(a + 1, len(active_indices))
+    ]
+    # Heaviest pairs first (longest-processing-time-first), tuple tie-break for
+    # a fully deterministic order on every rank.
+    pairs.sort(key=lambda p: (-(n_states_by_frag[p[0]] + n_states_by_frag[p[1]]), p))
+    for (I, J) in pairs:
+        oi, oj = fragment_owners[I], fragment_owners[J]
+        cost_i = n_states_by_frag[J]  # owner(I) computes -> streams J
+        cost_j = n_states_by_frag[I]  # owner(J) computes -> streams I
+        li = load.get(oi, 0) + cost_i
+        lj = load.get(oj, 0) + cost_j
+        # Prefer the lighter resulting load; tie -> owner(I) for determinism.
+        if li <= lj:
+            sched[(min(I, J), max(I, J))] = oi
+            load[oi] = li
+        else:
+            sched[(min(I, J), max(I, J))] = oj
+            load[oj] = lj
+    return sched
+
+
+def broadcast_f_nadd(f_nadd, comm, root=0):
+    """Broadcast the (single) global-grid coupling kernel from ``root`` to all ranks."""
+    payload = np.ascontiguousarray(np.asarray(f_nadd, dtype=np.float64)) \
+        if comm.rank == root else None
+    return comm.bcast(payload, root=root)
+
+
+def _send_grid(comm, arr, dest, tag):
+    """Send one transition-density grid (contiguous float64) to ``dest``."""
+    comm.send(np.ascontiguousarray(np.asarray(arr, dtype=np.float64)), dest=dest, tag=tag)
+
+
+def _recv_grid(comm, source, tag):
+    """Receive one streamed transition-density grid from ``source``."""
+    return comm.recv(source=source, tag=tag)
+
+
+def _resident_rho(res_by_frag, idx):
+    """Local resident ``rho_transition`` for fragment ``idx`` as a list of grids."""
+    res = res_by_frag.get(idx)
+    rho = res.get("rho_transition") if res is not None else None
+    if rho is None:
+        raise ValueError(
+            f"Fragment {idx}: resident rho_transition missing on its owner rank "
+            "(distributed coupling expects the owner to keep its own densities).",
+        )
+    stack, n_rho = _rho_transition_to_stack(rho)
+    return [stack[i] for i in range(n_rho)]
+
+
+def compute_coupling_block_streamed(
+    phi_res,
+    stream_state,
+    n_stream,
+    gsystem,
+    isub_res,
+    isub_stream,
+    f_nadd,
+    hartree_func,
+    include_hartree: bool = True,
+) -> np.ndarray:
+    """Coupling block with the resident fragment stacked and the partner streamed.
+
+    ``phi_res`` is the full resident transition-density list; ``stream_state(jb)``
+    returns the ``jb``-th grid of the streamed fragment (pulled over MPI, or read
+    locally). Returns ``K`` with shape ``(len(phi_res), n_stream)`` — the same
+    numbers :func:`compute_coupling_block` produces, just consuming the streamed
+    fragment one state at a time so at most one of its grids is ever resident.
+    """
+    n_res = len(phi_res)
+    if n_res == 0 or n_stream == 0:
+        return np.zeros((n_res, n_stream), dtype=float)
+
+    global_grid = gsystem.grid
+    phi_res_fields = [
+        _embedding_subcell_field(phi_res[ia], gsystem, isub_res) for ia in range(n_res)
+    ]
+    phi_res_flat = np.stack([np.asarray(f).ravel() for f in phi_res_fields])  # (n_res, n_sub)
+    sub_dV = float(phi_res_fields[0].grid.dV)
+
+    K = np.zeros((n_res, n_stream), dtype=float)
+    for jb in range(n_stream):
+        phi_jb = _embedding_subcell_field(stream_state(jb), gsystem, isub_stream)
+        phi_jb_global = _sub_to_global(phi_jb, gsystem, isub_stream)
+        if include_hartree:
+            vh_jb = hartree_func(phi_jb_global, calcType=["V"]).potential
+            response_global = np.asarray(vh_jb) + f_nadd * np.asarray(phi_jb_global)
+        else:
+            response_global = f_nadd * np.asarray(phi_jb_global)
+        response_field = DirectField(grid=global_grid, rank=1)
+        response_field[:] = response_global.reshape(response_field.shape)
+        if include_hartree and jb == 0 and np.abs(np.asarray(response_field)).sum() == 0.0:
+            raise RuntimeError(
+                f"compute_coupling_block_streamed: response_field all zeros for "
+                f"fragments ({isub_res},{isub_stream}), jb=0.",
+            )
+        response_on_res = _global_to_sub(response_field, gsystem, isub_res)
+        response_arr = np.asarray(response_on_res).ravel()
+        K[:, jb] = phi_res_flat @ response_arr * sub_dV
+    return K
+
+
+def _compute_f_nadd(
+    gsystem, drivers, active_indices, sub_densities,
+    xc_functional, ke_functional, rho_cutoff, fxc_max, verbose,
+):
+    """Pavanello non-additive kernel f_xc + f_T at rho_total (serial-grid, root only)."""
+    rho_total = gsystem.density
+    rho_subs = []
+    for idx in active_indices:
+        rho_I_global = DirectField(grid=gsystem.grid, rank=1)
+        rho_I_global[:] = 0.0
+        subrho = None
+        if sub_densities is not None and idx < len(sub_densities):
+            subrho = sub_densities[idx]
+        elif idx < len(drivers) and drivers[idx] is not None:
+            subrho = drivers[idx].density
+        if subrho is not None:
+            sub_field = _embedding_subcell_field(subrho, gsystem, idx)
+            index = _global_sub_index(gsystem, idx)
+            np.asarray(rho_I_global)[index] = np.asarray(sub_field).reshape(
+                np.asarray(rho_I_global)[index].shape,
+            )
+        rho_subs.append(rho_I_global)
+
+    if verbose:
+        print("  Computing Pavanello coupling kernel (f_xc + f_T at rho_tot)...", flush=True)
+    f_nadd = compute_nadd_kernel(
+        rho_total, rho_subs, xc_functional, ke_functional,
+        rho_cutoff=rho_cutoff, fxc_max=fxc_max,
+    )
+    fnadd_arr = np.asarray(f_nadd, dtype=float)
+    if verbose:
+        nz = float(np.sum(fnadd_arr != 0.0)) / max(fnadd_arr.size, 1)
+        print(
+            f"  f_nadd stats: min={float(fnadd_arr.min()):.4e}  "
+            f"max={float(fnadd_arr.max()):.4e}  nonzero={nz:.1%}",
+            flush=True,
+        )
+        if nz == 0.0:
+            print(
+                "  WARNING: f_nadd is entirely zero — all coupling will be pure "
+                "Hartree. Check rho_cutoff and that rho_total is non-zero.",
+                flush=True,
+            )
+    return fnadd_arr
+
+
+def _run_subsystem_casida_distributed(
+    gsystem,
+    drivers,
+    active_indices,
+    active_results,
+    xc_functional,
+    ke_functional=None,
+    sub_densities=None,
+    tda=False,
+    rho_cutoff=1e-3,
+    fxc_max=20.0,
+    verbose=True,
+    graphtopo=None,
+    fragment_owners=None,
+    f_nadd=None,
+):
+    """Collective distributed coupling. See :func:`run_subsystem_casida`.
+
+    Every rank calls this. Returns the coupled result dict on world rank 0 and
+    ``None`` elsewhere (eDFTpy broadcasts the slim spectrum afterwards).
+    """
+    if graphtopo is None or fragment_owners is None:
+        raise ValueError(
+            "distributed coupling requires graphtopo and fragment_owners.",
+        )
+    comm = graphtopo.comm
+    is_mpi = graphtopo.is_mpi
+    my_rank = graphtopo.rank
+    root = 0
+
+    res_by_frag = {idx: res for idx, res in zip(active_indices, active_results)}
+    n_states_by_frag = {
+        idx: len(_res_array(res, "omega")) for idx, res in res_by_frag.items()
+    }
+
+    # ---- f_nadd: build on root (needs serial gsystem.density), broadcast ----
+    if f_nadd is None:
+        if (not is_mpi) or my_rank == root:
+            f_nadd = _compute_f_nadd(
+                gsystem, drivers, active_indices, sub_densities,
+                xc_functional, ke_functional, rho_cutoff, fxc_max, verbose,
+            )
+        if is_mpi:
+            f_nadd = broadcast_f_nadd(f_nadd, comm, root=root)
+    f_nadd = np.asarray(f_nadd, dtype=float)
+
+    hartree = Functional(type="HARTREE")
+
+    # Per-rank diagnostics: resident footprint (proves the O(1)-streamed invariant
+    # — a rank only ever holds its own fragment's stack, never all of them) and a
+    # sub->global->sub round-trip on the first resident state (embedding sanity).
+    if verbose:
+        for f in active_indices:
+            if fragment_owners[f] != my_rank:
+                continue
+            rho = res_by_frag[f].get("rho_transition")
+            if rho is None:
+                continue
+            stack, n_rho = _rho_transition_to_stack(rho)
+            if n_rho == 0:
+                continue
+            print(
+                f"  [rank {my_rank}] resident fragment {f}: {n_rho} grids, "
+                f"{stack.nbytes / 1e9:.3f} GB",
+                flush=True,
+            )
+            phi0 = _embedding_subcell_field(stack[0], gsystem, f)
+            back = _global_to_sub(_sub_to_global(phi0, gsystem, f), gsystem, f)
+            orig = np.asarray(phi0).ravel()
+            rec = np.asarray(back).ravel()
+            err = float(np.max(np.abs(orig - rec)))
+            scale = max(float(np.max(np.abs(orig))), 1e-30)
+            print(
+                f"  [rank {my_rank}] fragment {f} sub->global->sub round-trip "
+                f"max error: {err:.3e}",
+                flush=True,
+            )
+            if err > 1e-10 * scale:
+                print(
+                    f"  [rank {my_rank}] WARNING: large round-trip error for "
+                    f"fragment {f} — check get_sub_index vs field shape.",
+                    flush=True,
+                )
+
+    schedule = build_block_schedule(active_indices, fragment_owners, n_states_by_frag)
+    rounds = round_robin_rounds(active_indices)
+
+    if verbose and ((not is_mpi) or my_rank == root):
+        print(
+            f"Distributed subsystem Casida coupling: {len(active_indices)} fragments, "
+            f"{sum(len(r) for r in rounds)} blocks over {len(rounds)} rounds "
+            f"(streaming partner densities state-by-state).",
+            flush=True,
+        )
+
+    K_local: Dict[Tuple[int, int], np.ndarray] = {}
+    for rnd in rounds:
+        for (A, B) in rnd:
+            key = (min(A, B), max(A, B))
+            owner = schedule[key]
+            resident = A if owner == fragment_owners[A] else B
+            producer = B if resident == A else A
+            resident_rank = fragment_owners[resident]
+            producer_rank = fragment_owners[producer]
+            n_stream = n_states_by_frag[producer]
+
+            if my_rank == resident_rank:
+                phi_res = _resident_rho(res_by_frag, resident)
+                if producer_rank == resident_rank:
+                    # Same rank owns both fragments (only in non-MPI / SerialComm):
+                    # read the partner locally, no messages.
+                    phi_prod = _resident_rho(res_by_frag, producer)
+
+                    def _getter(jb, _p=phi_prod):
+                        return _p[jb]
+                else:
+                    def _getter(jb, _src=producer_rank):
+                        return _recv_grid(comm, _src, jb)
+
+                K_rs = compute_coupling_block_streamed(
+                    phi_res, _getter, n_stream, gsystem,
+                    resident, producer, f_nadd, hartree, include_hartree=True,
+                )
+                # Canonical orientation K[(min,max)].
+                K_local[key] = K_rs if resident == key[0] else K_rs.T
+            elif my_rank == producer_rank:
+                phi_prod = _resident_rho(res_by_frag, producer)
+                for jb in range(n_stream):
+                    _send_grid(comm, phi_prod[jb], resident_rank, jb)
+            # ranks owning neither fragment sit this pair out
+        if is_mpi:
+            comm.Barrier()
+
+    # ---- gather the (small) K blocks to root ----
+    if is_mpi:
+        gathered = comm.gather(K_local, root=root)
+    else:
+        gathered = [K_local]
+    if is_mpi and my_rank != root:
+        return None
+
+    K_coupling: Dict[Tuple[int, int], np.ndarray] = {}
+    for d in (gathered or []):
+        if d:
+            K_coupling.update(d)
+    for (I, J), K_IJ in list(K_coupling.items()):
+        K_coupling.setdefault((J, I), np.asarray(K_IJ).T)
+
+    if verbose:
+        for (I, J), K_IJ in sorted(K_coupling.items()):
+            if I < J:
+                K_IJ = np.asarray(K_IJ)
+                k_max = float(np.max(np.abs(K_IJ))) if K_IJ.size else 0.0
+                print(f"  K[{I},{J}] shape={K_IJ.shape}  max|K|={k_max:.4e} Ha", flush=True)
+
+    K_pos = _remap_k_coupling_to_positions(K_coupling, active_indices)
+    if verbose:
+        print("  Solving coupled Casida equation...", flush=True)
+    omega_coupled, Z_coupled = assemble_coupled_casida(
+        active_results, K_pos, tda=tda, verbose=verbose,
+    )
+    f_coupled = coupled_oscillator_strengths(
+        omega_coupled, Z_coupled, active_results, tda=tda, verbose=verbose,
+    )
+    if verbose:
+        print(
+            f"  Done. {len(omega_coupled)} coupled excitations computed (distributed).",
             flush=True,
         )
 
