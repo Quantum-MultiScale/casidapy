@@ -325,6 +325,21 @@ class GTOKernel:
     def n_trans(self) -> int:
         return self._n_trans
 
+    @property
+    def mf(self):
+        """The underlying PySCF mean-field object (RKS/RHF or UKS/UHF)."""
+        return self._mf
+
+    @property
+    def occ_indices(self) -> np.ndarray:
+        """Active-space occupied MO indices into the full MO set."""
+        return self._occ_idx
+
+    @property
+    def virt_indices(self) -> np.ndarray:
+        """Active-space virtual MO indices into the full MO set."""
+        return self._virt_idx
+
     def diagonal_dE(self) -> np.ndarray:
         if self._dE is None:
             self._dE = build_energy_differences(self._occ_e, self._unocc_e)

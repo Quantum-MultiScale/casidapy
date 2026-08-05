@@ -7,6 +7,16 @@ no TDDFT NAC in stock PySCF.
 **gpu4pyscf** and use the usual PySCF-style API
 (``td.nac_method()`` / ``td.NAC()`` → ``.kernel(states=...)``).
 
+**CPU-native ground<->excited TDA NAC** is now available for the GTO/RKS
+path (closed-shell singlet only) in :mod:`casidapy.nac_gto` —
+:func:`casidapy.nac_gto.solve_nac_cpu` builds on the same CPHF/Z-vector
+machinery gpu4pyscf uses, ported onto stock CPU PySCF (``pyscf.scf.cphf``,
+``mf.gen_response``, ``mf.nuc_grad_method()``), and returns the same
+:class:`NACResults` contract (``backend="casidapy-cpu"``). Prefer it when no
+CUDA GPU is available and the ground<->excited, TDA, singlet restriction is
+acceptable; excited<->excited, full TDDFT/RPA, triplet, and spin-flip NAC
+still require gpu4pyscf (or are unimplemented — see ``nac_gto`` for scope).
+
 State indexing (gpu4pyscf TDDFT)::
 
     0 = electronic ground state
@@ -15,8 +25,9 @@ State indexing (gpu4pyscf TDDFT)::
 **Projected QED NACs** (``project_qed_nac`` / ``solve_qed_projected_nac``)
 approximate polariton derivative couplings by contracting electronic TDDFT
 NACVs with the electronic weights of each polariton. Photon / ∂g/∂R pieces
-are neglected. Electronic NACs still need gpu4pyscf (GPU); the QED solve
-and projection can run on CPU.
+are neglected. Electronic NACs need either gpu4pyscf (GPU, full scope) or
+``casidapy.nac_gto`` (CPU, ground<->excited TDA only); the QED solve and
+projection themselves always run on CPU.
 """
 from __future__ import annotations
 
