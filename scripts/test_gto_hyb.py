@@ -9,7 +9,7 @@ Small H2 / 6-31G system so it runs in seconds. Usage:
 import numpy as np
 from pyscf import gto, dft, scf
 
-from casidapy.pyscf_adapter import extract_gto_kernel
+from casidapy.adapter.pyscf import extract_gto_kernel
 from casidapy.casida_engine import run_casida
 
 NSTATES = 2

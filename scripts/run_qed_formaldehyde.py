@@ -2,7 +2,7 @@
 """Pauli–Fierz QED-TDDFT (TDA) for formaldehyde (H2CO).
 
 Level A: ordinary PySCF RKS/RHF ground state; DSE + coherent-state enter the
-response only via ``casidapy.qed``.
+response only via ``casidapy.utils.qed``.
 
 Example
 -------
@@ -107,8 +107,8 @@ def bare_tda_from_kernel(kernel):
 def main():
     args = parse_args()
 
-    from casidapy.pyscf_adapter import extract_gto_kernel
-    from casidapy.qed import QEDOptions, solve_qed_tda, permanent_dipole, scan_qed_lambda
+    from casidapy.adapter.pyscf import extract_gto_kernel
+    from casidapy.utils.qed import QEDOptions, solve_qed_tda, permanent_dipole, scan_qed_lambda
 
     mf = build_mf(args.basis, args.xc, verbose=args.verbose)
 

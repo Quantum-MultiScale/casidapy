@@ -1,4 +1,4 @@
-"""Tests for the CPU-native ground<->excited TDA NAC path (casidapy.nac_gto).
+"""Tests for the CPU-native ground<->excited TDA NAC path (casidapy.utils.nac_gto).
 
 Requires PySCF (skipped otherwise). Uses small H2/6-31G and LiH/STO-3G
 RHF/TDA systems, matching the conventions in scripts/test_gto_hyb.py.
@@ -7,7 +7,7 @@ These are correctness *sanity checks* (translational invariance, internal
 consistency of the returned NACResults fields) rather than a comparison to
 an independent reference value -- there is no CPU reference implementation
 of TDDFT NAC to compare against. Where gpu4pyscf + a CUDA GPU are available,
-cross-check numerically against casidapy.nac.solve_nac(..., method="tda").
+cross-check numerically against casidapy.utils.nac.solve_nac(..., method="tda").
 
 Note on translational invariance: only the **ETF-corrected** coupling
 (``de_etf``) is guaranteed translationally invariant (sum over atoms = 0);
@@ -25,9 +25,9 @@ pyscf = pytest.importorskip("pyscf")
 
 from pyscf import gto, scf
 
-from casidapy.pyscf_adapter import extract_gto_kernel
+from casidapy.adapter.pyscf import extract_gto_kernel
 from casidapy.casida_engine import run_casida
-from casidapy.nac_gto import solve_nac_cpu
+from casidapy.utils.nac_gto import solve_nac_cpu
 
 
 def _build_system(atom, basis, n_states=3):

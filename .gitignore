@@ -9,3 +9,11 @@ __pycache__/
 doc/source/tutorials/config.rst
 H2O_SERIAL/tmp.save/
 STDDFT/
+
+# Local QE / tutorial scratch
+pwscf.save/
+pwscf.xml
+tutorials/_*/
+tutorials/*.log
+tutorials/xas/_*/
+*.save/

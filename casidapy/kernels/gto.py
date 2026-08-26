@@ -1,81 +1,105 @@
 """GTO / AO-MO Casida kernel (molecular TDDFT path).
 
-RKS + adiabatic XC response, delegated to PySCF ``mf.gen_response`` so the
-coupling matches PySCF TDDFT exactly: Coulomb, exact exchange for (range-
-separated) hybrids, and the spin-adapted f_xc (singlet or triplet via
-``spin_state``) are all included. Density fitting is used when ``use_df``
-is set (via ``mf.density_fit()``).
+Stores active MOs and evaluates the Casida coupling ``K`` via PySCF
+``mf.gen_response`` (closed-shell) or exchange-only spin-flip (SF-TDDFT).
+Construction helpers (active-space windowing, GPU/MPI ``mf`` promotion,
+high-spin UKS bootstrap) live in :mod:`casidapy.adapter.pyscf`.
 
-Pure functionals support TDA and full TDDFT/RPA (matrix-free Casida ``C``
-chain with ``A - B = diag(dE)``). Hybrids support TDA matrix-free and full
-TDDFT via dense ``A,B`` from PySCF ``get_ab()`` (exact exchange makes
-``A - B`` non-diagonal, so the cheap matrix-free RPA chain does not apply).
-
-**Spin-flip TDDFT** (``spin_flip=True``, built via :meth:`GTOKernel.build_spin_flip`)
-runs the collinear Mₛ = −1 manifold (α-occupied → β-virtual) on a high-spin
-unrestricted (UKS/UHF) reference. In the spin-flip block the Hartree term and
-the spin-diagonal ``f_xc`` vanish; only the exact-exchange kernel survives, so
-the coupling is ``K = -c_x · get_k(dm_αβ)`` on the off-spin transition density.
-This is exchange-only ("Route A") collinear SF-TDDFT: it requires a hybrid
-(pure functionals give zero coupling) and is intrinsically TDA. The transverse
-DFT kernel (non-collinear ``f_xc``, "Route B") is gated behind ``sf_xc=True``
-and not yet implemented.
-
-With ``use_gpu=True`` (requires CuPy):
-
-* Active MO blocks and a cached dense ``K`` are uploaded once; cached
-  ``apply_K`` becomes a device DGEMM.
-* On-the-fly matvecs do AO↔MO contractions on the GPU.
-* If gpu4pyscf is available, ``mf`` is moved to the device so
-  ``gen_response`` (J + f_xc + hybrid K) also runs on GPU; otherwise the
-  response stays on CPU and only our contractions / cached matvecs use CuPy.
+Closed-shell: Coulomb + hybrid exchange + spin-adapted ``f_xc`` (singlet or
+triplet). Pure functionals support TDA and matrix-free RPA; hybrids support
+TDA matrix-free and full TDDFT via dense ``build_AB``. SF mode
+(``spin_flip=True``): α-occ → β-virt, exchange-only Route A, TDA-only —
+prefer :func:`~casidapy.adapter.pyscf.extract_sf_gto_kernel`.
 """
 from __future__ import annotations
 
 import warnings
-from typing import Any, Optional, Sequence
+from typing import Optional, Sequence
 
 import numpy as np
 
-from casidapy.casida_utils import build_energy_differences
+from casidapy.kernels.base import CasidaKernel
+from casidapy.utils.casida_utils import build_energy_differences
 
 
-class GTOKernel:
+def _resolve_active_mos(
+    mo_coeff: np.ndarray,
+    mo_energy: np.ndarray,
+    mo_occ: np.ndarray,
+    *,
+    spin_flip: bool,
+    occ_indices: Optional[np.ndarray],
+    virt_indices: Optional[np.ndarray],
+    n_occ: Optional[int],
+    n_unocc: Optional[int],
+):
+    """Return ``(occ_idx, virt_idx, C_o, C_v, occ_e, unocc_e, dm_factor)``.
+
+    Closed-shell: columns from a single ``(nao, nmo)`` set; ``dm_factor=2``.
+    Spin-flip: α-occ / β-virt from ``(2, nao, nmo)``; ``dm_factor=1``.
+    """
+    if spin_flip:
+        if occ_indices is None or virt_indices is None:
+            raise ValueError(
+                "spin_flip mode requires explicit occ_indices (alpha-occ) "
+                "and virt_indices (beta-virt); use "
+                "pyscf_adapter.extract_sf_gto_kernel()."
+            )
+        if mo_coeff.ndim != 3 or mo_coeff.shape[0] != 2:
+            raise ValueError(
+                "spin_flip mode expects mo_coeff of shape (2, nao, nmo)."
+            )
+        occ_idx = np.asarray(occ_indices, dtype=int)
+        virt_idx = np.asarray(virt_indices, dtype=int)
+        return (
+            occ_idx,
+            virt_idx,
+            mo_coeff[0][:, occ_idx],
+            mo_coeff[1][:, virt_idx],
+            mo_energy[0][occ_idx],
+            mo_energy[1][virt_idx],
+            1.0,
+        )
+
+    if occ_indices is None:
+        occ_all = np.where(mo_occ > 1e-6)[0]
+        n_o = n_occ if n_occ is not None else len(occ_all)
+        if n_o > len(occ_all):
+            raise ValueError(f"n_occ={n_o} exceeds occupied count {len(occ_all)}")
+        occ_indices = occ_all[-n_o:]
+    if virt_indices is None:
+        virt_all = np.where(mo_occ < 1e-6)[0]
+        n_u = n_unocc if n_unocc is not None else len(virt_all)
+        if n_u > len(virt_all):
+            raise ValueError(f"n_unocc={n_u} exceeds virtual count {len(virt_all)}")
+        virt_indices = virt_all[:n_u]
+
+    occ_idx = np.asarray(occ_indices, dtype=int)
+    virt_idx = np.asarray(virt_indices, dtype=int)
+    return (
+        occ_idx,
+        virt_idx,
+        mo_coeff[:, occ_idx],
+        mo_coeff[:, virt_idx],
+        mo_energy[occ_idx],
+        mo_energy[virt_idx],
+        2.0,
+    )
+
+
+class GTOKernel(CasidaKernel):
     """Casida ``K`` in a GTO MO basis using PySCF integral infrastructure.
 
-    Parameters
-    ----------
-    mol : pyscf.gto.Mole
-    mo_coeff, mo_energy, mo_occ : ndarray
-        Full MO set from a converged RKS/RHF calculation.
-    n_occ, n_unocc : int
-        Active-space sizes (after optional windowing).
-    occ_indices, virt_indices : optional index arrays into the MO set.
-        If omitted, the lowest ``n_occ`` occupied and first ``n_unocc``
-        virtuals (by occupation) are used.
-    xc : str
-        XC functional name understood by PySCF (e.g. ``"pbe"``, ``"pbe0"``,
-        ``"b3lyp"``).         Hybrids and range-separated hybrids are supported (TDA matrix-free
-        or full TDDFT via dense ``build_AB``); plain RHF gives CIS / TDHF.
-    use_df : bool
-        Use density fitting for the response (``mf.density_fit()``) when the
-        mean-field object is not already density-fitted.
-    k_cache_max : int
-        When ``n_trans <= k_cache_max``, the full coupling matrix ``K`` is
-        precomputed in ``setup()`` with a few batched ``gen_response`` calls
-        (one AO-integral pass per chunk instead of one per solver iteration);
-        ``apply_K`` then reduces to a DGEMM. Memory: ``n_trans**2 * 8`` bytes
-        (4096 -> 134 MB). Set to 0 to always evaluate matvecs on the fly.
-    use_gpu : bool
-        Accelerate MO contractions and cached ``K @ v`` with CuPy. When
-        gpu4pyscf is installed, also run ``gen_response`` on the GPU.
-    use_mpi_response : bool
-        Promote the mean-field to ``mpi4pyscf.dft.RKS`` so Davidson matvecs
-        call MPI-parallel ``get_jk`` inside ``gen_response``. Density fitting
-        is disabled (DF bypasses mpi4pyscf JK). Requires ``import mpi4pyscf``
-        (or ``enable_mpi4pyscf()``) **before** other work so non-master ranks
-        park in the worker pool. Incompatible with ``use_gpu``.
+    Prefer :func:`~casidapy.adapter.pyscf.extract_gto_kernel` /
+    :func:`~casidapy.adapter.pyscf.extract_sf_gto_kernel` for construction.
+    Pass ``occ_indices`` / ``virt_indices`` (required for spin-flip). Optional
+    ``n_occ`` / ``n_unocc`` window closed-shell MOs when indices are omitted.
     """
+
+    # MO/AO backend: no real-space grid; parallelism is delegated to
+    # PySCF / mpi4pyscf rather than MPI COMM_WORLD collectives.
+    provides_grid = False
+    distributes_over_comm = False
 
     def __init__(
         self,
@@ -141,65 +165,34 @@ class GTOKernel:
         self.spin_state = spin_state
         self.triplet = spin_state == "triplet"
 
-        if self._spin_flip:
-            # Unrestricted high-spin reference: MO arrays are (alpha, beta).
-            # Manifold is alpha-occupied -> beta-virtual (Ms = -1).
-            if occ_indices is None or virt_indices is None:
-                raise ValueError(
-                    "spin_flip mode requires explicit occ_indices (alpha-occ) "
-                    "and virt_indices (beta-virt); use GTOKernel.build_spin_flip()."
-                )
-            if self.mo_coeff.ndim != 3 or self.mo_coeff.shape[0] != 2:
-                raise ValueError(
-                    "spin_flip mode expects mo_coeff of shape (2, nao, nmo)."
-                )
-            self._occ_idx = np.asarray(occ_indices, dtype=int)
-            self._virt_idx = np.asarray(virt_indices, dtype=int)
-            Ca, Cb = self.mo_coeff[0], self.mo_coeff[1]
-            ea, eb = self.mo_energy[0], self.mo_energy[1]
-            self._C_o = Ca[:, self._occ_idx]      # alpha occupied
-            self._C_v = Cb[:, self._virt_idx]     # beta virtual
-            self._occ_e = ea[self._occ_idx]
-            self._unocc_e = eb[self._virt_idx]
-        else:
-            occ_mask = self.mo_occ > 1e-6
-            virt_mask = self.mo_occ < 1e-6
-            if occ_indices is None:
-                occ_all = np.where(occ_mask)[0]
-                n_o = n_occ if n_occ is not None else len(occ_all)
-                if n_o > len(occ_all):
-                    raise ValueError(f"n_occ={n_o} exceeds occupied count {len(occ_all)}")
-                # top of valence: last n_o occupied
-                occ_indices = occ_all[-n_o:]
-            if virt_indices is None:
-                virt_all = np.where(virt_mask)[0]
-                n_u = n_unocc if n_unocc is not None else len(virt_all)
-                if n_u > len(virt_all):
-                    raise ValueError(
-                        f"n_unocc={n_u} exceeds virtual count {len(virt_all)}"
-                    )
-                virt_indices = virt_all[:n_u]
-
-            self._occ_idx = np.asarray(occ_indices, dtype=int)
-            self._virt_idx = np.asarray(virt_indices, dtype=int)
-            self._C_o = self.mo_coeff[:, self._occ_idx]
-            self._C_v = self.mo_coeff[:, self._virt_idx]
-            self._occ_e = self.mo_energy[self._occ_idx]
-            self._unocc_e = self.mo_energy[self._virt_idx]
-
+        (
+            self._occ_idx,
+            self._virt_idx,
+            self._C_o,
+            self._C_v,
+            self._occ_e,
+            self._unocc_e,
+            self._dm_factor,
+        ) = _resolve_active_mos(
+            self.mo_coeff,
+            self.mo_energy,
+            self.mo_occ,
+            spin_flip=self._spin_flip,
+            occ_indices=occ_indices,
+            virt_indices=virt_indices,
+            n_occ=n_occ,
+            n_unocc=n_unocc,
+        )
         self._n_occ = len(self._occ_idx)
         self._n_unocc = len(self._virt_idx)
         self._n_trans = self._n_occ * self._n_unocc
-        # Closed-shell transition DMs carry a factor 2 (double occupancy); the
-        # single-spin spin-flip transition DM does not.
-        self._dm_factor = 1.0 if self._spin_flip else 2.0
         self._dE = None
         self._ready = False
         self.tda = True  # GTO path defaults to TDA; RPA uses same K
 
         self._vresp = None
-        self._rsh = None   # (omega, alpha, hyb) exact-exchange split, SF only
-        self._cx = None    # global-hybrid exchange fraction, SF only
+        self._rsh = None  # (omega, alpha, hyb) exact-exchange split, SF only
+        self._cx = None  # global-hybrid exchange fraction, SF only
         self.hybrid = False
         self.k_cache_max = int(k_cache_max)
         self._K = None  # cached dense coupling matrix (n_trans, n_trans)
@@ -221,109 +214,11 @@ class GTOKernel:
             self._cp = cupy
 
     @classmethod
-    def build_spin_flip(
-        cls,
-        mol,
-        *,
-        xc: str = "bhandhlyp",
-        spin: Optional[int] = None,
-        charge: Optional[int] = None,
-        n_occ: Optional[int] = None,
-        n_unocc: Optional[int] = None,
-        use_df: bool = True,
-        sf_xc: bool = False,
-        mf=None,
-        conv_tol: float = 1e-9,
-        verbose: bool = False,
-        use_gpu: bool = False,
-    ) -> "GTOKernel":
-        """Build a collinear SF-TDDFT kernel from a high-spin UKS/UHF reference.
+    def build_spin_flip(cls, mol, **kwargs) -> "GTOKernel":
+        """Deprecated wrapper → :func:`casidapy.adapter.pyscf.build_spin_flip_kernel`."""
+        from casidapy.adapter.pyscf import build_spin_flip_kernel
 
-        Converges (or accepts) a spin-unrestricted high-spin reference and sets
-        up the Mₛ = −1 spin-flip manifold (α-occupied → β-virtual). Requires a
-        hybrid ``xc`` for nonzero coupling (exchange-only, Route A). Pass an
-        already-converged unrestricted ``mf`` to skip the internal SCF.
-
-        Parameters
-        ----------
-        mol : pyscf.gto.Mole
-            Its ``spin`` (= 2·Mₛ) and ``charge`` are used unless overridden.
-        spin, charge : optional
-            Override ``mol.spin`` / ``mol.charge`` for the reference (a fresh
-            copy is built so ``mol`` is left untouched).
-        n_occ, n_unocc : optional active-window sizes (top α-occ / first β-virt).
-        sf_xc : bool
-            Reserved for the non-collinear transverse XC kernel (Route B);
-            ``True`` raises ``NotImplementedError`` in ``setup``.
-        """
-        from pyscf import dft
-
-        if mf is None:
-            m = mol
-            if spin is not None or charge is not None:
-                m = mol.copy()
-                if spin is not None:
-                    m.spin = int(spin)
-                if charge is not None:
-                    m.charge = int(charge)
-                m.build(False, False)
-            if m.spin == 0:
-                raise ValueError(
-                    "SF-TDDFT needs a high-spin (open-shell) reference; set "
-                    "spin>=2 (spin = 2·Mₛ)."
-                )
-            mf = dft.UKS(m)
-            mf.xc = xc
-            if use_df:
-                mf = mf.density_fit()
-            mf.conv_tol = conv_tol
-            mf.kernel()
-            if not getattr(mf, "converged", True):
-                warnings.warn("SF-TDDFT reference UKS SCF did not converge.")
-
-        mo_c = np.asarray(mf.mo_coeff, dtype=float)
-        mo_e = np.asarray(mf.mo_energy, dtype=float)
-        mo_o = np.asarray(mf.mo_occ, dtype=float)
-        if mo_c.ndim != 3 or mo_c.shape[0] != 2:
-            raise ValueError(
-                "build_spin_flip requires an unrestricted (UKS/UHF) reference "
-                "with (2, nao, nmo) MO coefficients."
-            )
-
-        occ_a = np.where(mo_o[0] > 1e-6)[0]   # alpha occupied
-        vir_b = np.where(mo_o[1] < 1e-6)[0]   # beta virtual
-        if n_occ is not None:
-            occ_a = occ_a[-int(n_occ):]
-        if n_unocc is not None:
-            vir_b = vir_b[:int(n_unocc)]
-
-        return cls(
-            mf.mol,
-            mo_c,
-            mo_e,
-            mo_o,
-            occ_indices=occ_a,
-            virt_indices=vir_b,
-            xc=getattr(mf, "xc", xc),
-            use_df=use_df,
-            mf=mf,
-            verbose=verbose,
-            use_gpu=use_gpu,
-            spin_flip=True,
-            sf_xc=sf_xc,
-        )
-
-    @property
-    def n_occ(self) -> int:
-        return self._n_occ
-
-    @property
-    def n_unocc(self) -> int:
-        return self._n_unocc
-
-    @property
-    def n_trans(self) -> int:
-        return self._n_trans
+        return build_spin_flip_kernel(mol, **kwargs)
 
     @property
     def mf(self):
@@ -340,71 +235,55 @@ class GTOKernel:
         """Active-space virtual MO indices into the full MO set."""
         return self._virt_idx
 
-    def diagonal_dE(self) -> np.ndarray:
-        if self._dE is None:
-            self._dE = build_energy_differences(self._occ_e, self._unocc_e)
-        return self._dE
+    def set_core_active_space(self, core_energies, core_mo_coeff):
+        """Replace occupied active MOs with imported core columns (CVS).
+
+        ``core_mo_coeff`` must be in **this kernel's** AO basis
+        ``(nao, n_core)``. Virtuals are unchanged. Clears K / response caches.
+        """
+        C = np.asarray(core_mo_coeff)
+        if C.ndim == 1:
+            C = C.reshape(-1, 1)
+        if np.iscomplexobj(C):
+            # Phase-align each column and take real part for real gen_response
+            C_real = np.empty(C.shape, dtype=float)
+            for j in range(C.shape[1]):
+                col = C[:, j]
+                idx = int(np.argmax(np.abs(col)))
+                phase = np.angle(col[idx])
+                C_real[:, j] = (col * np.exp(-1j * phase)).real
+            C = C_real
+        energies = np.asarray(core_energies, dtype=float).ravel()
+        if C.shape[1] != energies.size:
+            raise ValueError(
+                f"n_core energies ({energies.size}) != n_coeff cols ({C.shape[1]})"
+            )
+        if C.shape[0] != self.mo_coeff.shape[0]:
+            raise ValueError(
+                f"core MO nao={C.shape[0]} != kernel nao={self.mo_coeff.shape[0]}"
+            )
+        self._C_o = np.asarray(C, dtype=float)
+        self._occ_e = energies.copy()
+        self._n_occ = int(energies.size)
+        self._occ_idx = np.arange(self._n_occ)  # synthetic indices
+        self._n_trans = self._n_occ * self._n_unocc
+        self._dE = None
+        self._ready = False
+        self._K = None
+        self._K_dev = None
+        self._C_o_dev = None
+        self._vresp = None
+        return self
 
     def _as_numpy(self, arr) -> np.ndarray:
-        """Host ndarray from numpy or cupy array."""
-        if self._cp is not None and isinstance(arr, self._cp.ndarray):
-            return self._cp.asnumpy(arr)
-        return np.asarray(arr)
+        """Host ndarray; delegates to :func:`casidapy.adapter.pyscf._as_numpy`."""
+        from casidapy.adapter.pyscf import _as_numpy as as_numpy
 
-    def _move_mf_to_gpu(self, mf):
-        """Return a GPU mean-field (gpu4pyscf) or ``None`` if unavailable."""
-        # Prefer the recursive to_gpu() hook (PySCF >= 2.x + gpu4pyscf).
-        to_gpu = getattr(mf, "to_gpu", None)
-        if callable(to_gpu):
-            try:
-                return to_gpu()
-            except Exception as exc:
-                if self.verbose:
-                    warnings.warn(
-                        f"mf.to_gpu() failed ({exc}); trying gpu4pyscf.dft.rks"
-                    )
-
-        try:
-            from gpu4pyscf.dft import rks as gpu_rks
-        except ImportError:
-            return None
-
-        try:
-            gmf = gpu_rks.RKS(self.mol)
-            gmf.xc = getattr(mf, "xc", self.xc)
-            # MO data: gpu4pyscf expects cupy arrays on the GPU object.
-            cp = self._cp
-            gmf.mo_coeff = cp.asarray(self.mo_coeff)
-            gmf.mo_energy = cp.asarray(self.mo_energy)
-            gmf.mo_occ = cp.asarray(self.mo_occ)
-            if self.use_df:
-                gmf = gmf.density_fit()
-            if getattr(gmf, "grids", None) is not None:
-                gmf.grids.build()
-            return gmf
-        except Exception as exc:
-            if self.verbose:
-                warnings.warn(f"gpu4pyscf RKS setup failed ({exc})")
-            return None
-
-    def _ensure_mpi_mf(self, mf):
-        """Return an mpi4pyscf RKS with MO data for MPI ``get_jk`` response."""
-        mod = type(mf).__module__
-        if isinstance(mod, str) and mod.startswith("mpi4pyscf"):
-            # Drop DF wrapper if somehow present — it bypasses MPI JK.
-            if getattr(mf, "with_df", None) is not None:
-                warnings.warn(
-                    "mpi4pyscf mf has density fitting; promoting a direct "
-                    "MPI RKS so gen_response uses MPI get_jk."
-                )
-            else:
-                return mf
-        from casidapy.mpi_pyscf import promote_mf_to_mpi
-
-        return promote_mf_to_mpi(mf)
+        return as_numpy(arr)
 
     def setup(self, tda: bool = True) -> None:
         from pyscf import dft
+        from casidapy.adapter.pyscf import ensure_mpi_mf, move_mf_to_gpu
 
         self.tda = tda
         self._dE = build_energy_differences(self._occ_e, self._unocc_e)
@@ -429,7 +308,7 @@ class GTOKernel:
             mf.mo_occ = self.mo_occ
 
         if self.use_mpi_response:
-            mf = self._ensure_mpi_mf(mf)
+            mf = ensure_mpi_mf(mf)
 
         is_ks = hasattr(mf, "xc")
         if is_ks and (getattr(mf, "grids", None) is None or mf.grids.coords is None):
@@ -470,7 +349,17 @@ class GTOKernel:
 
         self._gpu_response = False
         if self.use_gpu:
-            gmf = self._move_mf_to_gpu(mf)
+            gmf = move_mf_to_gpu(
+                mf,
+                mol=self.mol,
+                mo_coeff=self.mo_coeff,
+                mo_energy=self.mo_energy,
+                mo_occ=self.mo_occ,
+                xc=self.xc,
+                use_df=self.use_df,
+                cp=self._cp,
+                verbose=self.verbose,
+            )
             if gmf is not None and hasattr(gmf, "gen_response"):
                 try:
                     self._vresp = gmf.gen_response(singlet=singlet, hermi=0)
@@ -565,7 +454,7 @@ class GTOKernel:
         if mf is None:
             raise ValueError(
                 "spin_flip mode requires an unrestricted reference mf "
-                "(use GTOKernel.build_spin_flip())."
+                "(use pyscf_adapter.extract_sf_gto_kernel())."
             )
 
         if hasattr(mf, "xc"):
@@ -850,25 +739,16 @@ class GTOKernel:
         ntr = self._n_trans
         return A_act.reshape(ntr, ntr), B_act.reshape(ntr, ntr)
 
-    def dipole_matrix(
+    def _transition_dipole_blocks(
         self, origin: Sequence[float] = (0.0, 0.0, 0.0)
     ) -> np.ndarray:
-        if self._spin_flip:
-            # Spin-flip transitions are dipole-forbidden through the (spin-
-            # conserving) electric-dipole operator: ⟨α|β⟩ = 0. Oscillator
-            # strengths require a spin-orbit treatment not modeled here.
-            return np.zeros((self._n_trans, 3), dtype=float)
-        if self.triplet:
-            # ⟨S0|μ|T⟩ = 0 without SOC (spin forbidden).
-            return np.zeros((self._n_trans, 3), dtype=float)
-        # Singlet TDA/RPA: ⟨S₀|r|S⟩ = √2 Σ_ia X_ia ⟨i|r|a⟩ (spin-adapted).
-        # Matches PySCF oscillator strengths and the √2 in QED-TDA couplings.
+        """Raw ``⟨i|r|a⟩`` blocks ``(n_trans, 3)``; the base applies the singlet
+        ``√2`` and returns zeros for triplet / spin-flip (both dipole-forbidden
+        without SOC), matching PySCF oscillator strengths."""
         orig = tuple(np.asarray(origin, dtype=float).ravel())
         with self.mol.with_common_orig(orig):
             dip_ao = self.mol.intor("int1e_r", comp=3)
         mu = np.empty((self._n_trans, 3), dtype=float)
-        sqrt2 = np.sqrt(2.0)
         for alpha in range(3):
-            mua = self._C_o.T @ dip_ao[alpha] @ self._C_v
-            mu[:, alpha] = sqrt2 * mua.ravel()
+            mu[:, alpha] = (self._C_o.T @ dip_ao[alpha] @ self._C_v).ravel()
         return mu

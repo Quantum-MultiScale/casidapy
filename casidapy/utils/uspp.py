@@ -10,7 +10,7 @@ Consolidates all USPP functionality:
 
 Usage
 -----
-    from casidapy.uspp import load_uspp_data, setup_uspp, normalize_uspp_wavefunctions
+    from casidapy.utils.uspp import load_uspp_data, setup_uspp, normalize_uspp_wavefunctions
 
     beta_projectors, qij_augmentation, core_density = load_uspp_data(
         upf_files={"Ag": "ag_pbe_v1.4.uspp.F.UPF"},

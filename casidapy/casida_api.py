@@ -65,7 +65,7 @@ class CasidaInputs:
     eigs: np.ndarray
     occs: np.ndarray
 
-    # USPP data (optional, loaded externally via casidapy.uspp.load_uspp_data)
+    # USPP data (optional, loaded externally via casidapy.utils.uspp.load_uspp_data)
     beta_projectors: Optional[Any] = None
     qij_augmentation: Optional[Any] = None
 

@@ -8,7 +8,8 @@ import numpy as np
 from dftpy.field import DirectField
 from dftpy.functional import Functional
 
-from casidapy.casida_utils import (
+from casidapy.kernels.base import CasidaKernel
+from casidapy.utils.casida_utils import (
     _as_scalar_field_on_grid,
     _compute_fxc_triplet_pylibxc,
     augmentation_integral,
@@ -19,7 +20,7 @@ from casidapy.casida_utils import (
 )
 
 
-class PlaneWaveKernel:
+class PlaneWaveKernel(CasidaKernel):
     """Hartree + local ``f_xc`` kernel on a uniform real-space grid.
 
     Transition densities are ``φ_ia(r) = ψ_i*(r) ψ_a(r)`` (+ USPP augmentation).
@@ -31,6 +32,10 @@ class PlaneWaveKernel:
     elementwise grid ops, and a cuFFT spectral Hartree solve) — only the
     small transition vector crosses the PCIe bus per matvec.
     """
+
+    # Carries a real-space grid and participates in MPI COMM_WORLD collectives.
+    provides_grid = True
+    distributes_over_comm = True
 
     def __init__(
         self,
@@ -108,6 +113,12 @@ class PlaneWaveKernel:
 
         self._occ_e = None
         self._unocc_e = None
+        # Origin (Bohr, grid frame) for the length-gauge position operator used in
+        # transition dipoles. Defaults to the box corner; for core-level XAS set it
+        # to the edge-atom position so ``(r - R0)`` is small where the tight core
+        # orbital lives, avoiding amplification of orthogonality residuals by the
+        # large ω and large |r| at the box edges.
+        self.dipole_origin = (0.0, 0.0, 0.0)
         self.transition_densities = None
         self._psi_occ: List = []
         self._psi_unocc: List = []
@@ -130,18 +141,6 @@ class PlaneWaveKernel:
         self._fkxc_dev = None
         self._coulG_dev = None
 
-    @property
-    def n_occ(self) -> int:
-        return self._n_occ
-
-    @property
-    def n_unocc(self) -> int:
-        return self._n_unocc
-
-    @property
-    def n_trans(self) -> int:
-        return self._n_trans
-
     def set_active_orbitals(self, occ_eigs, unocc_eigs, psi_occ, psi_unocc):
         self._occ_e = np.asarray(occ_eigs, dtype=float).copy()
         self._unocc_e = np.asarray(unocc_eigs, dtype=float).copy()
@@ -162,13 +161,6 @@ class PlaneWaveKernel:
             self._proj_unocc = proj_overlap(
                 self.beta_projectors, self.grid, self._psi_unocc
             )
-
-    def diagonal_dE(self) -> np.ndarray:
-        if self._dE is None:
-            if self._occ_e is None:
-                raise RuntimeError("Call set_active_orbitals() first.")
-            self._dE = build_energy_differences(self._occ_e, self._unocc_e)
-        return self._dE
 
     def transition_orbital(self, psi_i, psi_a, proj_i=None, proj_a=None):
         phi = psi_i.conj() * psi_a
@@ -564,21 +556,17 @@ class PlaneWaveKernel:
         """Electron count from the KS density integral."""
         return float(np.asarray(self.rho).integral())
 
-    def dipole_matrix(
+    def _transition_dipole_blocks(
         self, origin: Sequence[float] = (0.0, 0.0, 0.0)
     ) -> np.ndarray:
-        """Transition dipoles ``μ_ia`` with shape ``(n_trans, 3)``."""
+        """Raw ``⟨i|r|a⟩`` blocks ``(n_trans, 3)``; √2 / triplet handled by base."""
         if not self._psi_occ:
             raise RuntimeError("Call set_active_orbitals() first.")
-        if getattr(self, "triplet", False):
-            return np.zeros((self._n_trans, 3), dtype=float)
-
         _, _, d_ov = self.mo_dipole_blocks(origin=origin)
-        # d_ov: (3, n_o, n_u) → (n_trans, 3); singlet factor √2 as in GTOKernel
-        mu = np.stack(
+        # d_ov: (3, n_o, n_u) → (n_trans, 3)
+        return np.stack(
             [d_ov[0].ravel(), d_ov[1].ravel(), d_ov[2].ravel()], axis=-1
         )
-        return np.sqrt(2.0) * mu
 
     def collapse_transition_densities_to_state_basis(
         self, amp: np.ndarray

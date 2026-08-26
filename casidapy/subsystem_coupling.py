@@ -17,6 +17,12 @@ from dftpy.grid import DirectGrid
 from dftpy.mpi import MP, SerialComm
 from dftpy.utils import grid_map_data
 
+# Default range-separation screening parameter (a.u.^-1) for coupling_hartree=
+# "rangesep". Fixed (not box-derived) so the erf/erfc split is identical across a
+# distance scan. ~1/alpha = 10 a0 (~5 A): the grid SR captures fragment overlap,
+# the far-field dipole carries the rest. The exact result is alpha-independent.
+_DEFAULT_COUPLING_ALPHA = 0.1
+
 
 def compute_nadd_kernel(
     rho_total: DirectField,
@@ -580,6 +586,8 @@ def run_subsystem_casida(
     fragment_owners: Optional[List[int]] = None,
     distributed: bool = False,
     f_nadd: Optional[np.ndarray] = None,
+    hartree_mode: str = "full",
+    coupling_alpha: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Pavanello coupling on a serial ``gsystem`` (grid/density patched by eDFTpy).
 
@@ -618,6 +626,8 @@ def run_subsystem_casida(
             graphtopo=graphtopo,
             fragment_owners=fragment_owners,
             f_nadd=f_nadd,
+            hartree_mode=hartree_mode,
+            coupling_alpha=coupling_alpha,
         )
 
     if verbose:
@@ -1045,6 +1055,131 @@ def _resident_rho(res_by_frag, idx):
     return [stack[i] for i in range(n_rho)]
 
 
+def _union_index_box(gsystem, isub_a, isub_b, pad=0):
+    """Global-index bounding box (shift, shape) covering both subcells + ``pad``.
+
+    Pure index arithmetic on the replicated ``graph.sub_shift``/``sub_shape``,
+    clipped to the grid. Assumes neither subcell wraps the periodic boundary (the
+    same assumption as ``_global_sub_index``).
+    """
+    graph = gsystem.graphtopo.graph
+    nrR = np.asarray(gsystem.grid.nrR, dtype=int)
+    sa = np.asarray(graph.sub_shift[isub_a], dtype=int)
+    na = np.asarray(graph.sub_shape[isub_a], dtype=int)
+    sb = np.asarray(graph.sub_shift[isub_b], dtype=int)
+    nb = np.asarray(graph.sub_shape[isub_b], dtype=int)
+    lo = np.maximum(np.minimum(sa, sb) - pad, 0)
+    hi = np.minimum(np.maximum(sa + na, sb + nb) + pad, nrR)
+    return lo, np.maximum(hi - lo, 0)
+
+
+def _place_in_box(sub_arr, sub_shift, box_shift, box_shape):
+    """Place a subcell array into a ``box_shape`` array at ``sub_shift-box_shift``.
+
+    Clips to the box overlap (robust if a subcell edge falls outside the box).
+    """
+    out = np.zeros(tuple(int(x) for x in box_shape), dtype=float)
+    off = np.asarray(sub_shift, dtype=int) - np.asarray(box_shift, dtype=int)
+    src, dst = [None] * 3, [None] * 3
+    for i in range(3):
+        lo = max(int(off[i]), 0)
+        hi = min(int(off[i]) + int(sub_arr.shape[i]), int(box_shape[i]))
+        if hi <= lo:
+            return out  # no overlap along this axis
+        dst[i] = slice(lo, hi)
+        src[i] = slice(lo - int(off[i]), hi - int(off[i]))
+    out[tuple(dst)] = np.asarray(sub_arr)[tuple(src)]
+    return out
+
+
+def _box_grid(gsystem, box_shift, box_shape):
+    """Serial DirectGrid on the index sub-box (physical size = shape * spacing)."""
+    nrR = np.asarray(gsystem.grid.nrR, dtype=float)
+    lattice = np.asarray(gsystem.grid.lattice, dtype=float)
+    scale = (np.asarray(box_shape, dtype=float) / nrR)[:, None]
+    return DirectGrid(
+        lattice=lattice * scale,
+        nr=tuple(int(x) for x in box_shape),
+        full=gsystem.grid.full,
+        mp=MP(comm=SerialComm()),
+    )
+
+
+def _sr_coupling_block_box(
+    phi_res, stream_state, n_stream, gsystem, isub_res, isub_stream, f_nadd, alpha, pad=2,
+):
+    """Screened (erfc) short-range coupling block on the *union sub-box* of the two
+    fragments — the memory-saving variant of the SR term.
+
+    Because the SR Coulomb is screened it decays within ~1/alpha, so it only needs
+    a grid spanning where the two densities are close, not the full cell. Returns
+    ``K`` (n_res, n_stream); combine with the far-field dipole LR as usual.
+    """
+    n_res = len(phi_res)
+    if n_res == 0 or n_stream == 0:
+        return np.zeros((n_res, n_stream), dtype=float)
+
+    box_shift, box_shape = _union_index_box(gsystem, isub_res, isub_stream, pad)
+    if np.any(np.asarray(box_shape) <= 0):
+        return np.zeros((n_res, n_stream), dtype=float)
+
+    graph = gsystem.graphtopo.graph
+    s_res = np.asarray(graph.sub_shift[isub_res], dtype=int)
+    s_str = np.asarray(graph.sub_shift[isub_stream], dtype=int)
+    box_grid = _box_grid(gsystem, box_shift, box_shape)
+    box_dV = float(box_grid.dV)
+
+    bsl = tuple(slice(int(box_shift[i]), int(box_shift[i] + box_shape[i])) for i in range(3))
+    f_nadd_box = np.asarray(f_nadd)[bsl]
+
+    res_flat = np.stack([
+        _place_in_box(
+            np.asarray(_embedding_subcell_field(phi_res[ia], gsystem, isub_res)),
+            s_res, box_shift, box_shape,
+        ).ravel()
+        for ia in range(n_res)
+    ])  # (n_res, n_box)
+
+    K = np.zeros((n_res, n_stream), dtype=float)
+    for jb in range(n_stream):
+        phi_j_box = _place_in_box(
+            np.asarray(_embedding_subcell_field(stream_state(jb), gsystem, isub_stream)),
+            s_str, box_shift, box_shape,
+        )
+        fld = DirectField(grid=box_grid, rank=1)
+        fld[:] = phi_j_box.reshape(fld.shape)
+        v_sr = np.asarray(_screened_coulomb_potential(fld, alpha, "sr"))
+        response = v_sr + f_nadd_box * phi_j_box
+        K[:, jb] = res_flat @ response.ravel() * box_dV
+    return K
+
+
+def _screened_coulomb_potential(rho, alpha, part="sr"):
+    """Range-separated Hartree potential of a field on its own grid.
+
+    ``1/r = erfc(alpha r)/r + erf(alpha r)/r``. In reciprocal space the kernel is
+    ``4 pi / G^2`` times ``1`` (full), ``1 - exp(-G^2/4 alpha^2)`` (``part='sr'``,
+    the screened/erfc short range) or ``exp(-G^2/4 alpha^2)`` (``part='lr'``, erf).
+    Exact for **charge-neutral** densities (transition densities): rho(G=0)=0, so
+    dropping the G=0 term (invgg=0 there) is exact, and the screened SR part is
+    image-free because it decays within ~1/alpha of the density.
+    """
+    recip = rho.grid.get_reciprocal()
+    invgg = recip.invgg
+    rho_g = rho.fft()
+    if part == "full":
+        ker = 4.0 * np.pi * invgg
+    else:
+        damp = np.exp(-recip.gg / (4.0 * alpha * alpha))
+        if part == "sr":
+            ker = 4.0 * np.pi * invgg * (1.0 - damp)
+        elif part == "lr":
+            ker = 4.0 * np.pi * invgg * damp
+        else:
+            raise ValueError(f"unknown screened-Coulomb part {part!r}")
+    return (rho_g * ker).ifft(force_real=True)
+
+
 def compute_coupling_block_streamed(
     phi_res,
     stream_state,
@@ -1055,6 +1190,8 @@ def compute_coupling_block_streamed(
     f_nadd,
     hartree_func,
     include_hartree: bool = True,
+    screen_alpha=None,
+    screen_part: str = "sr",
 ) -> np.ndarray:
     """Coupling block with the resident fragment stacked and the partner streamed.
 
@@ -1063,6 +1200,10 @@ def compute_coupling_block_streamed(
     locally). Returns ``K`` with shape ``(len(phi_res), n_stream)`` — the same
     numbers :func:`compute_coupling_block` produces, just consuming the streamed
     fragment one state at a time so at most one of its grids is ever resident.
+
+    When ``screen_alpha`` is set, the Hartree part uses the range-separated
+    (``screen_part``) screened Coulomb instead of the full ``1/r`` — the grid half
+    of the erf/erfc split (``sr`` = image-free short range).
     """
     n_res = len(phi_res)
     if n_res == 0 or n_stream == 0:
@@ -1080,13 +1221,18 @@ def compute_coupling_block_streamed(
         phi_jb = _embedding_subcell_field(stream_state(jb), gsystem, isub_stream)
         phi_jb_global = _sub_to_global(phi_jb, gsystem, isub_stream)
         if include_hartree:
-            vh_jb = hartree_func(phi_jb_global, calcType=["V"]).potential
+            if screen_alpha is not None:
+                vh_jb = _screened_coulomb_potential(phi_jb_global, screen_alpha, screen_part)
+            else:
+                vh_jb = hartree_func(phi_jb_global, calcType=["V"]).potential
             response_global = np.asarray(vh_jb) + f_nadd * np.asarray(phi_jb_global)
         else:
             response_global = f_nadd * np.asarray(phi_jb_global)
         response_field = DirectField(grid=global_grid, rank=1)
         response_field[:] = response_global.reshape(response_field.shape)
-        if include_hartree and jb == 0 and np.abs(np.asarray(response_field)).sum() == 0.0:
+        if (include_hartree and screen_alpha is None and jb == 0
+                and np.abs(np.asarray(response_field)).sum() == 0.0):
+            # (screened SR can legitimately be ~0 between separated fragments)
             raise RuntimeError(
                 f"compute_coupling_block_streamed: response_field all zeros for "
                 f"fragments ({isub_res},{isub_stream}), jb=0.",
@@ -1158,11 +1304,32 @@ def _run_subsystem_casida_distributed(
     graphtopo=None,
     fragment_owners=None,
     f_nadd=None,
+    hartree_mode="full",
+    coupling_alpha=None,
 ):
     """Collective distributed coupling. See :func:`run_subsystem_casida`.
 
     Every rank calls this. Returns the coupled result dict on world rank 0 and
     ``None`` elsewhere (eDFTpy broadcasts the slim spectrum afterwards).
+
+    ``hartree_mode``:
+      * ``"full"``  — grid Hartree on the serial global grid (streams densities).
+      * ``"dipole"`` — far-field (Förster) coupling: the erf->1 long-range limit
+        of the range-separated Coulomb, i.e. transition-dipole/transition-dipole
+        interaction. Needs no grids and no density streaming (uses ``dip_tran``
+        metadata already present on every rank), so it is O(1) memory and image
+        free. Accurate for well-separated fragments; misses short-range overlap
+        and higher multipoles.
+      * ``"rangesep"`` — full erf/erfc range separation: screened (erfc) short
+        range on the **global** grid (image-free) + erf long range as far-field
+        dipole. Image-corrected coupling at ~the same memory as ``full``;
+        ``coupling_alpha`` (a.u.^-1) sets the split (exact result is
+        alpha-independent).
+      * ``"rangesep_box"`` — same physics as ``rangesep`` but the screened SR is
+        solved on the **union sub-box** of the two fragments instead of the global
+        grid (memory-saving; the SR is localized within ~1/alpha so the small box
+        is sufficient). Validate against ``rangesep`` — they should agree when the
+        box + pad exceeds the screening length.
     """
     if graphtopo is None or fragment_owners is None:
         raise ValueError(
@@ -1178,6 +1345,14 @@ def _run_subsystem_casida_distributed(
         idx: len(_res_array(res, "omega")) for idx, res in res_by_frag.items()
     }
 
+    # ---- Förster (far-field, dipole) path: metadata-only, no grids/streaming ----
+    if str(hartree_mode).lower() == "dipole":
+        if is_mpi and my_rank != root:
+            return None
+        return _assemble_dipole_coupling(
+            gsystem, active_indices, active_results, res_by_frag, tda, verbose,
+        )
+
     # ---- f_nadd: build on root (needs serial gsystem.density), broadcast ----
     if f_nadd is None:
         if (not is_mpi) or my_rank == root:
@@ -1190,6 +1365,25 @@ def _run_subsystem_casida_distributed(
     f_nadd = np.asarray(f_nadd, dtype=float)
 
     hartree = Functional(type="HARTREE")
+
+    # Range-separated Hartree: the grid loop computes the screened (erfc) short
+    # range with 'sr' kernel; the erf long range is added afterwards as far-field
+    # dipole coupling (root only). A FIXED alpha (a.u.) is used so the split is
+    # identical across a distance scan; the exact result is alpha-independent, and
+    # a smaller alpha pushes more of the interaction onto the exact grid SR.
+    _mode = str(hartree_mode).lower()
+    _rangesep = _mode in ("rangesep", "rangesep_box")
+    _rangesep_box = _mode == "rangesep_box"
+    _screen_alpha = None
+    if _rangesep:
+        _screen_alpha = float(coupling_alpha) if coupling_alpha else _DEFAULT_COUPLING_ALPHA
+        if verbose and ((not is_mpi) or my_rank == root):
+            where = "union sub-box" if _rangesep_box else "global grid"
+            print(
+                f"  Range-separated coupling Hartree: erfc SR on {where} (alpha="
+                f"{_screen_alpha:.3f} a0^-1) + erf far-field dipole LR.",
+                flush=True,
+            )
 
     # Per-rank diagnostics: resident footprint (proves the O(1)-streamed invariant
     # — a rank only ever holds its own fragment's stack, never all of them) and a
@@ -1262,10 +1456,17 @@ def _run_subsystem_casida_distributed(
                     def _getter(jb, _src=producer_rank):
                         return _recv_grid(comm, _src, jb)
 
-                K_rs = compute_coupling_block_streamed(
-                    phi_res, _getter, n_stream, gsystem,
-                    resident, producer, f_nadd, hartree, include_hartree=True,
-                )
+                if _rangesep_box:
+                    K_rs = _sr_coupling_block_box(
+                        phi_res, _getter, n_stream, gsystem,
+                        resident, producer, f_nadd, _screen_alpha,
+                    )
+                else:
+                    K_rs = compute_coupling_block_streamed(
+                        phi_res, _getter, n_stream, gsystem,
+                        resident, producer, f_nadd, hartree, include_hartree=True,
+                        screen_alpha=_screen_alpha, screen_part="sr",
+                    )
                 # Canonical orientation K[(min,max)].
                 K_local[key] = K_rs if resident == key[0] else K_rs.T
             elif my_rank == producer_rank:
@@ -1290,6 +1491,20 @@ def _run_subsystem_casida_distributed(
             K_coupling.update(d)
     for (I, J), K_IJ in list(K_coupling.items()):
         K_coupling.setdefault((J, I), np.asarray(K_IJ).T)
+
+    # Range separation: add the erf long range as far-field dipole coupling. The
+    # grid loop above produced the screened (erfc) short range + f_nadd; here we
+    # add the smooth erf tail from the transition dipoles (no grid).
+    if _rangesep:
+        centers = {i: _fragment_center(gsystem, i) for i in active_indices}
+        for (I, J) in [k for k in list(K_coupling.keys()) if k[0] < k[1]]:
+            mu_I = _res_optional(res_by_frag[I], "dip_tran")
+            mu_J = _res_optional(res_by_frag[J], "dip_tran")
+            if mu_I is None or mu_J is None:
+                continue
+            K_lr = dipole_dipole_block(mu_I, mu_J, centers[I], centers[J])
+            K_coupling[(I, J)] = np.asarray(K_coupling[(I, J)]) + K_lr
+            K_coupling[(J, I)] = np.asarray(K_coupling[(J, I)]) + K_lr.T
 
     if verbose:
         for (I, J), K_IJ in sorted(K_coupling.items()):
@@ -1319,4 +1534,95 @@ def _run_subsystem_casida_distributed(
         "Z": Z_coupled,
         "K_coupling": K_coupling,
         "f_nadd": f_nadd,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Far-field (Förster) coupling: erf->1 long-range limit of range-separated
+# Coulomb, i.e. transition-dipole/transition-dipole interaction. No grids.
+# ---------------------------------------------------------------------------
+
+
+def dipole_dipole_block(mu_I, mu_J, R_I, R_J) -> np.ndarray:
+    """Transition-dipole coupling block K[m,n] = mu_I[m] . T(R_IJ) . mu_J[n].
+
+    ``mu_I`` (n_I, 3), ``mu_J`` (n_J, 3) are transition dipoles (a.u.); these are
+    origin-independent because transition densities are charge-neutral, so only
+    the separation ``R_J - R_I`` between fragment centers matters. ``T`` is the
+    dipole-dipole tensor ``(I - 3 u u^T)/R^3`` (a.u.), the exact long-range limit
+    of the Coulomb coupling between two neutral localized densities (Förster).
+    Returns K in Hartree, shape (n_I, n_J).
+    """
+    mu_I = np.atleast_2d(np.asarray(mu_I, dtype=float))
+    mu_J = np.atleast_2d(np.asarray(mu_J, dtype=float))
+    d = np.asarray(R_J, dtype=float) - np.asarray(R_I, dtype=float)
+    R = float(np.linalg.norm(d))
+    if R < 1e-8:
+        return np.zeros((mu_I.shape[0], mu_J.shape[0]), dtype=float)
+    u = d / R
+    T = (np.eye(3) - 3.0 * np.outer(u, u)) / R**3
+    return mu_I @ T @ mu_J.T
+
+
+def _fragment_center(gsystem, isub) -> np.ndarray:
+    """Cartesian center (a.u.) of subsystem ``isub``'s embedding subcell.
+
+    Derived from the globally-replicated ``graph.sub_shift``/``sub_shape`` and the
+    serial grid geometry, so it is valid on every rank without communication.
+    """
+    graph = gsystem.graphtopo.graph
+    shift = np.asarray(graph.sub_shift[isub], dtype=float)
+    shape = np.asarray(graph.sub_shape[isub], dtype=float)
+    nrR = np.asarray(gsystem.grid.nrR, dtype=float)
+    lattice = np.asarray(gsystem.grid.lattice, dtype=float)  # rows = cell vectors (a.u.)
+    frac = (shift + 0.5 * shape) / nrR
+    return frac @ lattice
+
+
+def _assemble_dipole_coupling(
+    gsystem, active_indices, active_results, res_by_frag, tda, verbose,
+) -> Dict[str, Any]:
+    """Build + solve the coupled problem with far-field dipole coupling (root only)."""
+    centers = {i: _fragment_center(gsystem, i) for i in active_indices}
+    K_coupling: Dict[Tuple[int, int], np.ndarray] = {}
+    for a, I in enumerate(active_indices):
+        mu_I = _res_optional(res_by_frag[I], "dip_tran")
+        if mu_I is None:
+            continue
+        for J in active_indices[a + 1:]:
+            mu_J = _res_optional(res_by_frag[J], "dip_tran")
+            if mu_J is None:
+                continue
+            K_IJ = dipole_dipole_block(mu_I, mu_J, centers[I], centers[J])
+            K_coupling[(I, J)] = K_IJ
+            K_coupling[(J, I)] = K_IJ.T
+
+    if verbose:
+        for (I, J), K_IJ in sorted(K_coupling.items()):
+            if I < J:
+                R = float(np.linalg.norm(centers[J] - centers[I]))
+                k_max = float(np.max(np.abs(K_IJ))) if K_IJ.size else 0.0
+                print(
+                    f"  [dipole] K[{I},{J}] R={R:.3f} a0  max|K|={k_max:.4e} Ha",
+                    flush=True,
+                )
+
+    K_pos = _remap_k_coupling_to_positions(K_coupling, active_indices)
+    omega_coupled, Z_coupled = assemble_coupled_casida(
+        active_results, K_pos, tda=tda, verbose=verbose,
+    )
+    f_coupled = coupled_oscillator_strengths(
+        omega_coupled, Z_coupled, active_results, tda=tda, verbose=verbose,
+    )
+    if verbose:
+        print(
+            f"  Done. {len(omega_coupled)} coupled excitations (far-field dipole).",
+            flush=True,
+        )
+    return {
+        "omega": omega_coupled,
+        "f": f_coupled,
+        "Z": Z_coupled,
+        "K_coupling": K_coupling,
+        "f_nadd": None,
     }

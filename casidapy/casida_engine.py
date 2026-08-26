@@ -2,9 +2,20 @@
 from __future__ import annotations
 
 from typing import Any, Optional, Sequence
+import time
 
 import numpy as np
 from mpi4py import MPI
+
+
+def _wtime() -> float:
+    """Wall time; avoid MPI.Wtime when MPI is not usable (serial / login nodes)."""
+    try:
+        if MPI.Is_initialized():
+            return float(MPI.Wtime())
+    except Exception:
+        pass
+    return time.time()
 
 from dftpy.functional import Functional, LocalPseudo, TotalFunctional
 from dftpy.ions import Ions
@@ -15,7 +26,7 @@ from scipy.sparse.linalg import LinearOperator
 
 from casidapy.casida_api import CasidaInputs, CasidaOptions, CasidaResults
 from casidapy.casida_of import build_of_functional_context
-from casidapy.casida_utils import (
+from casidapy.utils.casida_utils import (
     XC_TO_LIBXC_COMPONENTS,
     build_initial_guess,
     mpi_comm_rank,
@@ -23,9 +34,9 @@ from casidapy.casida_utils import (
     normalize_wavefunctions,
     psi_to_fields,
 )
-from casidapy.davidson import davidson, solve_davidson, solve_eigsh, solve_lobpcg
+from casidapy.utils.davidson import davidson, solve_davidson, solve_eigsh, solve_lobpcg
 from casidapy.kernels.plane_wave import PlaneWaveKernel
-from casidapy.qepy_adapter import slice_active_space
+from casidapy.adapter.qepy import slice_active_space
 
 
 class CasidaKS_MPI:
@@ -40,7 +51,7 @@ class CasidaKS_MPI:
                  rho_cutoff=1e-3, fxc_max=20.0, use_gpu=False,
                  spin_state="singlet", libxc_xc_components=None, comm=None,
                  use_uspp=False, beta_projectors=None, qij_augmentation=None,
-                 use_eDFTpy=False, kernel=None):
+                 use_eDFTpy=False, kernel=None, driver=None):
         if comm is None:
             self.comm = MPI.COMM_WORLD
         else:
@@ -97,6 +108,7 @@ class CasidaKS_MPI:
         self.tda = False
         self.n_occ = 0
         self.n_unocc = 0
+        self.driver = driver
 
     def set_active_orbitals(self, occ_eigs, unocc_eigs, psi_occ, psi_unocc):
         """Store pre-sliced active occupied/unoccupied orbital sets.
@@ -115,6 +127,116 @@ class CasidaKS_MPI:
         self.n_unocc = self._n_unocc
         self._proj_occ = getattr(self._kernel, "_proj_occ", None)
         self._proj_unocc = getattr(self._kernel, "_proj_unocc", None)
+
+    def xas(
+        self,
+        *,
+        reconstruct=True,
+        edge_atom,
+        edge="K",
+        basis="def2-tzvp",
+        xc="pbe0",
+        n_virt=None,
+        n_states=40,
+        shell=None,
+        shells=None,
+        upf_path=None,
+        verbose=False,
+        driver=None,
+        pw_xc=None,
+        embed_mode="hirshfeld",
+        vhxc_scale="auto",
+        vhxc_scale_alpha=None,
+        vhxc_scale_min=None,
+        vhxc_scale_max=None,
+        r_damp=1.0,
+        gauge_align="far_field",
+        ae_electrons="atomic",
+        oxidation_state=None,
+        oxidation_states=None,
+        spin=None,
+        zero_embedding=False,
+        core_gauge_shift_ha=0.0,
+        eps_core_reference_ha=None,
+        core_reference_index=0,
+        vloc_source="qepy",
+        use_gpu=None,
+        use_gpu_pw=None,
+        n_virt_active=None,
+        comm=None,
+    ):
+        """Core XAS via AE reconstruction in frozen ``V_env``.
+
+        Production defaults: ``hirshfeld`` (method-2 ionic + ``v_Hxc[ρ_env]``),
+        ``ae_electrons="atomic"`` (formal oxidation state), ``gauge_align="far_field"``
+        (auto Hirshfeld weight gauge for ``hirshfeld`` mode),
+        ``vloc_source="qepy"`` (QE ``setlocal`` peel of ``V_loc(A)``).
+        Use ``embed_mode="loc_only"`` for ionic solids; ``damp_vhxc`` for the
+        legacy geometric fade; ``zero_embedding=True`` for the isolated-ion
+        diagnostic. Pass ``eps_core_reference_ha`` to align cores to a full-AE
+        GTO reference level.
+
+        ``use_gpu``
+            CuPy for Hirshfeld / ``V_env`` AO / (optionally) PW kernel. Defaults
+            to the host kernel's ``use_gpu`` flag when omitted.
+        ``use_gpu_pw``
+            CuPy for PW Casida orbitals. Defaults to ``use_gpu``.
+        ``n_virt_active``
+            Optional energy-strided Casida virtual count for large ``n_virt``
+            pools (``None`` = use every selected virtual).
+        ``comm``
+            Optional ``mpi4py`` communicator for Hirshfeld atom loops and
+            AO-grid blocks (``None`` = serial; does not auto-touch
+            ``COMM_WORLD``).
+        """
+        if not reconstruct:
+            raise ValueError("xas() currently requires reconstruct=True")
+        driver = driver if driver is not None else self.driver
+        if driver is None:
+            raise ValueError("xas() needs a QEpy driver")
+        from casidapy.xas import run_reconstruct_cvs_from_driver
+
+        n_virt = int(n_virt if n_virt is not None else (self.n_unocc or 40))
+        if use_gpu is None:
+            use_gpu = bool(getattr(self._kernel, "use_gpu", False))
+        if comm is None:
+            comm = getattr(self, "comm", None)
+        if pw_xc is None:
+            pw_xc = getattr(getattr(self, "functional", None), "name", None) or "PBE"
+        return run_reconstruct_cvs_from_driver(
+            driver,
+            int(edge_atom),
+            edge=edge,
+            shell=shell,
+            shells=shells,
+            basis=basis,
+            xc=xc,
+            pw_xc=pw_xc,
+            n_virt=n_virt,
+            n_states=int(n_states),
+            n_virt_active=n_virt_active,
+            use_gpu=bool(use_gpu),
+            use_gpu_pw=use_gpu_pw,
+            comm=comm,
+            upf_path=upf_path,
+            verbose=verbose,
+            embed_mode=embed_mode,
+            vhxc_scale=vhxc_scale,
+            vhxc_scale_alpha=vhxc_scale_alpha,
+            vhxc_scale_min=vhxc_scale_min,
+            vhxc_scale_max=vhxc_scale_max,
+            r_damp=r_damp,
+            gauge_align=gauge_align,
+            vloc_source=vloc_source,
+            ae_electrons=ae_electrons,
+            oxidation_state=oxidation_state,
+            oxidation_states=oxidation_states,
+            spin=spin,
+            zero_embedding=zero_embedding,
+            core_gauge_shift_ha=core_gauge_shift_ha,
+            eps_core_reference_ha=eps_core_reference_ha,
+            core_reference_index=core_reference_index,
+        )
 
     def transition_orbital(self, psi_i, psi_a, proj_i=None, proj_a=None):
         """Transition density ψ_i* ψ_a + USPP augmentation if enabled."""
@@ -159,7 +281,12 @@ class CasidaKS_MPI:
             self.d_mode = None
             return self.f
 
-        mu = self._kernel.dipole_matrix()
+        origin = getattr(self._kernel, "dipole_origin", (0.0, 0.0, 0.0))
+        try:
+            mu = self._kernel.dipole_matrix(origin=origin)
+        except TypeError:
+            # Kernels whose dipole_matrix() takes no origin argument.
+            mu = self._kernel.dipole_matrix()
         self.mu_transition = mu
 
         if self.tda:
@@ -195,11 +322,7 @@ class CasidaKS_MPI:
 
     def setup_matrix_free(self, tda: bool = False):
         self._kernel.setup(tda=tda)
-        if (
-            not tda
-            and getattr(self._kernel, "hybrid", False)
-            and type(self._kernel).__name__ == "GTOKernel"
-        ):
+        if not tda and not self._kernel.supports_matrix_free_rpa:
             raise NotImplementedError(
                 "Hybrid full TDDFT is not available matrix-free (A-B ≠ diag(dE)). "
                 "Use run_casida(), which builds dense A/B via PySCF get_ab(), "
@@ -544,40 +667,55 @@ def run_casida(
 
     Typical GTO usage::
 
-        from casidapy.pyscf_adapter import extract_gto_kernel
+        from casidapy.adapter.pyscf import extract_gto_kernel
         from casidapy.casida_engine import run_casida
 
         kernel, opts = extract_gto_kernel(mf, n_states=10, tda=True)
         results = run_casida(kernel, opts)
     """
-    from casidapy.kernels.gto import GTOKernel
-    from casidapy.kernels.plane_wave import PlaneWaveKernel
+    from casidapy.kernels.base import CasidaKernel
 
     # mpi4pyscf parks non-master ranks in a worker pool. Using COMM_WORLD for
     # SPMD Casida/QED collectives would hang — treat as serial on the master.
     try:
-        from casidapy.mpi_pyscf import is_mpi4pyscf_enabled
+        from casidapy.adapter.mpi_pyscf import is_mpi4pyscf_enabled
         _mpi4 = is_mpi4pyscf_enabled() or bool(
             getattr(kernel, "use_mpi_response", False)
         )
     except Exception:
         _mpi4 = bool(getattr(kernel, "use_mpi_response", False))
-    if _mpi4:
+    # Serial GTO (no mpi4pyscf JK): never touch COMM_WORLD — Open MPI on
+    # login nodes often aborts on MPI_Comm_rank before a proper init. Backends
+    # that don't participate in COMM_WORLD collectives (GTO) run serial here.
+    _gto_serial = not getattr(kernel, "distributes_over_comm", True) and not bool(
+        getattr(kernel, "use_mpi_response", False)
+    )
+    if _mpi4 or _gto_serial:
         comm = None
     elif comm is None:
-        comm = MPI.COMM_WORLD
+        try:
+            if MPI.Is_initialized():
+                comm = MPI.COMM_WORLD
+            else:
+                comm = None
+        except Exception:
+            comm = None
     if comm is None:
         rank, size = 0, 1
     else:
         rank = mpi_comm_rank(comm)
         size = mpi_comm_size(comm)
 
-    if not hasattr(kernel, "apply_K"):
-        raise TypeError("kernel must implement apply_K (KernelBackend protocol)")
+    if not isinstance(kernel, CasidaKernel):
+        raise TypeError(
+            f"Unsupported kernel type: {type(kernel)} "
+            "(expected a CasidaKernel / KernelBackend)"
+        )
 
     # Algebra layer: reuse CasidaKS_MPI with an injected kernel.
-    # For GTO, pass a dummy rho/xc only if needed — inject kernel directly.
-    if isinstance(kernel, PlaneWaveKernel):
+    # Grid backends (PW) build the full fxc engine; MO backends (GTO) attach a
+    # minimal shell without PW fxc construction.
+    if kernel.provides_grid:
         casida = CasidaKS_MPI(
             kernel.rho,
             kernel.functional,
@@ -590,8 +728,8 @@ def run_casida(
         casida.set_active_orbitals(
             kernel._occ_e, kernel._unocc_e, kernel._psi_occ, kernel._psi_unocc
         )
-    elif isinstance(kernel, GTOKernel):
-        # Minimal shell: attach GTO kernel without PW fxc construction
+    else:
+        # Minimal shell: attach MO kernel without PW fxc construction
         casida = object.__new__(CasidaKS_MPI)
         casida.comm = comm
         casida.rank = rank
@@ -625,20 +763,18 @@ def run_casida(
         casida._unocc_e = kernel._unocc_e
         casida._psi_occ = []  # unused for GTO dipole path
         casida._psi_unocc = []
-    else:
-        raise TypeError(f"Unsupported kernel type: {type(kernel)}")
 
     n_trans = kernel.n_trans
     n_states_actual = min(options.n_states, n_trans)
 
-    t0 = MPI.Wtime()
+    t0 = _wtime()
 
     # Hybrid full TDDFT: A-B ≠ diag(dE) → dense A/B via PySCF get_ab.
     # Pure-functional RPA stays matrix-free (fast C-chain).
     hybrid_rpa = False
-    if isinstance(kernel, GTOKernel) and not options.tda:
+    if not kernel.provides_grid and not options.tda:
         kernel.setup(tda=False)
-        hybrid_rpa = bool(getattr(kernel, "hybrid", False))
+        hybrid_rpa = not kernel.supports_matrix_free_rpa
 
     if hybrid_rpa:
         if rank == 0:
@@ -665,17 +801,17 @@ def run_casida(
         casida._AmB_evals = s
         casida._AmB_evecs = U
         casida._matrix_free = False
-        t_build = MPI.Wtime() - t0
-        t1 = MPI.Wtime()
+        t_build = _wtime() - t0
+        t1 = _wtime()
         omega, Z = casida.solve(
             k=n_states_actual,
             use_davidson=False,
             verbose=1 if rank == 0 else 0,
         )
-        t_solve = MPI.Wtime() - t1
+        t_solve = _wtime() - t1
         options.matrix_free = False
     else:
-        if not options.matrix_free and isinstance(kernel, GTOKernel):
+        if not options.matrix_free and not kernel.provides_grid:
             # Pure GTO TDA/RPA: matrix-free is the supported fast path
             if rank == 0:
                 print("GTO backend: forcing matrix_free=True")
@@ -683,8 +819,8 @@ def run_casida(
 
         if options.matrix_free:
             casida.setup_matrix_free(tda=options.tda)
-            t_build = MPI.Wtime() - t0
-            t1 = MPI.Wtime()
+            t_build = _wtime() - t0
+            t1 = _wtime()
             omega, Z = casida.solve_matrix_free(
                 k=n_states_actual,
                 tol=options.solver_tol,
@@ -692,17 +828,17 @@ def run_casida(
                 verbose=1 if rank == 0 else 0,
                 method=options.solver_method,
             )
-            t_solve = MPI.Wtime() - t1
+            t_solve = _wtime() - t1
         else:
             casida.build_matrices(tda=options.tda)
-            t_build = MPI.Wtime() - t0
-            t1 = MPI.Wtime()
+            t_build = _wtime() - t0
+            t1 = _wtime()
             omega, Z = casida.solve(k=n_states_actual)
-            t_solve = MPI.Wtime() - t1
+            t_solve = _wtime() - t1
 
     f = casida.oscillator_strengths(k=n_states_actual)
     rho_state = None
-    if isinstance(kernel, PlaneWaveKernel) and options.use_eDFTpy:
+    if kernel.provides_grid and options.use_eDFTpy:
         rho_state = casida.collapse_transition_densities_to_state_basis(n_states_actual)
 
     return CasidaResults(
@@ -737,7 +873,7 @@ def run_casida_in_memory(inputs: CasidaInputs, options: CasidaOptions, comm=None
     if str(basis).lower() == "gto":
         raise ValueError(
             "options.basis='gto' requires run_casida(GTOKernel, options). "
-            "Use casidapy.pyscf_adapter.extract_gto_kernel(mf)."
+            "Use casidapy.adapter.pyscf.extract_gto_kernel(mf)."
         )
 
     return _run_casida_plane_wave(inputs, options, comm=comm)
@@ -842,11 +978,11 @@ def _run_casida_plane_wave(inputs: CasidaInputs, options: CasidaOptions, comm=No
     n_trans = casida.n_occ * casida.n_unocc
     n_states_actual = min(options.n_states, n_trans)
 
-    t0 = MPI.Wtime()
+    t0 = _wtime()
     if options.matrix_free:
         casida.setup_matrix_free(tda=options.tda)
-        t_build = MPI.Wtime() - t0
-        t1 = MPI.Wtime()
+        t_build = _wtime() - t0
+        t1 = _wtime()
         omega, Z = casida.solve_matrix_free(
             k=n_states_actual,
             tol=options.solver_tol,
@@ -854,13 +990,13 @@ def _run_casida_plane_wave(inputs: CasidaInputs, options: CasidaOptions, comm=No
             verbose=1 if rank == 0 else 0,
             method=options.solver_method,
         )
-        t_solve = MPI.Wtime() - t1
+        t_solve = _wtime() - t1
     else:
         casida.build_matrices(tda=options.tda)
-        t_build = MPI.Wtime() - t0
-        t1 = MPI.Wtime()
+        t_build = _wtime() - t0
+        t1 = _wtime()
         omega, Z = casida.solve(k=n_states_actual)
-        t_solve = MPI.Wtime() - t1
+        t_solve = _wtime() - t1
 
     f = casida.oscillator_strengths(k=n_states_actual)
     rho_state = casida.collapse_transition_densities_to_state_basis(n_states_actual)

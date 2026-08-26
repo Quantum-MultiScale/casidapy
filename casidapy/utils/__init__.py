@@ -1,0 +1,148 @@
+"""Shared numerical utilities (Casida helpers, Davidson, NAC, QED, SOC, USPP).
+
+Prefer submodule imports to keep start-up light::
+
+    from casidapy.utils.casida_utils import normalize_wavefunctions
+    from casidapy.utils.davidson import solve_davidson
+    from casidapy.utils.qed import solve_qed_tda
+    from casidapy.utils.accel import array_module, asnumpy
+"""
+
+__all__ = [
+    "NACResults",
+    "QEDOptions",
+    "QEDResults",
+    "SOCResults",
+    "array_module",
+    "asarray",
+    "asnumpy",
+    "assemble_electronic_nac_tensor",
+    "block_slices",
+    "build_energy_differences",
+    "build_initial_guess",
+    "build_qed_sf_tda_matrix",
+    "build_qed_tda_matrix",
+    "build_soc_qed_pf_matrix",
+    "build_tddft",
+    "compute_electronic_nac_tensor",
+    "cupy_available",
+    "davidson",
+    "distributed_indices",
+    "dse_exchange_matvec",
+    "dse_exchange_rows",
+    "electronic_weights_qed_dense",
+    "electronic_weights_qed_post",
+    "electronic_weights_qed_sf",
+    "load_uspp_data",
+    "mpi_allreduce_sum",
+    "mpi_is_root",
+    "mpi_rank_size",
+    "normalize_uspp_wavefunctions",
+    "normalize_wavefunctions",
+    "parse_upf",
+    "project_polariton_nac",
+    "project_qed_nac",
+    "qed_electronic_A_rows",
+    "qed_tda_apply",
+    "resolve_mpi_comm",
+    "scan_qed_lambda",
+    "scan_qed_sf_lambda",
+    "scan_qed_tda",
+    "setup_nc_pseudos",
+    "setup_uspp",
+    "soc_ao_integrals",
+    "solve_davidson",
+    "solve_eigsh",
+    "solve_lobpcg",
+    "solve_nac",
+    "solve_qed_levels",
+    "solve_qed_pf_post",
+    "solve_qed_post",
+    "solve_qed_projected_nac",
+    "solve_qed_sf_tda",
+    "solve_qed_tda",
+    "solve_sacasscf_nac",
+    "solve_soc_qed",
+    "solve_soc_qed_levels",
+    "solve_soc_qed_pf",
+    "solve_soc_si",
+    "solve_tddft_nac",
+    "tddft_state_dipoles",
+    "to_gpu_mf",
+]
+
+_LAZY = {
+    "array_module": ("casidapy.utils.accel", "array_module"),
+    "asarray": ("casidapy.utils.accel", "asarray"),
+    "asnumpy": ("casidapy.utils.accel", "asnumpy"),
+    "block_slices": ("casidapy.utils.accel", "block_slices"),
+    "cupy_available": ("casidapy.utils.accel", "cupy_available"),
+    "distributed_indices": ("casidapy.utils.accel", "distributed_indices"),
+    "mpi_allreduce_sum": ("casidapy.utils.accel", "mpi_allreduce_sum"),
+    "mpi_is_root": ("casidapy.utils.accel", "mpi_is_root"),
+    "mpi_rank_size": ("casidapy.utils.accel", "mpi_rank_size"),
+    "resolve_mpi_comm": ("casidapy.utils.accel", "resolve_mpi_comm"),
+    "build_energy_differences": ("casidapy.utils.casida_utils", "build_energy_differences"),
+    "build_initial_guess": ("casidapy.utils.casida_utils", "build_initial_guess"),
+    "normalize_wavefunctions": ("casidapy.utils.casida_utils", "normalize_wavefunctions"),
+    "davidson": ("casidapy.utils.davidson", "davidson"),
+    "solve_davidson": ("casidapy.utils.davidson", "solve_davidson"),
+    "solve_eigsh": ("casidapy.utils.davidson", "solve_eigsh"),
+    "solve_lobpcg": ("casidapy.utils.davidson", "solve_lobpcg"),
+    "NACResults": ("casidapy.utils.nac", "NACResults"),
+    "assemble_electronic_nac_tensor": ("casidapy.utils.nac", "assemble_electronic_nac_tensor"),
+    "build_tddft": ("casidapy.utils.nac", "build_tddft"),
+    "compute_electronic_nac_tensor": ("casidapy.utils.nac", "compute_electronic_nac_tensor"),
+    "electronic_weights_qed_dense": ("casidapy.utils.nac", "electronic_weights_qed_dense"),
+    "electronic_weights_qed_post": ("casidapy.utils.nac", "electronic_weights_qed_post"),
+    "electronic_weights_qed_sf": ("casidapy.utils.nac", "electronic_weights_qed_sf"),
+    "project_polariton_nac": ("casidapy.utils.nac", "project_polariton_nac"),
+    "project_qed_nac": ("casidapy.utils.nac", "project_qed_nac"),
+    "solve_nac": ("casidapy.utils.nac", "solve_nac"),
+    "solve_qed_projected_nac": ("casidapy.utils.nac", "solve_qed_projected_nac"),
+    "solve_sacasscf_nac": ("casidapy.utils.nac", "solve_sacasscf_nac"),
+    "solve_tddft_nac": ("casidapy.utils.nac", "solve_tddft_nac"),
+    "to_gpu_mf": ("casidapy.utils.nac", "to_gpu_mf"),
+    "QEDOptions": ("casidapy.utils.qed", "QEDOptions"),
+    "QEDResults": ("casidapy.utils.qed", "QEDResults"),
+    "build_qed_sf_tda_matrix": ("casidapy.utils.qed", "build_qed_sf_tda_matrix"),
+    "build_qed_tda_matrix": ("casidapy.utils.qed", "build_qed_tda_matrix"),
+    "dse_exchange_matvec": ("casidapy.utils.qed", "dse_exchange_matvec"),
+    "dse_exchange_rows": ("casidapy.utils.qed", "dse_exchange_rows"),
+    "qed_electronic_A_rows": ("casidapy.utils.qed", "qed_electronic_A_rows"),
+    "qed_tda_apply": ("casidapy.utils.qed", "qed_tda_apply"),
+    "scan_qed_lambda": ("casidapy.utils.qed", "scan_qed_lambda"),
+    "scan_qed_sf_lambda": ("casidapy.utils.qed", "scan_qed_sf_lambda"),
+    "scan_qed_tda": ("casidapy.utils.qed", "scan_qed_tda"),
+    "solve_qed_levels": ("casidapy.utils.qed", "solve_qed_levels"),
+    "solve_qed_pf_post": ("casidapy.utils.qed", "solve_qed_pf_post"),
+    "solve_qed_post": ("casidapy.utils.qed", "solve_qed_post"),
+    "solve_qed_sf_tda": ("casidapy.utils.qed", "solve_qed_sf_tda"),
+    "solve_qed_tda": ("casidapy.utils.qed", "solve_qed_tda"),
+    "tddft_state_dipoles": ("casidapy.utils.qed", "tddft_state_dipoles"),
+    "SOCResults": ("casidapy.utils.soc", "SOCResults"),
+    "build_soc_qed_pf_matrix": ("casidapy.utils.soc", "build_soc_qed_pf_matrix"),
+    "soc_ao_integrals": ("casidapy.utils.soc", "soc_ao_integrals"),
+    "solve_soc_qed": ("casidapy.utils.soc", "solve_soc_qed"),
+    "solve_soc_qed_levels": ("casidapy.utils.soc", "solve_soc_qed_levels"),
+    "solve_soc_qed_pf": ("casidapy.utils.soc", "solve_soc_qed_pf"),
+    "solve_soc_si": ("casidapy.utils.soc", "solve_soc_si"),
+    "load_uspp_data": ("casidapy.utils.uspp", "load_uspp_data"),
+    "normalize_uspp_wavefunctions": ("casidapy.utils.uspp", "normalize_uspp_wavefunctions"),
+    "parse_upf": ("casidapy.utils.uspp", "parse_upf"),
+    "setup_nc_pseudos": ("casidapy.utils.uspp", "setup_nc_pseudos"),
+    "setup_uspp": ("casidapy.utils.uspp", "setup_uspp"),
+}
+
+
+def __getattr__(name):
+    target = _LAZY.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    mod_name, attr = target
+    import importlib
+
+    mod = importlib.import_module(mod_name)
+    value = getattr(mod, attr)
+    globals()[name] = value
+    return value

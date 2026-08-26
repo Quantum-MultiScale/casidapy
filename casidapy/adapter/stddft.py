@@ -5,7 +5,7 @@ from typing import Optional
 
 from casidapy.casida_api import CasidaInputs, CasidaOptions, CasidaResults
 from casidapy.casida_engine import run_casida_in_memory
-from casidapy.qepy_adapter import extract_casida_inputs_from_qepy_driver
+from casidapy.adapter.qepy import extract_casida_inputs_from_qepy_driver
 
 # Class to bridge the STDDFT and Casida engines
 class STDDFTBridge:

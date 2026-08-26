@@ -25,9 +25,9 @@ import ase.io
 
 from casidapy.casida_engine import CasidaKS_MPI, XC_TO_LIBXC_COMPONENTS
 from casidapy.casida_of import build_of_functional_context
-from casidapy.qepy_adapter import slice_active_space
+from casidapy.adapter.qepy import slice_active_space
 
-from casidapy.uspp import setup_uspp, setup_nc_pseudos, load_uspp_data, parse_upf
+from casidapy.utils.uspp import setup_uspp, setup_nc_pseudos, load_uspp_data, parse_upf
 HAS_USPP_MODULE = True
 
 try:

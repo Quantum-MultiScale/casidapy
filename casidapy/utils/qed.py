@@ -354,7 +354,7 @@ def qed_tda_apply(
 
 def _qed_tda_initial_guess(dE: np.ndarray, omega_c: float, nroots: int) -> np.ndarray:
     """Unit vectors on lowest Δε singles plus a photonic seed."""
-    from casidapy.casida_utils import build_initial_guess
+    from casidapy.utils.casida_utils import build_initial_guess
 
     dE = np.asarray(dE, dtype=float).ravel()
     n = dE.size
@@ -825,7 +825,7 @@ def solve_qed_tda(
         X, m = V[:n, :], V[n, :]
         solver_method_eff = "eigh"
     else:
-        from casidapy.davidson import solve_davidson, solve_lobpcg
+        from casidapy.utils.davidson import solve_davidson, solve_lobpcg
 
         q, Q_oo, Q_vv = dipole_blocks(
             kernel,
@@ -1473,7 +1473,7 @@ def solve_qed_pf_post(
     Returned ``omega`` is relative to the PF ground (``w - w[0]``). Probe
     ``f`` uses ``μ ⊗ I``; do **not** use ``photon_frac`` as intensity.
     """
-    from casidapy.soc import build_soc_qed_pf_matrix
+    from casidapy.utils.soc import build_soc_qed_pf_matrix
 
     omega_c = float(omega_c)
     if omega_c <= 0.0:

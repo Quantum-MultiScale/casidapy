@@ -45,7 +45,7 @@ import numpy as np
 
 from casidapy.casida_api import CasidaResults
 from casidapy.kernels.gto import GTOKernel
-from casidapy.nac import NACResults
+from casidapy.utils.nac import NACResults
 
 
 def _full_space_amplitude(kernel: GTOKernel, amp_active: np.ndarray) -> np.ndarray:
@@ -266,9 +266,9 @@ def solve_nac_cpu(
 ) -> NACResults:
     """High-level CPU TDA ground<->excited NAC entry point.
 
-    Mirrors :func:`casidapy.nac.solve_nac`'s return contract
-    (:class:`~casidapy.nac.NACResults`) so downstream QED-projection code
-    (``casidapy.nac.solve_qed_projected_nac``) is backend-agnostic.
+    Mirrors :func:`casidapy.utils.nac.solve_nac`'s return contract
+    (:class:`~casidapy.utils.nac.NACResults`) so downstream QED-projection code
+    (``casidapy.utils.nac.solve_qed_projected_nac``) is backend-agnostic.
     """
     if len(states) != 2:
         raise ValueError(f"states must be a length-2 pair, got {states!r}")

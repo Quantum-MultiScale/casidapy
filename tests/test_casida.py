@@ -17,7 +17,7 @@ import pytest
 
 class TestBuildEnergyDifferences:
     def test_basic(self):
-        from casidapy.casida_utils import build_energy_differences
+        from casidapy.utils.casida_utils import build_energy_differences
 
         occ_e = np.array([-0.5, -0.3])
         unocc_e = np.array([0.1, 0.4, 0.7])
@@ -32,7 +32,7 @@ class TestBuildEnergyDifferences:
         assert np.isclose(dE[5], 0.7 - (-0.3))  # i=1, a=2
 
     def test_single_transition(self):
-        from casidapy.casida_utils import build_energy_differences
+        from casidapy.utils.casida_utils import build_energy_differences
 
         occ_e = np.array([0.0])
         unocc_e = np.array([1.0])
@@ -44,7 +44,7 @@ class TestBuildEnergyDifferences:
 
 class TestBuildInitialGuess:
     def test_shape_and_unit_vectors(self):
-        from casidapy.casida_utils import build_initial_guess
+        from casidapy.utils.casida_utils import build_initial_guess
 
         dE = np.array([0.5, 0.1, 0.8, 0.3])
         k = 3
@@ -58,7 +58,7 @@ class TestBuildInitialGuess:
             assert dominant == sorted_idx[col]
 
     def test_k_larger_than_n_trans(self):
-        from casidapy.casida_utils import build_initial_guess
+        from casidapy.utils.casida_utils import build_initial_guess
 
         dE = np.array([1.0, 2.0])
         k = 5
@@ -78,7 +78,7 @@ class TestSliceActiveSpace:
 
     def test_no_total_occ(self):
         """When n_total_occ is None, select the first n_occ orbitals."""
-        from casidapy.qepy_adapter import slice_active_space
+        from casidapy.adapter.qepy import slice_active_space
 
         n_occ = 4
         n_unocc = 3
@@ -95,7 +95,7 @@ class TestSliceActiveSpace:
 
     def test_with_total_occ(self):
         """When n_total_occ is set, select top n_occ from the occupied block."""
-        from casidapy.qepy_adapter import slice_active_space
+        from casidapy.adapter.qepy import slice_active_space
 
         n_occ = 3
         n_unocc = 2
@@ -114,7 +114,7 @@ class TestSliceActiveSpace:
 
     def test_n_unocc_none_uses_all(self):
         """When n_unocc is None, use all available unoccupied orbitals."""
-        from casidapy.qepy_adapter import slice_active_space
+        from casidapy.adapter.qepy import slice_active_space
 
         n_occ = 4
         occ_e, unocc_e, psi_occ, psi_unocc = slice_active_space(
@@ -126,14 +126,44 @@ class TestSliceActiveSpace:
         assert len(unocc_e) == 6
         np.testing.assert_array_equal(unocc_e, self.eigs[4:])
 
+    def test_unocc_subsample_energy_stride(self):
+        """Opt-in subsample keeps endpoints and reduces active virtual count."""
+        from casidapy.adapter.qepy import slice_active_space, subsample_virtuals_by_energy
+
+        n_occ = 2
+        n_unocc = 8
+        _, unocc_e, _, psi_unocc = slice_active_space(
+            self.eigs,
+            self.psi_all,
+            n_occ,
+            n_unocc=n_unocc,
+            unocc_subsample=4,
+        )
+        assert len(unocc_e) == 4
+        assert len(psi_unocc) == 4
+        pool = self.eigs[n_occ : n_occ + n_unocc]
+        assert unocc_e[0] == pytest.approx(pool[0])
+        assert unocc_e[-1] == pytest.approx(pool[-1])
+        e2, _p2, idx = subsample_virtuals_by_energy(pool, list(range(8)), 8)
+        assert len(e2) == 8 and len(idx) == 8
+
+    def test_unocc_subsample_none_is_noop(self):
+        from casidapy.adapter.qepy import slice_active_space
+
+        _, unocc_e, _, psi_unocc = slice_active_space(
+            self.eigs, self.psi_all, 3, n_unocc=5, unocc_subsample=None
+        )
+        assert len(unocc_e) == 5
+        assert psi_unocc == [3, 4, 5, 6, 7]
+
     def test_invalid_n_occ_raises(self):
-        from casidapy.qepy_adapter import slice_active_space
+        from casidapy.adapter.qepy import slice_active_space
 
         with pytest.raises(ValueError, match="n_occ must be > 0"):
             slice_active_space(self.eigs, self.psi_all, 0)
 
     def test_mismatched_lengths_raises(self):
-        from casidapy.qepy_adapter import slice_active_space
+        from casidapy.adapter.qepy import slice_active_space
 
         with pytest.raises(ValueError, match="len\\(eigs\\)"):
             slice_active_space(self.eigs[:5], self.psi_all, 3)
@@ -183,7 +213,7 @@ class TestKernelBackends:
     def test_gto_kernel_requires_pyscf_or_runs(self):
         pytest.importorskip("pyscf")
         from pyscf import gto, dft
-        from casidapy.pyscf_adapter import extract_gto_kernel
+        from casidapy.adapter.pyscf import extract_gto_kernel
         from casidapy.casida_engine import run_casida
 
         # Use 6-31G so n_trans > 1; eigsh cannot solve k >= N for LinearOperator.
@@ -211,7 +241,7 @@ class TestKernelBackends:
         """GTO TDA must reproduce PySCF TDA, including hybrids."""
         pytest.importorskip("pyscf")
         from pyscf import gto, dft
-        from casidapy.pyscf_adapter import extract_gto_kernel
+        from casidapy.adapter.pyscf import extract_gto_kernel
         from casidapy.casida_engine import run_casida
 
         # Small H2 system: the matrix-free solver calls gen_response per
@@ -240,7 +270,7 @@ class TestKernelBackends:
         """Pure-functional full TDDFT (matrix-free RPA) must match PySCF TDDFT."""
         pytest.importorskip("pyscf")
         from pyscf import gto, dft
-        from casidapy.pyscf_adapter import extract_gto_kernel
+        from casidapy.adapter.pyscf import extract_gto_kernel
         from casidapy.casida_engine import run_casida
 
         mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="6-31g", verbose=0)
@@ -270,7 +300,7 @@ class TestKernelBackends:
         """Hybrid/HF full TDDFT via dense A/B must match PySCF TDDFT/TDHF."""
         pytest.importorskip("pyscf")
         from pyscf import gto, dft, scf, tdscf
-        from casidapy.pyscf_adapter import extract_gto_kernel
+        from casidapy.adapter.pyscf import extract_gto_kernel
         from casidapy.casida_engine import run_casida
 
         mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="6-31g", verbose=0)
@@ -300,7 +330,7 @@ class TestKernelBackends:
         """Direct matrix-free hybrid RPA must still raise (dense path only)."""
         pytest.importorskip("pyscf")
         from pyscf import gto, dft
-        from casidapy.pyscf_adapter import extract_gto_kernel
+        from casidapy.adapter.pyscf import extract_gto_kernel
         from casidapy.casida_engine import CasidaKS_MPI
 
         mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="6-31g", verbose=0)
@@ -471,7 +501,7 @@ class TestQEDClosedShellMPI:
         return kernel
 
     def test_dse_exchange_rows_match_full(self):
-        from casidapy.qed import dse_exchange_matrix, dse_exchange_rows
+        from casidapy.utils.qed import dse_exchange_matrix, dse_exchange_rows
 
         rng = np.random.default_rng(0)
         n_o, n_v = 3, 4
@@ -487,7 +517,7 @@ class TestQEDClosedShellMPI:
     def test_partitioned_A_rows_match_serial_M(self):
         """Simulated multi-rank row ownership must reproduce serial A = M[:n,:n]."""
         pytest.importorskip("pyscf")
-        from casidapy.qed import (
+        from casidapy.utils.qed import (
             build_qed_tda_matrix,
             dipole_blocks,
             qed_electronic_A_rows,
@@ -516,7 +546,7 @@ class TestQEDClosedShellMPI:
         pytest.importorskip("pyscf")
         pytest.importorskip("mpi4py")
         from mpi4py import MPI
-        from casidapy.qed import build_qed_tda_matrix, solve_qed_tda
+        from casidapy.utils.qed import build_qed_tda_matrix, solve_qed_tda
 
         kernel = self._h2_kernel(k_cache_max=0)
         lam = (0.0, 0.0, 0.04)
@@ -533,7 +563,7 @@ class TestQEDClosedShellMPI:
         assert np.all(np.isfinite(res.omega))
 
     def test_dse_exchange_matvec_matches_dense(self):
-        from casidapy.qed import dse_exchange_matrix, dse_exchange_matvec
+        from casidapy.utils.qed import dse_exchange_matrix, dse_exchange_matvec
 
         rng = np.random.default_rng(1)
         n_o, n_v = 3, 5
@@ -553,7 +583,7 @@ class TestQEDClosedShellMPI:
 
     def test_qed_tda_apply_matches_dense_matvec(self):
         pytest.importorskip("pyscf")
-        from casidapy.qed import (
+        from casidapy.utils.qed import (
             SQRT2,
             build_qed_tda_matrix,
             dipole_blocks,
@@ -600,7 +630,7 @@ class TestQEDClosedShellMPI:
 
     def test_matrix_free_solve_matches_dense_eigh(self):
         pytest.importorskip("pyscf")
-        from casidapy.qed import build_qed_tda_matrix, solve_qed_tda
+        from casidapy.utils.qed import build_qed_tda_matrix, solve_qed_tda
 
         kernel = self._h2_kernel(k_cache_max=0)
         lam = (0.0, 0.0, 0.05)
@@ -643,7 +673,7 @@ class TestQEDSpinFlip:
     def test_delta_matrix_structure_and_symmetry(self):
         pytest.importorskip("pyscf")
         from casidapy.kernels.gto import GTOKernel
-        from casidapy.qed import sf_dipole_difference_matrix
+        from casidapy.utils.qed import sf_dipole_difference_matrix
 
         mol, mf = TestSpinFlipGTO._triplet_mf("bhandhlyp")
         kernel = GTOKernel.build_spin_flip(mol, xc="bhandhlyp", use_df=False, mf=mf)
@@ -671,7 +701,7 @@ class TestQEDSpinFlip:
         """λ=0 → eigenvalues are {ω_SF} ∪ {ω_SF + ω_c}."""
         pytest.importorskip("pyscf")
         from casidapy.kernels.gto import GTOKernel
-        from casidapy.qed import solve_qed_sf_tda
+        from casidapy.utils.qed import solve_qed_sf_tda
 
         mol, mf = TestSpinFlipGTO._triplet_mf("bhandhlyp")
         kernel = GTOKernel.build_spin_flip(mol, xc="bhandhlyp", use_df=False, mf=mf)
@@ -698,7 +728,7 @@ class TestQEDSpinFlip:
     def test_qed_sf_smoke_and_guards(self):
         pytest.importorskip("pyscf")
         from casidapy.kernels.gto import GTOKernel
-        from casidapy.qed import (
+        from casidapy.utils.qed import (
             build_qed_tda_matrix,
             solve_qed_sf_tda,
             solve_qed_tda,
@@ -743,7 +773,7 @@ class TestTrackStates:
 
     @staticmethod
     def _res(omega, phot, X=None):
-        from casidapy.qed import QEDResults
+        from casidapy.utils.qed import QEDResults
 
         omega = np.asarray(omega, dtype=float)
         n = omega.shape[0]
@@ -758,7 +788,7 @@ class TestTrackStates:
         )
 
     def test_energy_tracking_follows_adiabatic_order(self):
-        from casidapy.qed import track_states
+        from casidapy.utils.qed import track_states
 
         pts = [
             self._res([1.0, 2.0], [0.0, 1.0]),
@@ -774,7 +804,7 @@ class TestTrackStates:
         np.testing.assert_allclose(phot_p[:, 1], [1.0, 1.0, 1.0])
 
     def test_auto_falls_back_on_garbage_overlap(self):
-        from casidapy.qed import track_states
+        from casidapy.utils.qed import track_states
 
         rng = np.random.default_rng(1)
         X1 = rng.normal(size=(2, 2))
@@ -794,7 +824,7 @@ class TestTripletGTO:
     def test_triplet_tda_matches_pyscf(self):
         pytest.importorskip("pyscf")
         from pyscf import gto, dft
-        from casidapy.pyscf_adapter import extract_gto_kernel
+        from casidapy.adapter.pyscf import extract_gto_kernel
         from casidapy.casida_engine import run_casida
 
         mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="6-31g", verbose=0)
@@ -824,7 +854,7 @@ class TestSOC:
     def test_soc_ao_hermitian(self):
         pytest.importorskip("pyscf")
         from pyscf import gto
-        from casidapy.soc import soc_ao_integrals
+        from casidapy.utils.soc import soc_ao_integrals
 
         mol = gto.M(atom="C 0 0 0; O 0 0 1.2", basis="sto-3g", verbose=0)
         h = soc_ao_integrals(mol)
@@ -833,7 +863,7 @@ class TestSOC:
             assert np.allclose(h[k], h[k].conj().T, atol=1e-10)
 
     def test_si_recovers_uncoupled_when_h_zero(self):
-        from casidapy.soc import build_soc_si_matrix
+        from casidapy.utils.soc import build_soc_si_matrix
 
         omega_s = np.array([0.1, 0.2])
         omega_t = np.array([0.15])
@@ -848,9 +878,9 @@ class TestSOC:
         """Formaldehyde: SOC mixes S/T; few-level QED sees borrowed dipoles."""
         pytest.importorskip("pyscf")
         from pyscf import gto, dft
-        from casidapy.pyscf_adapter import extract_gto_kernel
+        from casidapy.adapter.pyscf import extract_gto_kernel
         from casidapy.casida_engine import run_casida
-        from casidapy.soc import solve_soc_si, solve_soc_qed_levels
+        from casidapy.utils.soc import solve_soc_si, solve_soc_qed_levels
 
         mol = gto.M(
             atom="""
@@ -897,7 +927,7 @@ class TestSOC:
         if np.any(phot_dom):
             assert float(np.max(qed["f"][phot_dom])) < 1e-8
 
-        from casidapy.soc import (
+        from casidapy.utils.soc import (
             solve_soc_qed,
             solve_soc_qed_pf,
             build_soc_qed_pf_matrix,
@@ -970,7 +1000,7 @@ class TestSOC:
     def test_qed_post_on_tddft_synthetic(self):
         """JC/TC/PF post-processing on fake TDDFT eigenstates."""
         from types import SimpleNamespace
-        from casidapy.qed import solve_qed_post
+        from casidapy.utils.qed import solve_qed_post
 
         omega = np.array([0.15, 0.22, 0.30])
         mu = np.array([[0.0, 0.0, 1.0], [0.5, 0.0, 0.0], [0.0, 0.1, 0.0]])
@@ -1113,7 +1143,7 @@ class TestGTOGPUAcceleration:
             pytest.skip("CuPy is installed; cannot test the missing-CuPy error")
         except ImportError:
             pass
-        from casidapy.pyscf_adapter import extract_gto_kernel
+        from casidapy.adapter.pyscf import extract_gto_kernel
 
         mf = _h2_rks()
         with pytest.raises(ImportError, match="requires CuPy"):
@@ -1128,7 +1158,7 @@ class TestGTOGPUAcceleration:
         except Exception:
             pytest.skip("CuPy installed but no usable CUDA device")
 
-        from casidapy.pyscf_adapter import extract_gto_kernel
+        from casidapy.adapter.pyscf import extract_gto_kernel
 
         mf = _h2_rks("pbe")
         k_cpu, _ = extract_gto_kernel(
@@ -1276,7 +1306,7 @@ class TestFullCasidaWorkflow:
 
     def test_run_casida_in_memory(self):
         from casidapy.casida_engine import run_casida_in_memory
-        from casidapy.qepy_adapter import extract_casida_inputs_from_qepy_driver
+        from casidapy.adapter.qepy import extract_casida_inputs_from_qepy_driver
 
         inputs, options = extract_casida_inputs_from_qepy_driver(
             self.driver, self.atoms
@@ -1290,8 +1320,8 @@ class TestFullCasidaWorkflow:
 
     def test_manual_workflow(self):
         from casidapy.casida_engine import CasidaKS_MPI
-        from casidapy.casida_utils import normalize_wavefunctions
-        from casidapy.qepy_adapter import (
+        from casidapy.utils.casida_utils import normalize_wavefunctions
+        from casidapy.adapter.qepy import (
             extract_casida_inputs_from_qepy_driver,
             slice_active_space,
         )
@@ -1457,7 +1487,7 @@ class TestSelectActiveFragments:
 
 class TestNACWrapper:
     def test_import_and_missing_gpu4pyscf(self):
-        from casidapy.nac import solve_nac, NACResults, _require_gpu4pyscf
+        from casidapy.utils.nac import solve_nac, NACResults, _require_gpu4pyscf
         import importlib.util
 
         if importlib.util.find_spec("gpu4pyscf") is None:
@@ -1469,7 +1499,7 @@ class TestNACWrapper:
         assert abs(r.omega_ev[1] - 0.1 * 27.211386245988) < 1e-10
 
     def test_as_numpy_cupy_or_list(self):
-        from casidapy.nac import _as_numpy
+        from casidapy.utils.nac import _as_numpy
 
         assert _as_numpy(None) is None
         a = _as_numpy([[1.0, 2.0, 3.0]])
@@ -1505,7 +1535,7 @@ class TestNACWrapper:
 
 class TestProjectedQEDNAC:
     def test_assemble_and_project_algebra(self):
-        from casidapy.nac import (
+        from casidapy.utils.nac import (
             assemble_electronic_nac_tensor,
             project_polariton_nac,
             project_qed_nac,
@@ -1542,7 +1572,7 @@ class TestProjectedQEDNAC:
         assert np.allclose(res.de, d12)
 
     def test_jc_post_weights_and_projection(self):
-        from casidapy.nac import (
+        from casidapy.utils.nac import (
             assemble_electronic_nac_tensor,
             electronic_weights_qed_post,
             solve_qed_projected_nac,
@@ -1577,7 +1607,7 @@ class TestProjectedQEDNAC:
         assert np.allclose(nac.de, 0.0, atol=1e-12)
 
     def test_pf_post_weights_add_photon_sectors(self):
-        from casidapy.nac import electronic_weights_qed_post
+        from casidapy.utils.nac import electronic_weights_qed_post
 
         # n_el=2 (GS + S1), 2 photon sectors → V shape (4, 1)
         V = np.zeros((4, 1))
@@ -1599,7 +1629,7 @@ class TestProjectedQEDNAC:
 
     def test_dense_weights_via_casida_Z(self):
         from types import SimpleNamespace
-        from casidapy.nac import electronic_weights_qed_dense
+        from casidapy.utils.nac import electronic_weights_qed_dense
 
         rng = np.random.default_rng(0)
         n_trans, n_cas, n_pol = 5, 3, 2
@@ -1615,7 +1645,7 @@ class TestProjectedQEDNAC:
 
     def test_sf_qed_weights_and_projection(self):
         from types import SimpleNamespace
-        from casidapy.nac import (
+        from casidapy.utils.nac import (
             assemble_electronic_nac_tensor,
             electronic_weights_qed_sf,
             solve_qed_projected_nac,
@@ -1653,3 +1683,70 @@ class TestProjectedQEDNAC:
         nac = solve_qed_projected_nac(qed2, d_el, states=(0, 1), casida=cas)
         assert nac.meta.get("spin_flip") is True
         assert np.allclose(nac.de, d12, atol=1e-10)
+
+
+class TestDipoleDipoleBlock:
+    """Far-field (Förster) coupling block from transition dipoles."""
+
+    def test_head_to_tail(self):
+        from casidapy.subsystem_coupling import dipole_dipole_block
+        R = 4.0
+        K = dipole_dipole_block([[0, 0, 1]], [[0, 0, 1]], [0, 0, 0], [0, 0, R])
+        assert np.isclose(K[0, 0], -2.0 / R**3)   # (1 - 3)/R^3
+
+    def test_parallel_perpendicular(self):
+        from casidapy.subsystem_coupling import dipole_dipole_block
+        R = 4.0
+        K = dipole_dipole_block([[1, 0, 0]], [[1, 0, 0]], [0, 0, 0], [0, 0, R])
+        assert np.isclose(K[0, 0], 1.0 / R**3)     # (1 - 0)/R^3
+
+    def test_orthogonal_dipoles_zero(self):
+        from casidapy.subsystem_coupling import dipole_dipole_block
+        K = dipole_dipole_block([[1, 0, 0]], [[0, 1, 0]], [0, 0, 0], [0, 0, 4.0])
+        assert np.isclose(K[0, 0], 0.0)
+
+    def test_inverse_cube_scaling(self):
+        from casidapy.subsystem_coupling import dipole_dipole_block
+        a = dipole_dipole_block([[1, 0, 0]], [[1, 0, 0]], [0, 0, 0], [0, 0, 4.0])[0, 0]
+        b = dipole_dipole_block([[1, 0, 0]], [[1, 0, 0]], [0, 0, 0], [0, 0, 8.0])[0, 0]
+        assert np.isclose(a / b, 8.0)
+
+    def test_origin_independence(self):
+        from casidapy.subsystem_coupling import dipole_dipole_block
+        R = 4.0
+        s = np.array([3.0, -1.0, 2.0])
+        k1 = dipole_dipole_block([[0, 0, 1]], [[0, 0, 1]], [0, 0, 0], [0, 0, R])[0, 0]
+        k2 = dipole_dipole_block([[0, 0, 1]], [[0, 0, 1]], s, s + np.array([0, 0, R]))[0, 0]
+        assert np.isclose(k1, k2)
+
+    def test_block_shape(self):
+        from casidapy.subsystem_coupling import dipole_dipole_block
+        mu_I = np.random.RandomState(0).randn(4, 3)
+        mu_J = np.random.RandomState(1).randn(6, 3)
+        K = dipole_dipole_block(mu_I, mu_J, [0, 0, 0], [0, 0, 5.0])
+        assert K.shape == (4, 6)
+        # symmetry: K[I,J] == K[J,I]^T (same tensor)
+        K2 = dipole_dipole_block(mu_J, mu_I, [0, 0, 5.0], [0, 0, 0])
+        assert np.allclose(K, K2.T)
+
+
+class TestUnionBoxGeometry:
+    """Pure index math behind the memory-saving rangesep_box SR grid."""
+
+    def test_place_matches_global_slice(self):
+        # placing a subcell into the union box == slicing the box out of the full grid
+        from casidapy.subsystem_coupling import _place_in_box
+        nrR = (20, 20, 20)
+        box_shift, box_shape = (1, 1, 1), (16, 9, 8)
+        sub = np.arange(216, dtype=float).reshape(6, 6, 6)
+        full = np.zeros(nrR)
+        full[2:8, 2:8, 2:8] = sub
+        via_box = _place_in_box(sub, (2, 2, 2), box_shift, box_shape)
+        via_full = full[1:17, 1:10, 1:9]
+        assert np.array_equal(via_box, via_full)
+
+    def test_place_clips_and_conserves(self):
+        from casidapy.subsystem_coupling import _place_in_box
+        assert _place_in_box(np.ones((6, 6, 6)), (2, 2, 2), (1, 1, 1), (16, 9, 8)).sum() == 216
+        assert _place_in_box(np.ones((6, 6, 6)), (0, 0, 0), (2, 2, 2), (6, 6, 6)).sum() == 64  # clipped
+        assert _place_in_box(np.ones((3, 3, 3)), (0, 0, 0), (10, 10, 10), (5, 5, 5)).sum() == 0  # disjoint

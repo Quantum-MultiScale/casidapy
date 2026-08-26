@@ -7,9 +7,17 @@ from casidapy.casida_engine import (
     CasidaKS_MPI,
 )
 from casidapy.kernels import KernelBackend, PlaneWaveKernel, GTOKernel
-from casidapy.qepy_adapter import slice_active_space, build_uspp_map_from_driver
-from casidapy.pyscf_adapter import extract_gto_kernel, extract_sf_gto_kernel
-from casidapy.qed import (
+from casidapy.adapter.qepy import (
+    slice_active_space,
+    build_uspp_map_from_driver,
+    extract_pw_kernel,
+)
+from casidapy.adapter.pyscf import (
+    extract_gto_kernel,
+    extract_sf_gto_kernel,
+    build_spin_flip_kernel,
+)
+from casidapy.utils.qed import (
     QEDOptions,
     QEDResults,
     build_qed_tda_matrix,
@@ -28,7 +36,7 @@ from casidapy.qed import (
     qed_electronic_A_rows,
     qed_tda_apply,
 )
-from casidapy.soc import (
+from casidapy.utils.soc import (
     SOCResults,
     soc_ao_integrals,
     solve_soc_si,
@@ -37,7 +45,7 @@ from casidapy.soc import (
     solve_soc_qed_pf,
     build_soc_qed_pf_matrix,
 )
-from casidapy.stddft_bridge import STDDFTBridge
+from casidapy.adapter.stddft import STDDFTBridge
 from casidapy.subsystem_coupling import (
     compute_nadd_kernel,
     compute_coupling_block,
@@ -45,7 +53,7 @@ from casidapy.subsystem_coupling import (
     coupled_oscillator_strengths,
     run_subsystem_casida,
 )
-from casidapy.nac import (
+from casidapy.utils.nac import (
     NACResults,
     build_tddft,
     solve_nac,
@@ -61,7 +69,53 @@ from casidapy.nac import (
     electronic_weights_qed_dense,
     electronic_weights_qed_sf,
 )
-from casidapy.uspp import (
+from casidapy.xas import (
+    CoreOrbitals,
+    FragmentSpec,
+    align_core_to_reference,
+    apply_core_gauge_shift,
+    apply_orbital_soc,
+    build_pw_kernel_from_qepy,
+    core_from_mf,
+    core_mos_to_pw_fields,
+    extract_fragment_core,
+    formal_oxidation_charge,
+    frozen_shells_from_pp,
+    inject_core_orbitals,
+    reconstruct_core_from_driver,
+    resolve_oxidation_state,
+    run_cvs_gto_from_mf,
+    run_cvs_tda,
+    run_reconstruct_cvs_from_driver,
+    scf_ae_core_semicore,
+    select_atoms_in_radius,
+    select_neutral_first_shell,
+    select_xas_fragment,
+)
+from casidapy import xas  # modular XAS facade (run_xas_gto, plot_sticks, ...)
+from casidapy import embed  # AE embedding (Hirshfeld / ionic peel)
+from casidapy import adapter  # QE / PySCF / STDDFT bridges
+from casidapy import utils  # Casida helpers, Davidson, NAC, QED, SOC, USPP
+from casidapy.embed import (
+    DEFAULT_EMBED_MODE,
+    DEFAULT_GAUGE_ALIGN,
+    DEFAULT_R_DAMP,
+    DEFAULT_VLOC_SOURCE,
+    auto_vhxc_scale,
+    build_ae_embedding_potential,
+    build_hirshfeld_embedding,
+    density_functional_potential_ha,
+    effective_potential_ha,
+    hirshfeld_weights_and_partition,
+    local_pp_total_ha,
+    read_upf_local_potential,
+    read_upf_rhoatom,
+    read_upf_z_valence,
+    resolve_vhxc_scale,
+    shift_v_env_gauge_at,
+    vloc_atom_from_qepy,
+)
+from casidapy.utils.uspp import (
     load_uspp_data,
     parse_upf,
     setup_uspp,
@@ -84,8 +138,10 @@ __all__ = [
     "run_casida",
     "slice_active_space",
     "build_uspp_map_from_driver",
+    "extract_pw_kernel",
     "extract_gto_kernel",
     "extract_sf_gto_kernel",
+    "build_spin_flip_kernel",
     "QEDOptions",
     "QEDResults",
     "build_qed_tda_matrix",
@@ -129,6 +185,48 @@ __all__ = [
     "electronic_weights_qed_post",
     "electronic_weights_qed_dense",
     "electronic_weights_qed_sf",
+    "CoreOrbitals",
+    "FragmentSpec",
+    "select_atoms_in_radius",
+    "select_neutral_first_shell",
+    "select_xas_fragment",
+    "formal_oxidation_charge",
+    "core_from_mf",
+    "extract_fragment_core",
+    "apply_orbital_soc",
+    "core_mos_to_pw_fields",
+    "inject_core_orbitals",
+    "run_cvs_tda",
+    "run_cvs_gto_from_mf",
+    "build_pw_kernel_from_qepy",
+    "xas",
+    "embed",
+    "adapter",
+    "utils",
+    "build_ae_embedding_potential",
+    "auto_vhxc_scale",
+    "resolve_vhxc_scale",
+    "scf_ae_core_semicore",
+    "reconstruct_core_from_driver",
+    "run_reconstruct_cvs_from_driver",
+    "apply_core_gauge_shift",
+    "align_core_to_reference",
+    "shift_v_env_gauge_at",
+    "DEFAULT_EMBED_MODE",
+    "DEFAULT_R_DAMP",
+    "DEFAULT_GAUGE_ALIGN",
+    "DEFAULT_VLOC_SOURCE",
+    "build_hirshfeld_embedding",
+    "hirshfeld_weights_and_partition",
+    "read_upf_rhoatom",
+    "frozen_shells_from_pp",
+    "vloc_atom_from_qepy",
+    "effective_potential_ha",
+    "density_functional_potential_ha",
+    "local_pp_total_ha",
+    "read_upf_local_potential",
+    "read_upf_z_valence",
+    "resolve_oxidation_state",
     "load_uspp_data",
     "parse_upf",
     "setup_uspp",

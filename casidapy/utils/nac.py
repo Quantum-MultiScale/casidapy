@@ -8,8 +8,8 @@ no TDDFT NAC in stock PySCF.
 (``td.nac_method()`` / ``td.NAC()`` → ``.kernel(states=...)``).
 
 **CPU-native ground<->excited TDA NAC** is now available for the GTO/RKS
-path (closed-shell singlet only) in :mod:`casidapy.nac_gto` —
-:func:`casidapy.nac_gto.solve_nac_cpu` builds on the same CPHF/Z-vector
+path (closed-shell singlet only) in :mod:`casidapy.utils.nac_gto` —
+:func:`casidapy.utils.nac_gto.solve_nac_cpu` builds on the same CPHF/Z-vector
 machinery gpu4pyscf uses, ported onto stock CPU PySCF (``pyscf.scf.cphf``,
 ``mf.gen_response``, ``mf.nuc_grad_method()``), and returns the same
 :class:`NACResults` contract (``backend="casidapy-cpu"``). Prefer it when no
@@ -26,7 +26,7 @@ State indexing (gpu4pyscf TDDFT)::
 approximate polariton derivative couplings by contracting electronic TDDFT
 NACVs with the electronic weights of each polariton. Photon / ∂g/∂R pieces
 are neglected. Electronic NACs need either gpu4pyscf (GPU, full scope) or
-``casidapy.nac_gto`` (CPU, ground<->excited TDA only); the QED solve and
+``casidapy.utils.nac_gto`` (CPU, ground<->excited TDA only); the QED solve and
 projection themselves always run on CPU.
 """
 from __future__ import annotations
@@ -693,10 +693,10 @@ def solve_qed_projected_nac(
     Parameters
     ----------
     qed :
-        Either the dict from :func:`~casidapy.qed.solve_qed_post` /
+        Either the dict from :func:`~casidapy.utils.qed.solve_qed_post` /
         ``solve_qed_levels`` / ``solve_qed_pf_post``, or a
-        :class:`~casidapy.qed.QEDResults` from :func:`~casidapy.qed.solve_qed_tda`
-        or :func:`~casidapy.qed.solve_qed_sf_tda`.
+        :class:`~casidapy.utils.qed.QEDResults` from :func:`~casidapy.utils.qed.solve_qed_tda`
+        or :func:`~casidapy.utils.qed.solve_qed_sf_tda`.
         Dense / SF results also need ``casida``
         (:class:`~casidapy.casida_api.CasidaResults`) with eigenvectors ``Z``.
     d_el :

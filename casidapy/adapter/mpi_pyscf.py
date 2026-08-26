@@ -9,7 +9,7 @@ workers — this is **not** SPMD Davidson across ranks.
 
 Use with::
 
-    from casidapy.mpi_pyscf import enable_mpi4pyscf, make_mpi_rks
+    from casidapy.adapter.mpi_pyscf import enable_mpi4pyscf, make_mpi_rks
 
     enable_mpi4pyscf()          # must be early; workers never return
     mf = make_mpi_rks(mol, xc="wb97xd")

@@ -17,7 +17,7 @@ import numpy as np
 
 def main():
     from pyscf import gto, dft
-    from casidapy.pyscf_adapter import extract_gto_kernel
+    from casidapy.adapter.pyscf import extract_gto_kernel
     from casidapy.casida_engine import run_casida
 
     mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="6-31g", verbose=0)
