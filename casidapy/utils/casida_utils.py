@@ -66,6 +66,136 @@ def _bcast_psi_stack(comm, psi_small, root=0):
     return out
 
 
+def grid_slab_bounds(n_flat: int, rank: int, size: int) -> tuple:
+    """Flat real-space slab ``[p0, p1)`` for rank (matches PlaneWaveKernel)."""
+    n_flat = int(n_flat)
+    size = max(int(size), 1)
+    rank = int(rank)
+    base = n_flat // size
+    rem = n_flat % size
+    p0 = rank * base + min(rank, rem)
+    p1 = p0 + base + (1 if rank < rem else 0)
+    return p0, p1
+
+
+def scatter_psi_slabs(comm, psi_full, root=0):
+    """Scatter a root-held ``(n_band, *nr)`` stack into per-rank flat slabs.
+
+    Returns ``(slab, p0, p1, n_flat)`` where ``slab`` has shape
+    ``(n_band, p1 - p0)``.  Root frees the full stack after the send so peak
+    RAM is one full copy + one slab, not a full copy on every rank.
+    """
+    rank = mpi_comm_rank(comm)
+    size = mpi_comm_size(comm)
+
+    if size <= 1:
+        arr = np.ascontiguousarray(psi_full)
+        if arr.ndim > 2:
+            arr = arr.reshape(arr.shape[0], -1)
+        n_flat = int(arr.shape[1])
+        return arr, 0, n_flat, n_flat
+
+    if rank == root:
+        arr = np.ascontiguousarray(psi_full)
+        if arr.ndim > 2:
+            arr = arr.reshape(arr.shape[0], -1)
+        # Casida matvecs / dipoles use real KS orbitals after phase alignment.
+        if np.iscomplexobj(arr):
+            arr = np.ascontiguousarray(arr.real, dtype=np.float64)
+        else:
+            arr = np.ascontiguousarray(arr, dtype=np.float64)
+        n_band, n_flat = int(arr.shape[0]), int(arr.shape[1])
+        meta = (n_band, n_flat, arr.dtype.str)
+    else:
+        arr = None
+        meta = None
+
+    n_band, n_flat, dtype_str = comm.bcast(meta, root=root)
+    dtype = np.dtype(dtype_str)
+    p0, p1 = grid_slab_bounds(n_flat, rank, size)
+    slab = np.empty((n_band, p1 - p0), dtype=dtype)
+
+    # Per-band Send/Recv keeps temporary buffers to one band's slab.
+    for ib in range(n_band):
+        if rank == root:
+            for dest in range(size):
+                d0, d1 = grid_slab_bounds(n_flat, dest, size)
+                chunk = np.ascontiguousarray(arr[ib, d0:d1])
+                if dest == root:
+                    slab[ib] = chunk
+                else:
+                    comm.Send(chunk, dest=dest, tag=ib)
+        else:
+            comm.Recv(slab[ib], source=root, tag=ib)
+
+    if rank == root:
+        del arr
+    return slab, p0, p1, n_flat
+
+
+def scatter_real_band(comm, band_full, dest, root=0, tag=0):
+    """Scatter one real orbital into a preallocated local slab ``dest``.
+
+    ``band_full`` is the full flat charge-grid orbital on ``root`` and ignored
+    elsewhere. ``dest`` has length ``p1 - p0`` for this rank. Only one band is
+    in memory on the root, instead of the whole ``(n_band, *nr)`` stack.
+    """
+    rank = mpi_comm_rank(comm)
+    size = mpi_comm_size(comm)
+    if size <= 1:
+        dest[...] = np.ascontiguousarray(np.asarray(band_full, dtype=np.float64).ravel())
+        return
+    if rank == root:
+        arr = np.ascontiguousarray(np.asarray(band_full, dtype=np.float64).ravel())
+        for dest_rank in range(size):
+            d0, d1 = grid_slab_bounds(arr.size, dest_rank, size)
+            chunk = np.ascontiguousarray(arr[d0:d1])
+            if dest_rank == root:
+                dest[...] = chunk
+            else:
+                comm.Send(chunk, dest=dest_rank, tag=int(tag))
+        del arr
+    else:
+        comm.Recv(dest, source=root, tag=int(tag))
+
+
+def normalize_psi_slabs(psi_list, dV: float, comm=None, inplace: bool = False):
+    """Normalize 1-D slab orbitals (skip ``None`` slots); Allreduce norms.
+
+    Phase/sign must already be consistent across ranks (root-aligned before
+    scatter); do not flip signs locally.
+
+    With ``inplace=True``, writeable contiguous float64 slabs are scaled in
+    place, so rows of a packed orbital array stay rows of that array.
+    """
+    from mpi4py import MPI
+
+    size = mpi_comm_size(comm)
+    out = list(psi_list)
+    for i, p in enumerate(out):
+        if p is None:
+            continue
+        local = np.asarray(p, dtype=np.float64).ravel()
+        n2 = float(np.dot(local, local) * dV)
+        if size > 1 and comm is not None:
+            n2 = float(comm.allreduce(n2, op=MPI.SUM))
+        if n2 <= 0.0:
+            raise ValueError(f"orbital {i} has zero norm on slab")
+        scale = 1.0 / np.sqrt(n2)
+        if (
+            inplace
+            and isinstance(p, np.ndarray)
+            and p.dtype == np.float64
+            and p.ndim == 1
+            and p.flags["C_CONTIGUOUS"]
+            and p.flags["WRITEABLE"]
+        ):
+            p *= scale
+        else:
+            out[i] = local * scale
+    return out
+
+
 def build_energy_differences(occ_e, unocc_e) -> np.ndarray:
     """Return flattened ΔE[ia] = ε_a - ε_i for the active space."""
     n_occ = len(occ_e)
@@ -100,15 +230,66 @@ def field_integral(field_a, field_b, dV, xp=np):
     return float(xp.sum(field_a * field_b).real * dV)
 
 
+def total_density_for_alda(rho_ks):
+    """Collapse QE/DFTpy spin density to a rank-1 total ρ for singlet ALDA.
+
+    Casida ``K`` is spin-restricted here.  Collinear ``nspin=2`` densities
+    arrive as DFTpy ``rank=2`` fields ``(nspin, nx, ny, nz)``.  DFTpy's
+    polarized ``v2rho2`` is then rank-3 ``(f_uu, f_ud, f_dd)``, which cannot
+    broadcast against ρ in :func:`filtered`.
+
+    Packing heuristic (matches QEpy LSDA + the XAS embedding path):
+
+    * both channels non-negative → treat as ``(ρ↑, ρ↓)`` and sum;
+    * otherwise treat channel 0 as total density (QE ``rho(:,1)`` total /
+      ``rho(:,2)`` magnetization in some builds).
+    """
+    if not isinstance(rho_ks, DirectField):
+        raise TypeError(f"rho_ks must be a DirectField, got {type(rho_ks)}")
+    arr = np.asarray(rho_ks, dtype=np.float64)
+    grid = rho_ks.grid
+    if arr.ndim == 3 or int(getattr(rho_ks, "rank", 1) or 1) == 1:
+        if arr.ndim == 3:
+            return rho_ks
+        return DirectField(grid, rank=1, griddata_3d=arr)
+    if arr.ndim != 4:
+        raise ValueError(f"unexpected density shape {arr.shape}")
+    ns = int(arr.shape[0])
+    if ns == 1:
+        return DirectField(grid, rank=1, griddata_3d=arr[0])
+    if ns == 2:
+        if float(np.min(arr[1])) < -1.0e-12:
+            data = arr[0]
+        else:
+            data = arr[0] + arr[1]
+        return DirectField(grid, rank=1, griddata_3d=np.asarray(data, dtype=np.float64))
+    # Rare: already (total, up, down) or similar — prefer channel 0 if it
+    # looks like total, else sum.
+    data = arr[0] if float(np.min(arr[0])) >= -1.0e-12 else np.sum(arr, axis=0)
+    return DirectField(grid, rank=1, griddata_3d=np.asarray(data, dtype=np.float64))
+
+
 def _as_scalar_field_on_grid(grid, obj):
     """
     Return a DirectField(rank=1) living on 'grid' from various possible inputs.
     Accepts:
-      - DirectField
+      - DirectField (rank-1, or spin ``v2rho2`` rank-2/3 collapsed to singlet)
       - ndarray shaped like grid.nr
       - list/tuple like [up, down] where each is ndarray/DirectField
     """
     if isinstance(obj, DirectField):
+        arr = np.asarray(obj)
+        if arr.ndim == 3:
+            return obj
+        if arr.ndim == 4 and arr.shape[0] == 3:
+            # LSDA singlet kernel: (f_uu + f_dd + 2 f_ud) / 4
+            data = 0.25 * (arr[0] + arr[2] + 2.0 * arr[1])
+            return DirectField(grid, rank=1, griddata_3d=data)
+        if arr.ndim == 4 and arr.shape[0] == 2:
+            data = 0.5 * (arr[0] + arr[1])
+            return DirectField(grid, rank=1, griddata_3d=data)
+        if arr.ndim == 4 and arr.shape[0] == 1:
+            return DirectField(grid, rank=1, griddata_3d=arr[0])
         return obj
 
     # Spin-like container: [up, down]
@@ -151,9 +332,25 @@ def normalize_wavefunctions(psi_list, grid):
 def filtered(f, f_max, rho, cut):
     """
     Zero the kernel where density is below ``cut``, then clip to ``[-f_max, f_max]``.
+
+    ``rho`` may be spin-polarized ``(nspin, nx, ny, nz)``; the cutoff uses the
+    total density so it always broadcasts against a scalar ``f_xc``.
     """
     f_arr = np.asarray(f).copy()
     rho_arr = np.asarray(rho)
+    if rho_arr.ndim == 4:
+        if rho_arr.shape[0] == 2 and float(np.min(rho_arr[1])) >= -1.0e-12:
+            rho_arr = rho_arr[0] + rho_arr[1]
+        else:
+            rho_arr = rho_arr[0]
+    if f_arr.ndim == 4:
+        # Defensive: polarized v2rho2 → singlet scalar
+        if f_arr.shape[0] == 3:
+            f_arr = 0.25 * (f_arr[0] + f_arr[2] + 2.0 * f_arr[1])
+        elif f_arr.shape[0] == 2:
+            f_arr = 0.5 * (f_arr[0] + f_arr[1])
+        else:
+            f_arr = f_arr[0]
     f_arr = np.where(rho_arr > cut, f_arr, 0.0)
     f_arr = np.clip(f_arr, -f_max, f_max)
     return f_arr
@@ -252,17 +449,27 @@ def proj_overlap(beta, grid, psi):
     Compute projector overlaps <beta_n|psi_k> for all projectors and states.
 
     Returns array of shape (n_projectors, n_states).
+    ``beta[n]`` may be a dense field or a :class:`SparseGridField`.
     """
+    from casidapy.utils.uspp import SparseGridField
+
     n_p = len(beta)
     n_s = len(psi)
     dV = float(grid.dV)
     out = np.zeros((n_p, n_s), dtype=complex)
 
     for n in range(n_p):
-        b = np.asarray(beta[n])
-        for k in range(n_s):
-            p = np.asarray(psi[k])
-            out[n, k] = np.sum(b.conj() * p) * dV
+        b = beta[n]
+        if isinstance(b, SparseGridField):
+            b_idx, b_val = b.indices, b.values
+            for k in range(n_s):
+                p = np.asarray(psi[k]).ravel(order="C")
+                out[n, k] = np.vdot(b_val, p[b_idx]) * dV
+        else:
+            b_arr = np.asarray(b).ravel(order="C")
+            for k in range(n_s):
+                p = np.asarray(psi[k]).ravel(order="C")
+                out[n, k] = np.vdot(b_arr, p) * dV
     return out
 
 
@@ -274,20 +481,30 @@ def rho_aug(grid, qij, p_i, p_a, threshold=1e-30):
     Parameters
     ----------
     grid : DirectGrid
-    qij : list of lists of DirectField
-        Q_nm augmentation charges
+    qij : list of lists
+        Q_nm augmentation charges (DirectField, SparseGridField, or None)
     p_i : array (n_proj,)
         Projector overlaps <beta_n|psi_i>
     p_a : array (n_proj,)
         Projector overlaps <beta_m|psi_a>
     """
+    from casidapy.utils.uspp import SparseGridField
+
     n_p = len(p_i)
     rho = np.zeros(grid.nr, dtype=float)
+    rho_flat = rho.ravel(order="C")
     for n in range(n_p):
         for m in range(n_p):
+            q = qij[n][m]
+            if q is None:
+                continue
             c = (p_i[n].conj() * p_a[m]).real
-            if abs(c) > threshold:
-                rho += c * np.asarray(qij[n][m])
+            if abs(c) <= threshold:
+                continue
+            if isinstance(q, SparseGridField):
+                rho_flat[q.indices] += c * q.values
+            else:
+                rho += c * np.asarray(q)
     return DirectField(grid, rank=1, griddata_3d=rho)
 
 
@@ -296,14 +513,24 @@ def add_aug_contribution(accum, qij, proj_left, proj_right, scalar=1.0, threshol
     Add augmentation contribution into an existing array-like accumulator:
       accum += scalar * sum_nm conj(proj_left[n]) * proj_right[m] * Q_nm
     """
+    from casidapy.utils.uspp import SparseGridField
+
     n_p = len(proj_left)
+    accum_arr = xp.asarray(accum)
+    flat = accum_arr.ravel()
     for n in range(n_p):
         for m in range(n_p):
+            q = qij[n][m]
+            if q is None:
+                continue
             coeff = (xp.conj(proj_left[n]) * proj_right[m]).real
             coeff_val = float(coeff)
             if abs(coeff_val) > threshold:
-                accum += scalar * coeff_val * qij[n][m]
-    return accum
+                if isinstance(q, SparseGridField):
+                    flat[q.indices] += scalar * coeff_val * q.values
+                else:
+                    accum_arr += scalar * coeff_val * xp.asarray(q)
+    return accum_arr
 
 
 def augmentation_integral(response_field, qij, proj_left, proj_right, dV, threshold=1e-30, xp=np):
@@ -313,14 +540,23 @@ def augmentation_integral(response_field, qij, proj_left, proj_right, dV, thresh
     Used in Casida matrix element computation where the response (Hartree/XC potential)
     must include augmentation charge contributions.
     """
+    from casidapy.utils.uspp import SparseGridField
+
     n_p = len(proj_left)
     total = 0.0
+    resp = xp.asarray(response_field).ravel()
     for n in range(n_p):
         for m in range(n_p):
+            q = qij[n][m]
+            if q is None:
+                continue
             coeff = (xp.conj(proj_left[n]) * proj_right[m]).real
             coeff_val = float(coeff)
             if abs(coeff_val) > threshold:
-                q_int = xp.sum(qij[n][m] * response_field).real * dV
-                total += coeff_val * float(q_int)
+                if isinstance(q, SparseGridField):
+                    q_int = float(xp.sum(q.values * resp[q.indices]).real) * dV
+                else:
+                    q_int = float(xp.sum(xp.asarray(q).ravel() * resp).real) * dV
+                total += coeff_val * q_int
     return total
 

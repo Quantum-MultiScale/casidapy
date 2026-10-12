@@ -136,8 +136,25 @@ def permanent_dipole(
     ``NUCLEAR_DIPOLE_SIGN`` (or ``nuclear_sign`` override) so the origin-
     invariance test can resolve the relative sign empirically.
     """
-    mol = kernel.mol
     orig = np.asarray(origin, dtype=float).ravel()
+
+    # Plane-wave / grid kernel: electronic permanent dipole from the KS density.
+    if getattr(kernel, "mol", None) is None:
+        if not hasattr(kernel, "permanent_dipole_el"):
+            raise TypeError(
+                "kernel has neither a PySCF .mol (GTO) nor permanent_dipole_el "
+                "(plane-wave) — cannot compute the permanent dipole."
+            )
+        el = np.asarray(kernel.permanent_dipole_el(origin=tuple(orig)), dtype=float)
+        if not include_nuclear:
+            return el
+        raise NotImplementedError(
+            "permanent_dipole(include_nuclear=True) is not supported for the "
+            "plane-wave kernel; the coherent-state shift uses the electronic "
+            "dipole (include_nuclear=False)."
+        )
+
+    mol = kernel.mol
     mf = getattr(kernel, "_mf", None)
     if mf is not None and hasattr(mf, "make_rdm1"):
         dm = np.asarray(mf.make_rdm1(), dtype=float)
@@ -189,11 +206,47 @@ def dipole_blocks(
             "dipole_blocks is for closed-shell QED; use "
             "sf_dipole_difference_matrix for QED-SF-TDA."
         )
-    mol, C_o, C_v = kernel.mol, kernel._C_o, kernel._C_v
     lam = np.asarray(lam_vec, dtype=float).ravel()
     if lam.shape != (3,):
         raise ValueError(f"lam_vec must have shape (3,), got {lam.shape}")
     orig = tuple(np.asarray(origin, dtype=float).ravel())
+
+    # Plane-wave / grid kernels have no PySCF ``mol``; they expose grid-based MO
+    # dipole blocks instead. This is what enables in-calculation QED-TDDFT (PF)
+    # for the plane-wave backend.
+    if getattr(kernel, "mol", None) is None:
+        if not hasattr(kernel, "mo_dipole_blocks"):
+            raise TypeError(
+                "kernel has neither a PySCF .mol (GTO) nor mo_dipole_blocks "
+                "(plane-wave) — cannot build dipole blocks."
+            )
+        d_oo, d_vv, d_ov = kernel.mo_dipole_blocks(origin=orig)  # (3,o,o),(3,v,v),(3,o,v)
+        q_ov = np.einsum("x,xia->ia", lam, d_ov, optimize=True)
+        Q_oo = np.einsum("x,xij->ij", lam, d_oo, optimize=True)
+        Q_vv = np.einsum("x,xab->ab", lam, d_vv, optimize=True)
+        if coherent_state:
+            mu0_el = np.asarray(kernel.permanent_dipole_el(origin=orig), dtype=float)
+            # Electron count from the KS density on the grid. (Do not use
+            # kernel.nelectron: it does np.asarray(rho).integral(), which drops
+            # the DirectField .integral method and raises.)
+            nelec = 0.0
+            rho = getattr(kernel, "rho", None)
+            if rho is not None:
+                try:
+                    nelec = float(rho.integral())
+                except Exception:
+                    nelec = float(np.sum(np.asarray(rho)) * float(kernel.grid.dV))
+            if nelec < 1e-12:
+                raise ValueError(
+                    "Could not determine the electron count for the coherent-"
+                    "state shift from the plane-wave kernel density."
+                )
+            shift = float(np.dot(lam, mu0_el)) / nelec
+            Q_oo = Q_oo - shift * np.eye(Q_oo.shape[0])
+            Q_vv = Q_vv - shift * np.eye(Q_vv.shape[0])
+        return q_ov.ravel(), Q_oo, Q_vv
+
+    mol, C_o, C_v = kernel.mol, kernel._C_o, kernel._C_v
 
     with mol.with_common_orig(orig):
         dip_ao = mol.intor("int1e_r", comp=3)
@@ -1545,6 +1598,189 @@ def solve_qed_pf_post(
         "include_dse": bool(include_dse),
         "include_ground_slot": bool(include_ground_slot),
         "model": "pauli-fierz",
+        "postprocess": True,
+    }
+
+
+def state_basis_dipole_matrix(
+    Z: np.ndarray,
+    d_oo: np.ndarray,
+    d_vv: np.ndarray,
+    d_ov: np.ndarray,
+    *,
+    mu0: Sequence[float] = (0.0, 0.0, 0.0),
+    nstates: Optional[int] = None,
+) -> np.ndarray:
+    """Full dipole matrix ``⟨S_j|r|S_k⟩`` in the ``{ground, excited states}`` basis.
+
+    Built from the TDA Casida eigenvectors ``Z`` (transition basis, flattened
+    ``ia = i*n_unocc + a``) and the MO dipole blocks ``d_oo, d_vv, d_ov`` (each
+    ``(3, ·, ·)`` from :meth:`PlaneWaveKernel.mo_dipole_blocks`). Index 0 is the
+    ground state; the returned array is ``(3, N+1, N+1)`` with ``N`` excited
+    states::
+
+        ⟨S_0|r|S_k⟩ = √2 Σ_ia X^k_ia ⟨i|r|a⟩                         (transition)
+        ⟨S_j|r|S_k⟩ = δ_jk μ0 + Σ_ab P^{jk}_vv ⟨a|r|b⟩ − Σ_mn P^{jk}_oo ⟨m|r|n⟩
+
+    with ``P^{jk}_vv = Σ_i X^j_{ia} X^k_{ib}``, ``P^{jk}_oo = Σ_a X^j_{ma} X^k_{na}``.
+    The diagonal ``⟨S_k|r|S_k⟩ = μ0 + Δμ_k`` is the excited-state permanent
+    dipole; the off-diagonal are state-to-state transition dipoles. These are the
+    excited-state dipoles that :func:`solve_qed_pf_post` omits.
+    """
+    Z = np.asarray(Z, dtype=float)
+    d_oo = np.asarray(d_oo, dtype=float)
+    d_vv = np.asarray(d_vv, dtype=float)
+    d_ov = np.asarray(d_ov, dtype=float)
+    n_o, n_v = d_oo.shape[1], d_vv.shape[1]
+    n_s = Z.shape[1]
+    if nstates is not None:
+        n_s = min(int(nstates), n_s)
+        Z = Z[:, :n_s]
+    if Z.shape[0] != n_o * n_v:
+        raise ValueError(f"Z has {Z.shape[0]} transitions but n_occ*n_unocc={n_o*n_v}")
+    mu0 = np.asarray(mu0, dtype=float).ravel()
+    X = Z.reshape(n_o, n_v, n_s)  # X[i, a, k]
+
+    N = n_s + 1
+    D = np.zeros((3, N, N), dtype=float)
+    D[:, 0, 0] = mu0
+    trans = np.sqrt(2.0) * np.einsum("iak,xia->xk", X, d_ov, optimize=True)  # (3, n_s)
+    D[:, 0, 1:] = trans
+    D[:, 1:, 0] = trans
+    Pvv = np.einsum("iaj,ibk->jkab", X, X, optimize=True)  # (n_s, n_s, n_v, n_v)
+    Poo = np.einsum("maj,nak->jkmn", X, X, optimize=True)  # (n_s, n_s, n_o, n_o)
+    ss = (np.einsum("jkab,xab->xjk", Pvv, d_vv, optimize=True)
+          - np.einsum("jkmn,xmn->xjk", Poo, d_oo, optimize=True))  # (3, n_s, n_s)
+    D[:, 1:, 1:] = ss
+    for k in range(n_s):
+        D[:, 1 + k, 1 + k] += mu0  # μ_exc = μ0 + Δμ_k on the diagonal
+    return D
+
+
+def solve_qed_pf_full(
+    omega: np.ndarray,
+    mu_matrix: np.ndarray,
+    lam_vec: Sequence[float],
+    omega_c: float,
+    *,
+    include_dse: bool = True,
+) -> Dict[str, Any]:
+    """Pauli–Fierz on electronic eigenstates using the **full** dipole matrix.
+
+    Unlike :func:`solve_qed_pf_post` (which keeps only S₀↔excited dipoles and
+    zeros the excited–excited block), this consumes the complete state-basis
+    dipole matrix ``mu_matrix`` ``(3, N, N)`` from
+    :func:`state_basis_dipole_matrix` (index 0 = ground). The photon therefore
+    couples through excited-state permanent / state-to-state dipoles, and the
+    DSE carries the full ``½(λ·μ)²``. Basis is electronic ⊗ {0,1} photons.
+    """
+    from casidapy.utils.soc import build_soc_qed_pf_matrix
+
+    omega_c = float(omega_c)
+    lam = np.asarray(lam_vec, dtype=float).ravel()
+    mu = np.asarray(mu_matrix, dtype=float)  # (3, N, N)
+    if mu.ndim != 3 or mu.shape[0] != 3 or mu.shape[1] != mu.shape[2]:
+        raise ValueError(f"mu_matrix must be (3, N, N), got {mu.shape}")
+    N = mu.shape[1]
+    e = np.concatenate([[0.0], np.asarray(omega, dtype=float).ravel()[: N - 1]])
+    d_mat = np.einsum("x,xjk->jk", lam, mu, optimize=True)  # λ·μ, (N, N)
+
+    M = build_soc_qed_pf_matrix(e, d_mat, omega_c, include_dse=include_dse)
+    w_abs, V = scipy.linalg.eigh(M)
+    w = w_abs - w_abs[0]
+    n = N
+    photon_frac = np.sum(V[n:, :] ** 2, axis=0)
+    # Physical polariton transition dipoles from the PF ground (μ ⊗ I_photon).
+    mu_pol = (
+        np.einsum("i,xij,jk->xk", V[:n, 0], mu, V[:n, :], optimize=True)
+        + np.einsum("i,xij,jk->xk", V[n:, 0], mu, V[n:, :], optimize=True)
+    )  # (3, 2N)
+    f_out = np.zeros(w.size, dtype=float)
+    for k, wk in enumerate(w):
+        if wk > 1e-12:
+            f_out[k] = (2.0 / 3.0) * float(wk) * float(mu_pol[:, k] @ mu_pol[:, k])
+
+    return {
+        "omega": w,
+        "omega_absolute": w_abs,
+        "photon_frac": photon_frac,
+        "f": f_out,
+        "mu": mu_pol.T,
+        "d_mat": d_mat,
+        "omega_c": omega_c,
+        "lam": lam,
+        "V": V,
+        "M": M,
+        "include_dse": bool(include_dse),
+        "model": "pauli-fierz-full-dipole",
+        "postprocess": True,
+    }
+
+
+def solve_qed_tddft_state(
+    omega: np.ndarray,
+    mu_states: np.ndarray,
+    lam_vec: Sequence[float],
+    omega_c: float,
+    *,
+    f: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    """Full QED-TDDFT (Stage 1) polaritons in the molecular eigenbasis.
+
+    Augments the electronic Casida **C** matrix — diagonal ``ω_k²`` in the
+    eigenbasis — with a single cavity mode, mirroring the kernel's own
+    ``C Z = ω² Z`` solve. Unlike the TDA post model (symmetric ``ω_c ± g``),
+    the eigenvalues here are polariton ``ω²``, so branches are asymmetric
+    ``√(ω²±…)`` — the RPA structure with de-excitation content baked into the
+    ``(X+Y)`` transition dipoles ``μ_k``. Coupling ``√2 ω_c √ω_k (λ·μ_k)``,
+    which reduces to the TDA Rabi ``g=√(ω_c/2)(λ·μ)`` at weak/resonant coupling.
+    DSE is not included here (it lives in ``(A+B)``; use the transition-basis
+    ``build_qed_tda_matrix`` or the full-dipole post for the self-energy).
+    """
+    w_e = np.asarray(omega, dtype=float).ravel()
+    mu = np.asarray(mu_states, dtype=float)
+    if mu.shape[0] == 3 and mu.shape[1] != 3:
+        mu = mu.T  # -> (n_states, 3)
+    if mu.shape[0] != w_e.size:
+        raise ValueError(f"mu_states has {mu.shape[0]} states but omega has {w_e.size}")
+    lam = np.asarray(lam_vec, dtype=float).ravel()
+    omega_c = float(omega_c)
+    n = w_e.size
+
+    lam_mu = mu @ lam  # λ·μ_k
+    sqrt_w = np.sqrt(np.clip(w_e, 0.0, None))
+    coupling = np.sqrt(2.0) * omega_c * sqrt_w * lam_mu  # C-form electron-photon coupling
+
+    C = np.zeros((n + 1, n + 1), dtype=float)
+    C[np.arange(n), np.arange(n)] = w_e ** 2
+    C[n, n] = omega_c ** 2
+    C[:n, n] = coupling
+    C[n, :n] = coupling
+    w2, V = np.linalg.eigh(C)
+    w = np.sqrt(np.clip(w2, 0.0, None))
+    photon_frac = V[n, :] ** 2
+
+    # (X+Y)-style polariton transition dipoles: (X+Y)_p = ω_p^{-1/2} S Z_p, S=diag(√ω).
+    S = np.concatenate([sqrt_w, [np.sqrt(omega_c)]])
+    mu_ext = np.vstack([mu, np.zeros((1, 3))])  # cavity photon carries no dipole
+    f_out = np.zeros(n + 1, dtype=float)
+    mu_pol = np.zeros((n + 1, 3), dtype=float)
+    for p in range(n + 1):
+        if w[p] <= 1e-12:
+            continue
+        xpy = (S * V[:, p]) / np.sqrt(w[p])
+        mu_pol[p] = xpy @ mu_ext
+        f_out[p] = (2.0 / 3.0) * float(w[p]) * float(mu_pol[p] @ mu_pol[p])
+
+    return {
+        "omega": w,
+        "photon_frac": photon_frac,
+        "f": f_out,
+        "mu": mu_pol,
+        "omega_c": omega_c,
+        "C": C,
+        "V": V,
+        "model": "qed-tddft-state",
         "postprocess": True,
     }
 

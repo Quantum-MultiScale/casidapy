@@ -1,7 +1,8 @@
 """GTO / AO-MO Casida kernel (molecular TDDFT path).
 
-Stores active MOs and evaluates the Casida coupling ``K`` via PySCF
-``mf.gen_response`` (closed-shell) or exchange-only spin-flip (SF-TDDFT).
+Stores active MOs and evaluates the Casida coupling ``K`` via
+:func:`~casidapy.utils.response.make_response` (PySCF ``mf`` or generic MO
+solver) or exchange-only spin-flip (SF-TDDFT).
 Construction helpers (active-space windowing, GPU/MPI ``mf`` promotion,
 high-spin UKS bootstrap) live in :mod:`casidapy.adapter.pyscf`.
 
@@ -275,6 +276,37 @@ class GTOKernel(CasidaKernel):
         self._vresp = None
         return self
 
+    def set_virtual_active_space(self, unocc_energies, virt_mo_coeff):
+        """Replace virtual active MOs with imported columns (projected PW bands).
+
+        ``virt_mo_coeff`` must be ``(nao, n_virt)`` in this kernel's AO basis.
+        Clears K / response caches.
+        """
+        C = np.asarray(virt_mo_coeff, dtype=float)
+        if C.ndim == 1:
+            C = C.reshape(-1, 1)
+        energies = np.asarray(unocc_energies, dtype=float).ravel()
+        if C.shape[1] != energies.size:
+            raise ValueError(
+                f"n_virt energies ({energies.size}) != n_coeff cols ({C.shape[1]})"
+            )
+        if C.shape[0] != self.mo_coeff.shape[0]:
+            raise ValueError(
+                f"virt MO nao={C.shape[0]} != kernel nao={self.mo_coeff.shape[0]}"
+            )
+        self._C_v = C
+        self._unocc_e = energies.copy()
+        self._n_unocc = int(energies.size)
+        self._virt_idx = np.arange(self._n_unocc)
+        self._n_trans = int(self._n_occ * self._n_unocc)
+        self._dE = None
+        self._ready = False
+        self._K = None
+        self._K_dev = None
+        self._C_v_dev = None
+        self._vresp = None
+        return self
+
     def _as_numpy(self, arr) -> np.ndarray:
         """Host ndarray; delegates to :func:`casidapy.adapter.pyscf._as_numpy`."""
         from casidapy.adapter.pyscf import _as_numpy as as_numpy
@@ -283,7 +315,12 @@ class GTOKernel(CasidaKernel):
 
     def setup(self, tda: bool = True) -> None:
         from pyscf import dft
-        from casidapy.adapter.pyscf import ensure_mpi_mf, move_mf_to_gpu
+        from casidapy.adapter.pyscf import (
+            density_fit_mf,
+            ensure_mpi_mf,
+            move_mf_to_gpu,
+        )
+        from casidapy.utils.response import make_response, mf_uses_rohf_collinear_response
 
         self.tda = tda
         self._dE = build_energy_differences(self._occ_e, self._unocc_e)
@@ -296,37 +333,33 @@ class GTOKernel(CasidaKernel):
             self._setup_spin_flip(tda)
             return
 
-        # Build (or reuse) an RKS handle; its gen_response provides the full
-        # spin-adapted TDDFT coupling (singlet or triplet f_xc + J + hybrid K).
-        if self._mf is not None:
-            mf = self._mf
-        else:
-            mf = dft.RKS(self.mol)
-            mf.xc = self.xc
-            mf.mo_coeff = self.mo_coeff
-            mf.mo_energy = self.mo_energy
-            mf.mo_occ = self.mo_occ
+        singlet = not self.triplet
+        mf = self._mf
+        is_hf = str(self.xc).lower().strip() in ("hf", "rhf")
 
-        if self.use_mpi_response:
-            mf = ensure_mpi_mf(mf)
-
-        is_ks = hasattr(mf, "xc")
-        if is_ks and (getattr(mf, "grids", None) is None or mf.grids.coords is None):
-            mf.grids.build()
-
-        if self.use_df and getattr(mf, "with_df", None) is None:
-            mf = mf.density_fit()
-
-        if is_ks:
+        if mf is not None and hasattr(mf, "xc"):
             ni = getattr(mf, "_numint", dft.numint.NumInt())
             self.hybrid = bool(ni.libxc.is_hybrid_xc(mf.xc))
+        elif is_hf:
+            self.hybrid = True
         else:
-            self.hybrid = True  # plain RHF: response includes full exact exchange
+            ni = dft.numint.NumInt()
+            self.hybrid = bool(ni.libxc.is_hybrid_xc(self.xc))
 
-        singlet = not self.triplet
-
-        # Hybrid full TDDFT uses dense A/B (build_AB); skip gen_response setup.
+        # Hybrid full TDDFT uses PySCF dense A/B; requires an mf handle.
         if self.hybrid and not tda:
+            if mf is None:
+                mf = dft.RKS(self.mol)
+                mf.xc = self.xc
+                mf.mo_coeff = self.mo_coeff
+                mf.mo_energy = self.mo_energy
+                mf.mo_occ = self.mo_occ
+            if hasattr(mf, "xc") and (
+                getattr(mf, "grids", None) is None or mf.grids.coords is None
+            ):
+                mf.grids.build()
+            if self.use_df and getattr(mf, "with_df", None) is None:
+                mf = density_fit_mf(mf, verbose=self.verbose)
             self._mf = mf
             self._vresp = None
             self._K = None
@@ -347,8 +380,28 @@ class GTOKernel(CasidaKernel):
                 )
             return
 
+        # --- linear response: PySCF mf path vs generic MO path ---
         self._gpu_response = False
-        if self.use_gpu:
+        use_mf_path = mf is not None
+        roks_generic = (
+            use_mf_path
+            and mf_uses_rohf_collinear_response(mf)
+            and not self.use_gpu
+            and not self.use_mpi_response
+        )
+
+        if use_mf_path and self.use_mpi_response:
+            mf = ensure_mpi_mf(mf)
+            self._mf = mf
+        if use_mf_path and hasattr(mf, "xc") and (
+            getattr(mf, "grids", None) is None or mf.grids.coords is None
+        ):
+            mf.grids.build()
+        if use_mf_path and self.use_df and getattr(mf, "with_df", None) is None:
+            mf = density_fit_mf(mf, verbose=self.verbose)
+            self._mf = mf
+
+        if self.use_gpu and use_mf_path:
             gmf = move_mf_to_gpu(
                 mf,
                 mol=self.mol,
@@ -368,26 +421,87 @@ class GTOKernel(CasidaKernel):
                 except Exception as exc:
                     warnings.warn(
                         f"gpu4pyscf gen_response unavailable ({exc}); "
-                        "using CPU response with GPU contractions / cached K."
+                        "using CPU PySCF response with GPU contractions / cached K."
                     )
-                    self._vresp = mf.gen_response(singlet=singlet, hermi=0)
+                    self._vresp = make_response(
+                        mf,
+                        singlet=singlet,
+                        hermi=0,
+                        use_gpu=self.use_gpu,
+                        use_mpi_response=self.use_mpi_response,
+                        use_df=self.use_df,
+                        verbose=self.verbose,
+                    )
             else:
                 warnings.warn(
                     "gpu4pyscf not available or mf.to_gpu() failed; "
                     "using CPU response with GPU contractions / cached K. "
                     "Install with: pip install gpu4pyscf"
                 )
-                self._vresp = mf.gen_response(singlet=singlet, hermi=0)
+                self._vresp = make_response(
+                    mf,
+                    singlet=singlet,
+                    hermi=0,
+                    use_gpu=False,
+                    use_mpi_response=self.use_mpi_response,
+                    use_df=self.use_df,
+                    verbose=self.verbose,
+                )
             self._C_o_dev = self._cp.asarray(self._C_o)
             self._C_v_dev = self._cp.asarray(self._C_v)
-        else:
-            self._vresp = mf.gen_response(singlet=singlet, hermi=0)
+        elif roks_generic:
+            # ROKS gen_response rejects batched (k, nao, nao) DMs; singlet CVS uses
+            # closed-shell f_xc on the 2-D ROHF MO set (see gen_response_mos).
+            self._vresp = make_response(
+                mol=self.mol,
+                mo_coeff=self.mo_coeff,
+                mo_occ=self.mo_occ,
+                mo_energy=self.mo_energy,
+                xc=self.xc,
+                use_df=False,
+                singlet=singlet,
+                hermi=0,
+                verbose=self.verbose,
+            )
             self._mf = mf
+        elif use_mf_path:
+            self._vresp = make_response(
+                mf,
+                singlet=singlet,
+                hermi=0,
+                use_gpu=self.use_gpu,
+                use_mpi_response=self.use_mpi_response,
+                use_df=self.use_df,
+                verbose=self.verbose,
+            )
+            self._mf = mf
+        else:
+            self._vresp = make_response(
+                mol=self.mol,
+                mo_coeff=self.mo_coeff,
+                mo_occ=self.mo_occ,
+                mo_energy=self.mo_energy,
+                xc=self.xc,
+                use_df=self.use_df,
+                use_gpu=self.use_gpu,
+                use_mpi_response=self.use_mpi_response,
+                singlet=singlet,
+                hermi=0,
+                verbose=self.verbose,
+            )
 
         self._ready = True
         if self.verbose:
+            if roks_generic:
+                backend = "generic-mos-rohf"
+            else:
+                backend = (
+                    "pyscf-mf"
+                    if use_mf_path
+                    else "generic-mos"
+                )
             mpi_tag = ""
-            if self.use_mpi_response:
+            if self.use_mpi_response and use_mf_path:
                 try:
                     from mpi4pyscf.tools import mpi as _mpi
                     mpi_tag = f", MPI JK pool size={_mpi.pool.size}"
@@ -399,9 +513,9 @@ class GTOKernel(CasidaKernel):
                 f"= {self._n_trans}"
             )
             print(
-                f"  XC: {getattr(mf, 'xc', 'HF')}, hybrid: {self.hybrid}, "
+                f"  XC: {self.xc}, hybrid: {self.hybrid}, "
                 f"spin: {self.spin_state}, "
-                f"DF: {getattr(mf, 'with_df', None) is not None}, TDA: {tda}"
+                f"response: {backend}, TDA: {tda}"
                 f"{mpi_tag}"
             )
             if self.use_gpu:
@@ -506,8 +620,8 @@ class GTOKernel(CasidaKernel):
         return k
 
     def _response(self, dm):
-        """Dispatch the AO response: singlet gen_response (RKS) or, for the
-        spin-flip block, ``-c_x·get_k`` (Hartree and spin-diagonal f_xc vanish)."""
+        """Dispatch the AO response: ``make_response`` (mf or MO path) or, for
+        the spin-flip block, ``-c_x·get_k`` (Hartree and spin-diagonal f_xc vanish)."""
         if self._spin_flip:
             return -self._sf_exchange(dm)
         return self._vresp(dm)

@@ -51,7 +51,29 @@ class CasidaOptions:
     # When True, store transition densities as class variables for eDFTpy coupling.
     use_eDFTpy: bool = False
 
+    # Hartree piece of the Casida kernel (ia|jb):
+    #   "full"  — periodic 4π/G² (default for standalone / full-system runs)
+    #   "mt_sr" — Martyna–Tuckerman short-range only: 4π/G² (1−exp(−G²/4α²))
+    #             = erfc(α r)/r in real space. Use for subsystem fragments so
+    #             intra-fragment Casida does not own the full Coulomb; the
+    #             complementary long-range / inter-fragment Hartree is restored
+    #             in eDFTpy subsystem coupling (rangesep_box_mt + LR diagonals).
+    #   "none"  — drop Hartree (XC kernel only; diagnostics)
+    hartree_kernel: str = "full"
+    # Screening α (a0⁻¹) for hartree_kernel="mt_sr". Must match coupling_screen_alpha
+    # so fragment SR + coupling LR reconstruct the intended Coulomb split.
+    hartree_screen_alpha: float = 0.1
+    # Clip |f_xc| to this value (Ha). 0 with hartree_kernel="none" is the
+    # independent-particle Casida matrix.
+    fxc_max: float = 20.0
+
     tag: Optional[str] = None  # optional label for logging or downstream bookkeeping
+
+    # Compute the full MO dipole blocks (d_oo/d_vv/d_ov) and assemble the
+    # state-basis dipole matrix D_full for excited-state-dipole QED ("pff",
+    # incl. subsystem-coupled pff). Extra cost O(n_occ²+n_unocc²) grid dots;
+    # off by default since pf/jc/tddft only need transition dipoles.
+    compute_dipole_blocks: bool = False
 
 
 @dataclass
@@ -82,3 +104,7 @@ class CasidaResults:
     d_mode: Optional[np.ndarray]  # state-basis transition dipoles (3, n_states): mu.T @ (X+Y)
     xpy: Optional[np.ndarray]    # physical Casida amplitudes (n_trans, n_states): Z/sqrt(dE) for RPA, Z for TDA
     metadata: Dict[str, Any]  # timings, n_total_occ, n_trans, flags, etc.
+    # Full state-basis dipole matrix (3, n_states+1, n_states+1), index 0 = GS;
+    # built from mo_dipole_blocks when options.compute_dipole_blocks. Feeds the
+    # full-dipole PF ("pff") model and coupled_state_dipole_matrix.
+    D_full: Optional[np.ndarray] = None

@@ -1,53 +1,32 @@
-"""X-ray absorption / CVS — one public import surface.
+"""X-ray absorption / CVS — production import surface.
 
-Three workflows
----------------
+Two workflows
+-------------
 1. **All-GTO molecule** (you own the SCF)::
 
        from casidapy.xas import run_xas_gto
        res, core, kernel = run_xas_gto(mf, edge="K", edge_atom_indices=[0])
 
-2. **QE embedding → AE core → PW virtuals**::
+       # L-edge SOC-coupled TDDFT (spatial 2p + singlet/triplet SI-SOC)
+       res, core, kernel = run_xas_gto(
+           mf, edge="L", edge_atom_indices=[0], soc="si",
+       )
 
-       from casidapy.xas import run_xas_reconstruct
-       res, core, kernel, mf = run_xas_reconstruct(
-           driver, edge_atom=0, edge="K", use_gpu=True, comm=comm
+2. **QE host + frozen-core AE 1s + PW Casida (GIPAW μ/K)**::
+
+       from casidapy.xas import run_ae_host_pw_grid_cvs
+       res, core, kernel, mf, diag = run_ae_host_pw_grid_cvs(
+           driver, edge_atom=0, edge="K", gipaw_upf=path,
+           calc_type="crystal",  # or "molecule"
        )
 
 3. **Fragment core → inject yourself**::
 
        from casidapy.xas import select_xas_fragment, extract_fragment_core, inject_core_orbitals
-
-CuPy / MPI
-----------
-Pass ``use_gpu=True`` and/or ``comm=<mpi4py communicator>`` on
-``run_xas_reconstruct``, ``build_ae_embedding_potential``,
-``core_mos_to_pw_fields``, and ``CasidaKS_MPI.xas(...)``. ``comm=None`` is
-serial (no auto ``COMM_WORLD``). GTO-only XAS also accepts
-``use_mpi_response=True`` for mpi4pyscf response kernels.
-
-Large virtual pools
--------------------
-For continuum-dense QE cells, set a large ``n_virt`` (QE ``nbnd``) and
-optionally ``n_virt_active=N`` to energy-stride down to ``N`` Casida
-virtuals while keeping the full energy span::
-
-    run_xas_reconstruct(driver, 0, n_virt=800, n_virt_active=200, n_states=150)
-
-Leave ``n_virt_active=None`` (default) to use every selected virtual.
-
-Modules
--------
-- :mod:`casidapy.xas.cvs` — cores, fragments, inject, CVS-TDA
-- :mod:`casidapy.xas.reconstruct` — frozen ``V_env`` AE reconstruction
-- :mod:`casidapy.xas.spectrum` — sticks / plots
-- :mod:`casidapy.embed` — ``V_env`` builders (Hirshfeld default)
-- :mod:`casidapy.utils.accel` — shared CuPy / MPI helpers
-
-``CasidaKS_MPI.xas(reconstruct=True, ...)`` is the OO form of (2).
 """
 from casidapy.embed import build_ae_embedding_potential, read_upf_z_valence
 from casidapy.xas.cvs import (
+    CVSSOCResults,
     CoreOrbitals,
     FragmentSpec,
     apply_orbital_soc,
@@ -57,44 +36,96 @@ from casidapy.xas.cvs import (
     extract_fragment_core,
     formal_oxidation_charge,
     inject_core_orbitals,
+    parse_soc_mode,
     resolve_oxidation_state,
     run_cvs_gto_from_mf,
+    run_cvs_si_soc,
     run_cvs_tda,
+    clone_pw_kernel_triplet,
     select_atoms_in_radius,
     select_neutral_first_shell,
     select_xas_fragment,
 )
+from casidapy.xas.dipole import (
+    bind_ae_core_dipole,
+    core_charge_centroid_bohr,
+    core_dipole_radius_bohr,
+    core_enclosed_radius_bohr,
+    core_rms_radius_bohr,
+    prune_kernel_virtuals_by_core_dipole,
+    pseudo_dipole_scale_report,
+)
+from casidapy.xas.gipaw import (
+    apply_gipaw_kernel_virtuals,
+    core_virtual_dipole_matrix_paw_gipaw,
+    parse_gipaw_upf,
+    reconstruct_pw_virtuals,
+)
+from casidapy.xas.projected_gto import (
+    dense_cvs_A,
+    gto_dipole_ia,
+    hybrid_mo_ijab,
+    mo_ijab,
+    project_kernel_virtuals_to_gto,
+    run_particle_ci,
+    select_virtuals_by_shell_weight,
+    subset_pw_kernel_virtuals,
+    svd_particle_orbitals,
+    virtual_shell_weights,
+)
 from casidapy.xas.reconstruct import (
-    align_core_to_reference,
-    apply_core_gauge_shift,
+    AE_HOST_CALC_DEFAULTS,
+    ae_host_params_for_calc_type,
+    calc_type_from_driver,
     frozen_shells_from_pp,
-    reconstruct_core_from_driver,
-    run_reconstruct_cvs_from_driver,
-    scf_ae_core_semicore,
+    ground_state_spin,
+    resolve_calc_type,
+    run_ae_host_pw_grid_cvs,
 )
 from casidapy.xas.spectrum import (
     HA_TO_EV,
+    brightest_peak_shift_ev,
+    first_peak_shift_ev,
     omega_ev,
+    oscillator_table,
     plot_sticks,
     stick_spectrum,
+    stick_cartesian,
+    sum_d2,
     summarize_xas,
 )
 
 run_xas_gto = run_cvs_gto_from_mf
-run_xas_reconstruct = run_reconstruct_cvs_from_driver
 
 __all__ = [
     "HA_TO_EV",
     "CoreOrbitals",
+    "CVSSOCResults",
     "FragmentSpec",
     "run_xas_gto",
-    "run_xas_reconstruct",
     "run_cvs_gto_from_mf",
-    "run_reconstruct_cvs_from_driver",
+    "run_cvs_si_soc",
+    "parse_soc_mode",
+    "run_ae_host_pw_grid_cvs",
+    "AE_HOST_CALC_DEFAULTS",
+    "ae_host_params_for_calc_type",
+    "calc_type_from_driver",
+    "resolve_calc_type",
     "run_cvs_tda",
+    "clone_pw_kernel_triplet",
     "core_from_mf",
     "extract_fragment_core",
     "inject_core_orbitals",
+    "prune_kernel_virtuals_by_core_dipole",
+    "bind_ae_core_dipole",
+    "core_charge_centroid_bohr",
+    "core_rms_radius_bohr",
+    "core_enclosed_radius_bohr",
+    "core_dipole_radius_bohr",
+    "core_virtual_dipole_matrix_paw_gipaw",
+    "parse_gipaw_upf",
+    "reconstruct_pw_virtuals",
+    "apply_gipaw_kernel_virtuals",
     "core_mos_to_pw_fields",
     "build_pw_kernel_from_qepy",
     "select_atoms_in_radius",
@@ -103,15 +134,25 @@ __all__ = [
     "formal_oxidation_charge",
     "resolve_oxidation_state",
     "apply_orbital_soc",
-    "reconstruct_core_from_driver",
-    "scf_ae_core_semicore",
+    "pseudo_dipole_scale_report",
     "frozen_shells_from_pp",
-    "apply_core_gauge_shift",
-    "align_core_to_reference",
+    "ground_state_spin",
     "build_ae_embedding_potential",
     "read_upf_z_valence",
+    "run_particle_ci",
+    "select_virtuals_by_shell_weight",
+    "subset_pw_kernel_virtuals",
+    "hybrid_mo_ijab",
+    "project_kernel_virtuals_to_gto",
+    "svd_particle_orbitals",
+    "virtual_shell_weights",
     "omega_ev",
     "stick_spectrum",
+    "stick_cartesian",
     "plot_sticks",
+    "first_peak_shift_ev",
+    "brightest_peak_shift_ev",
+    "oscillator_table",
     "summarize_xas",
+    "sum_d2",
 ]

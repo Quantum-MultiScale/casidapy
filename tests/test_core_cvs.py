@@ -105,6 +105,9 @@ def test_core_from_mf_user_supplied():
     assert core.meta.get("from_user_mf") is True
     assert core.energies.size == 1
     assert core.energies[0] < -10.0
+    sel = core.meta.get("core_selection") or {}
+    assert sel.get("method") == "mulliken_max_per_atom"
+    assert sel.get("edge_atoms") == [0]
 
     n_virt_avail = int(np.sum(mf.mo_occ < 1e-6))
     n_unocc = min(4, n_virt_avail)
@@ -120,6 +123,126 @@ def test_core_from_mf_user_supplied():
     assert kernel.n_unocc == n_unocc
     assert res.omega.size == n_unocc
     assert np.all(res.omega > 10.0)  # core→virt, deep gap
+
+
+def test_core_from_mf_same_element_k_edge_picks_absorber():
+    """Inequivalent C 1s MOs: select by Mulliken pop on the requested atom.
+
+    (Symmetry-degenerate sites with equal populations are interchangeable.)
+    """
+    pytest.importorskip("pyscf")
+    from pyscf import gto, dft
+    from casidapy.xas import core_from_mf
+    from casidapy.xas.cvs import _ao_mask_for_atoms, _ao_shell_mask, _mo_mulliken_on_aos
+
+    # Acetaldehyde: methyl C vs carbonyl C — chemically distinct 1s.
+    mol = gto.M(
+        atom=(
+            "C  0.0000  0.0000  0.0000;"  # methyl
+            "C  1.5070  0.0000  0.0000;"  # carbonyl
+            "O  2.1400  1.0700  0.0000;"
+            "H -0.3800  1.0200  0.0000;"
+            "H -0.3800 -0.5100  0.8840;"
+            "H -0.3800 -0.5100 -0.8840;"
+            "H  1.9400 -1.0200  0.0000"
+        ),
+        basis="sto-3g",
+        verbose=0,
+    )
+    mf = dft.RKS(mol)
+    mf.xc = "lda,vwn"
+    mf.kernel()
+    assert mf.converged
+
+    S = mol.intor("int1e_ovlp")
+    shell = _ao_shell_mask(mol, 1, 0)
+
+    for ia, other in ((0, 1), (1, 0)):
+        core = core_from_mf(mf, edge="K", edge_atom_indices=[ia])
+        assert core.energies.size == 1
+        C = np.asarray(core.mo_coeff, float)
+        if C.ndim == 1:
+            C = C.reshape(-1, 1)
+        pop_abs = float(_mo_mulliken_on_aos(C, S, _ao_mask_for_atoms(mol, [ia], shell))[0])
+        pop_other = float(
+            _mo_mulliken_on_aos(C, S, _ao_mask_for_atoms(mol, [other], shell))[0]
+        )
+        assert pop_abs > 0.7, (ia, pop_abs, pop_other)
+        assert pop_abs > pop_other + 0.3, (ia, pop_abs, pop_other)
+        per = (core.meta.get("core_selection") or {}).get("per_atom") or []
+        assert per and int(per[0]["atom"]) == ia
+        assert float(per[0]["mulliken_pops"][0]) == pytest.approx(pop_abs, rel=0, abs=1e-8)
+
+    # Default heavy-atom K-edge: one 1s per C and O.
+    both = core_from_mf(mf, edge="K")
+    assert both.energies.size == 3
+    assert set(both.meta["core_selection"]["edge_atoms"]) == {0, 1, 2}
+
+
+def test_core_localize_recovers_single_site_1s():
+    """Symmetry-equivalent absorbers: canonical 1s is shared, localized is not.
+
+    Benzene C 1s MOs are fixed combinations over equivalent carbons, so the
+    canonical pick carries well under 1 e on the requested atom.  ``proj`` /
+    ``boys`` must recover a single-site core at near-unchanged energy.
+    """
+    pytest.importorskip("pyscf")
+    from pyscf import dft, gto
+
+    from casidapy.xas import core_from_mf
+    from casidapy.xas.cvs import (
+        _ao_mask_for_atoms,
+        _ao_shell_mask,
+        _mo_mulliken_on_aos,
+    )
+
+    r_cc, r_ch = 1.39, 2.48
+    atom = []
+    for k in range(6):
+        a = 2.0 * np.pi * k / 6.0
+        atom.append(f"C {r_cc * np.cos(a):.6f} {r_cc * np.sin(a):.6f} 0.0")
+        atom.append(f"H {r_ch * np.cos(a):.6f} {r_ch * np.sin(a):.6f} 0.0")
+    mol = gto.M(atom=";".join(atom), basis="sto-3g", verbose=0)
+    mf = dft.RKS(mol)
+    mf.xc = "lda,vwn"
+    mf.kernel()
+    assert mf.converged
+
+    S = mol.intor("int1e_ovlp")
+    mask = _ao_mask_for_atoms(mol, [0], _ao_shell_mask(mol, 1, 0))
+
+    def _pop(core):
+        C = np.asarray(core.mo_coeff, float).reshape(mol.nao, -1)
+        return float(_mo_mulliken_on_aos(C[:, :1], S, mask)[0]), C
+
+    canon = core_from_mf(mf, edge="K", edge_atom_indices=[0])
+    pop_canon, _ = _pop(canon)
+    assert pop_canon < 0.75, pop_canon
+
+    for method in ("proj", "boys"):
+        loc = core_from_mf(
+            mf, edge="K", edge_atom_indices=[0], core_localize=method
+        )
+        pop_loc, C_loc = _pop(loc)
+        assert loc.energies.size == 1
+        assert pop_loc > 0.9, (method, pop_loc)
+        # normalized, and still a core orbital at essentially the same energy
+        assert float(C_loc[:, 0] @ S @ C_loc[:, 0]) == pytest.approx(1.0, abs=1e-8)
+        assert float(loc.energies[0]) == pytest.approx(
+            float(canon.energies[0]), abs=5e-3
+        )
+        assert (loc.meta["core_selection"]["method"]).startswith("localized")
+
+    # Already-localized cores (inequivalent atoms) must be left alone.
+    mol2 = gto.M(atom="C 0 0 0; O 0 0 1.128", basis="sto-3g", verbose=0)
+    mf2 = dft.RKS(mol2)
+    mf2.xc = "lda,vwn"
+    mf2.kernel()
+    c_canon = core_from_mf(mf2, edge="K", edge_atom_indices=[0])
+    c_loc = core_from_mf(mf2, edge="K", edge_atom_indices=[0], core_localize="proj")
+    assert float(c_loc.energies[0]) == pytest.approx(
+        float(c_canon.energies[0]), abs=1e-5
+    )
 
 
 def test_extract_fragment_core_k_edge_h2o():
@@ -212,6 +335,19 @@ def test_pw_inject_synthetic_core():
     assert res.omega[0] > 15.0
 
 
+def test_parse_soc_mode():
+    from casidapy.xas import parse_soc_mode
+
+    assert parse_soc_mode(False) == "none"
+    assert parse_soc_mode(None) == "none"
+    assert parse_soc_mode(True) == "orbital"
+    assert parse_soc_mode("orbital") == "orbital"
+    assert parse_soc_mode("si") == "si"
+    assert parse_soc_mode("state-interaction") == "si"
+    with pytest.raises(ValueError):
+        parse_soc_mode("magic")
+
+
 def test_orbital_soc_2p_splits():
     pytest.importorskip("pyscf")
     from pyscf import gto, dft
@@ -227,3 +363,74 @@ def test_orbital_soc_2p_splits():
     assert core.energies.size == 6
     # Should show some splitting (not all equal)
     assert np.ptp(core.energies) > 1e-6
+    # soc="si" must not apply orbital SOC (spatial 2p stay 3)
+    core_si = extract_fragment_core(
+        mol, [0], edge="L", basis="sto-3g", xc="lda,vwn", soc="si"
+    )
+    assert core_si.energies.size == 3
+    assert core_si.meta.get("soc") is False
+    assert core_si.meta.get("soc_deferred") == "si"
+
+
+def test_l_edge_si_soc_ne():
+    """Ne L-edge: spatial 2p (n=3), singlet+triplet TDA, SI-SOC mixing."""
+    pytest.importorskip("pyscf")
+    from pyscf import gto, dft
+    from casidapy.xas import run_cvs_gto_from_mf, stick_cartesian
+    from casidapy.utils.soc import soc_ao_integrals, soc_mo_blocks, st_soc_matrix, _reshape_amps
+
+    mol = gto.M(atom="Ne 0 0 0", basis="6-31g", verbose=0)
+    mf = dft.RKS(mol)
+    mf.xc = "lda,vwn"
+    mf.grids.level = 1
+    mf.kernel()
+    assert mf.converged
+
+    n_virt = int(np.sum(mf.mo_occ < 1e-6))
+    n_unocc = min(4, n_virt)
+    n_states = min(6, 3 * n_unocc)
+    res, core, kernel = run_cvs_gto_from_mf(
+        mf,
+        edge="L",
+        edge_atom_indices=[0],
+        n_unocc=n_unocc,
+        n_states=n_states,
+        soc="si",
+        use_df=False,
+    )
+    assert core.energies.size == 3
+    assert core.meta.get("soc") is False
+    assert kernel.n_occ == 3
+    assert kernel.n_unocc == n_unocc
+    assert getattr(res, "metadata", {}).get("soc_mode") == "si"
+    n_s = int(res.singlet.omega.size)
+    n_t = int(res.triplet.omega.size)
+    assert res.omega.size == n_s + 3 * n_t
+    assert np.all(res.omega > 0.0)
+    assert float(np.sum(res.f)) > 0.0
+    # 2p hole SOC is the L2/L3 coupling between singlet and triplet CVS states
+    hso = soc_ao_integrals(kernel.mol)
+    h_oo, h_vv, _h_ov = soc_mo_blocks(hso, kernel._C_o, kernel._C_v)
+    assert np.max(np.abs(h_oo)) > 0.0
+    X_s = _reshape_amps(res.singlet.Z, 3, n_unocc)
+    X_t = _reshape_amps(res.triplet.Z, 3, n_unocc)
+    H_st = st_soc_matrix(X_s, X_t, h_oo, h_vv)
+    assert np.max(np.abs(H_st)) > 0.0
+    mixed = (res.singlet_weight > 1e-8) & (res.triplet_weight > 1e-8)
+    assert np.any(mixed)
+    w, f, fx, fy, fz = stick_cartesian(res)
+    assert w.size == res.omega.size
+    assert res.d_mode.shape == (3, res.omega.size)
+
+    # Hole-only (h_vv = 0) still couples through the 2p hole
+    from casidapy.utils.soc import solve_soc_si
+
+    soc_h = solve_soc_si(
+        res.singlet, res.triplet, kernel, hole_only=True
+    )
+    assert soc_h.meta.get("hole_only") is True
+    assert np.max(np.abs(st_soc_matrix(
+        X_s, X_t, h_oo, np.zeros_like(h_vv)
+    ))) > 0.0
+    assert soc_h.omega.size == res.omega.size
+

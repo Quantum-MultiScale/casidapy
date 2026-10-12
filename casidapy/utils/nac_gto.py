@@ -81,14 +81,13 @@ def _full_space_amplitude(kernel: GTOKernel, amp_active: np.ndarray) -> np.ndarr
 
 
 def _gen_response_mixed(mf):
-    """``mf.gen_response(singlet=None, hermi=1)``, the CPHF response used by
-    both stock ``pyscf.grad.tdrhf`` and ``gpu4pyscf.nac.tdrhf`` (a version-
-    tolerant wrapper: older/newer PySCF ``gen_response`` signatures differ on
-    optional kwargs such as ``with_nlc``)."""
+    """CPHF response ``singlet=None, hermi=1`` via PySCF ``mf.gen_response``."""
+    from casidapy.utils.response import gen_response_mf
+
     try:
-        return mf.gen_response(singlet=None, hermi=1, with_nlc=True)
+        return gen_response_mf(mf, singlet=None, hermi=1, with_nlc=True)
     except TypeError:
-        return mf.gen_response(singlet=None, hermi=1)
+        return gen_response_mf(mf, singlet=None, hermi=1)
 
 
 def get_nacv_ge_tda(

@@ -1,46 +1,26 @@
 """CVS / XAS building blocks: pick cores → inject into a host → run TDA.
 
-Prefer the facade :mod:`casidapy.xas` (``run_xas_gto``, ``run_xas_reconstruct``).
+Prefer the facade :mod:`casidapy.xas` (``run_xas_gto``, ``run_ae_host_pw_grid_cvs``).
 
-What lives where
-----------------
-1. **Data** — :class:`CoreOrbitals`, :class:`FragmentSpec`
-2. **Fragments** — radius / first-shell selection, oxidation state
-3. **Core pick** — :func:`core_from_mf`, :func:`extract_fragment_core`
-4. **Inject** — :func:`inject_core_orbitals`, :func:`core_mos_to_pw_fields`
-5. **Drivers** — :func:`run_cvs_tda`, :func:`run_cvs_gto_from_mf`
-
-Minimal GTO path::
-
-    from casidapy.xas import run_xas_gto
-    res, core, kernel = run_xas_gto(mf, edge="K", edge_atom_indices=[0])
-
-Under CVS the occupied active space is **only** the imported cores; virtuals
-stay those of the full-system host kernel.
+Dipole pruning: :mod:`casidapy.xas.dipole`. Validation / prototypes: :mod:`casidapy.xas.diagnostics`.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# Edge / shell labels  (n, ℓ) for AO matching
-# ---------------------------------------------------------------------------
-_EDGE_SHELL = {
-    "K": (1, 0),   # 1s
-    "L": (2, 1),   # 2p
-    "M": (3, 2),   # 3d default
-}
-_SHELL_ALIAS = {
-    "1s": (1, 0),
-    "2s": (2, 0),
-    "2p": (2, 1),
-    "3s": (3, 0),
-    "3p": (3, 1),
-    "3d": (3, 2),
-}
+from casidapy.xas.chemical_data import (
+    COVALENT_RADII_ANG as _COVALENT_RADII_ANG,
+    DEFAULT_OXIDATION_STATES,
+    DEFAULTS,
+    EDGE_SHELL as _EDGE_SHELL,
+    SHELL_ALIAS as _SHELL_ALIAS,
+)
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -64,83 +44,80 @@ class CoreOrbitals:
     meta: Dict[str, Any] = field(default_factory=dict)
 
 
-# Formal oxidation numbers for neutral-fragment automation (override per system).
-DEFAULT_OXIDATION_STATES: Dict[str, int] = {
-    "H": 1,
-    "Li": 1,
-    "Na": 1,
-    "K": 1,
-    "Rb": 1,
-    "Cs": 1,
-    "Be": 2,
-    "Mg": 2,
-    "Ca": 2,
-    "Sr": 2,
-    "Ba": 2,
-    "B": 3,
-    "Al": 3,
-    "Sc": 3,
-    "Y": 3,
-    "La": 3,
-    "C": 4,
-    "Si": 4,
-    "Ti": 4,
-    "Zr": 4,
-    "Hf": 4,
-    "Ge": 4,
-    "Sn": 4,
-    "N": -3,
-    "P": -3,
-    "O": -2,
-    "S": -2,
-    "Se": -2,
-    "Te": -2,
-    "F": -1,
-    "Cl": -1,
-    "Br": -1,
-    "I": -1,
-    "V": 5,
-    "Nb": 5,
-    "Ta": 5,
-    "Cr": 3,
-    "Mo": 6,
-    "W": 6,
-    "Mn": 4,
-    "Fe": 3,
-    "Co": 2,
-    "Ni": 2,
-    "Cu": 2,
-    "Zn": 2,
-    "Ag": 1,
-    "Au": 3,
-    "Pd": 2,
-    "Pt": 2,
-}
+def parse_soc_mode(soc: Union[bool, str, None]) -> str:
+    """Normalize CVS SOC flags to ``\"none\"``, ``\"orbital\"``, or ``\"si\"``.
 
-# Fallback covalent radii (Å) when ASE is unavailable.
-_COVALENT_RADII_ANG: Dict[str, float] = {
-    "H": 0.31,
-    "C": 0.76,
-    "N": 0.71,
-    "O": 0.66,
-    "F": 0.57,
-    "Si": 1.11,
-    "P": 1.07,
-    "S": 1.05,
-    "Cl": 1.02,
-    "Ti": 1.60,
-    "V": 1.53,
-    "Cr": 1.39,
-    "Mn": 1.39,
-    "Fe": 1.32,
-    "Co": 1.26,
-    "Ni": 1.24,
-    "Cu": 1.32,
-    "Zn": 1.22,
-    "Zr": 1.75,
-    "Ag": 1.45,
-    "Au": 1.36,
-}
+    * ``none`` — spatial cores, no SOC.
+    * ``orbital`` — Breit–Pauli in the core subspace *before* injection
+      (j-adapted orbital energies).  Not SOC-coupled TDDFT.
+    * ``si`` — spatial cores; singlet + triplet CVS-TDA coupled by
+      :func:`~casidapy.utils.soc.solve_soc_si` (final-state L₂/L₃ mixing).
+    """
+    if soc is None or soc is False:
+        return "none"
+    if soc is True:
+        return "orbital"
+    key = str(soc).lower().strip().replace("-", "_")
+    aliases = {
+        "none": "none",
+        "off": "none",
+        "false": "none",
+        "0": "none",
+        "orbital": "orbital",
+        "bp": "orbital",
+        "jadapted": "orbital",
+        "j_adapted": "orbital",
+        "true": "orbital",
+        "1": "orbital",
+        "si": "si",
+        "final": "si",
+        "state": "si",
+        "tddft": "si",
+        "state_interaction": "si",
+        "si_soc": "si",
+        "soc_si": "si",
+    }
+    if key not in aliases:
+        raise ValueError(
+            f"Unknown soc={soc!r}; expected False/'none', True/'orbital', "
+            "or 'si' (final-state singlet–triplet TDDFT coupling)."
+        )
+    return aliases[key]
+
+
+@dataclass
+class CVSSOCResults:
+    """SOC-coupled CVS-TDDFT: SI eigenpairs plus the parent singlet/triplet TDA.
+
+    Duck-types :class:`~casidapy.casida_api.CasidaResults` for
+    :mod:`casidapy.xas.spectrum` (``omega``, ``f``, ``d_mode``).
+    """
+
+    omega: np.ndarray
+    f: np.ndarray
+    mu: np.ndarray
+    U: np.ndarray
+    singlet_weight: np.ndarray
+    triplet_weight: np.ndarray
+    singlet: Any
+    triplet: Any
+    core: CoreOrbitals
+    kernel: Any
+    kernel_t: Any
+    soc: Any
+    Z: Optional[np.ndarray] = None
+    mu_transition: Optional[np.ndarray] = None
+    rho_transition: Optional[np.ndarray] = None
+    xpy: Optional[np.ndarray] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def d_mode(self) -> np.ndarray:
+        return np.asarray(self.mu, dtype=float).T
+
+    @property
+    def meta(self) -> Dict[str, Any]:
+        return self.metadata
 
 
 @dataclass
@@ -229,17 +206,40 @@ def select_atoms_in_radius(
     elements
         If given, keep only those element symbols (e.g. ``(\"Ag\",\"Cu\")``).
     """
-    pos, sym, _ = _as_positions_symbols(mol_or_atoms)
-    if isinstance(center, (int, np.integer)):
-        c = pos[int(center)]
+    pos, sym, parent = _as_positions_symbols(mol_or_atoms)
+    r_cut = float(radius_ang)
+    use_mic = (
+        isinstance(center, (int, np.integer))
+        and hasattr(parent, "get_distance")
+        and hasattr(parent, "pbc")
+        and any(parent.pbc)
+    )
+    if use_mic:
+        edge = int(center)
+        idx = np.array(
+            [
+                i
+                for i in range(len(sym))
+                if float(parent.get_distance(edge, i, mic=True)) <= r_cut
+            ],
+            dtype=int,
+        )
     else:
-        c = np.asarray(center, dtype=float).reshape(3)
-    d = np.linalg.norm(pos - c[None, :], axis=1)
-    mask = d <= float(radius_ang)
-    if elements is not None:
+        if isinstance(center, (int, np.integer)):
+            c = pos[int(center)]
+        else:
+            c = np.asarray(center, dtype=float).reshape(3)
+        d = np.linalg.norm(pos - c[None, :], axis=1)
+        mask = d <= r_cut
+        if elements is not None:
+            allowed = {e.strip().capitalize() for e in elements}
+            mask &= np.array([s.capitalize() in allowed for s in sym], dtype=bool)
+        idx = np.where(mask)[0]
+    if elements is not None and use_mic:
         allowed = {e.strip().capitalize() for e in elements}
-        mask &= np.array([s.capitalize() in allowed for s in sym], dtype=bool)
-    idx = np.where(mask)[0]
+        idx = np.array(
+            [i for i in idx if sym[int(i)].capitalize() in allowed], dtype=int
+        )
     if idx.size == 0:
         raise ValueError(
             f"No atoms within {radius_ang} Å of center={center}"
@@ -315,7 +315,7 @@ def _covalent_radii_ang(symbols: Sequence[str]) -> np.ndarray:
             if key not in _COVALENT_RADII_ANG:
                 raise ValueError(
                     f"No covalent radius for {key!r}; install ASE or extend "
-                    "_COVALENT_RADII_ANG."
+                    "chemical_data.json covalent_radii_ang."
                 )
             out.append(_COVALENT_RADII_ANG[key])
         return np.asarray(out, dtype=float)
@@ -325,7 +325,7 @@ def _bond_neighbors(
     pos: np.ndarray,
     symbols: Sequence[str],
     *,
-    bond_factor: float = 1.25,
+    bond_factor: float = DEFAULTS["bond_factor"],
 ) -> List[List[int]]:
     """Undirected bonded-neighbor lists from covalent-radii cutoffs."""
     n = len(symbols)
@@ -344,8 +344,8 @@ def select_neutral_first_shell(
     mol_or_atoms,
     center: int,
     *,
-    bond_factor: float = 1.25,
-    max_atoms: int = 24,
+    bond_factor: float = DEFAULTS["bond_factor"],
+    max_atoms: int = DEFAULTS["max_fragment_atoms"],
     target_charge: int = 0,
     oxidation_states: Optional[Dict[str, int]] = None,
     complete_ligands: bool = True,
@@ -369,7 +369,9 @@ def select_neutral_first_shell(
     first = sorted({c, *neigh[c]})
     if len(first) < 2 and len(sym) > 1:
         # Loosen once if the first shell is empty (soft geometry / radii).
-        neigh = _bond_neighbors(pos, sym, bond_factor=float(bond_factor) * 1.15)
+        neigh = _bond_neighbors(
+            pos, sym, bond_factor=float(bond_factor) * DEFAULTS["bond_factor_ligand_growth"]
+        )
         first = sorted({c, *neigh[c]})
 
     chosen: set = set(first)
@@ -439,9 +441,9 @@ def select_xas_fragment(
     atom_indices: Optional[Sequence[int]] = None,
     charge: Optional[int] = None,
     spin: int = 0,
-    radius_ang: float = 3.0,
-    bond_factor: float = 1.25,
-    max_atoms: int = 24,
+    radius_ang: float = DEFAULTS["fragment_radius_ang"],
+    bond_factor: float = DEFAULTS["bond_factor"],
+    max_atoms: int = DEFAULTS["max_fragment_atoms"],
     target_charge: int = 0,
     oxidation_states: Optional[Dict[str, int]] = None,
     complete_ligands: bool = True,
@@ -625,23 +627,106 @@ def _ao_mask_for_atoms(mol, atom_ids: Sequence[int], base_mask: np.ndarray) -> n
     return out
 
 
-def _select_core_mos(
+def _mo_mulliken_on_aos(
+    mo_c: np.ndarray,
+    S: np.ndarray,
+    ao_mask: np.ndarray,
+) -> np.ndarray:
+    """Mulliken population of each MO column on the selected AO subset.
+
+    ``pop_i = Σ_{μ ∈ mask} C_{μi} (S C)_{μi}``.  For near-degenerate same-
+    element cores (e.g. anthracene C 1s), this is far more reliable than
+    ranking by raw ``Σ|C_μ|²`` and then taking the lowest eigenvalue.
+    """
+    C = np.asarray(mo_c, dtype=float)
+    if C.ndim == 1:
+        C = C.reshape(-1, 1)
+    SC = np.asarray(S, dtype=float) @ C
+    mask = np.asarray(ao_mask, dtype=bool)
+    return np.sum(C[mask, :] * SC[mask, :], axis=0)
+
+
+def _core_atom_sets(
+    mol, ell: int, edge_frag_atoms: Optional[Sequence[int]] = None
+) -> Tuple[List[int], List[int]]:
+    """``(edge_ids, manifold_ids)``: requested absorbers and their same-Z shell block.
+
+    The manifold is the full set of same-element atoms, because their core MOs
+    are near-degenerate and mix with each other even when only one absorber is
+    requested.
+    """
+    natm = mol.natm
+    if edge_frag_atoms is not None:
+        edge_ids = [int(i) for i in edge_frag_atoms]
+        for i in edge_ids:
+            if i < 0 or i >= natm:
+                raise ValueError(f"edge fragment atom {i} out of range for natm={natm}")
+        zs = {int(mol.atom_charge(i)) for i in edge_ids}
+        manifold_ids = [i for i in range(natm) if int(mol.atom_charge(i)) in zs]
+        if ell == 0:
+            manifold_ids = [
+                i for i in manifold_ids if int(mol.atom_charge(i)) >= 3
+            ] or manifold_ids
+    elif ell == 0:
+        edge_ids = [i for i in range(natm) if mol.atom_charge(i) >= 3] or list(
+            range(natm)
+        )
+        manifold_ids = list(edge_ids)
+    else:
+        edge_ids = list(range(natm))
+        manifold_ids = list(edge_ids)
+    return edge_ids, manifold_ids
+
+
+def _mo_fock_expectation(mo_c: np.ndarray, mo_e: np.ndarray, S: np.ndarray, c: np.ndarray) -> float:
+    """``<phi|F|phi>`` for an orbital that is not a Fock eigenvector.
+
+    Uses the canonical spectrum, ``F = S C diag(e) C^T S``, so no integrals are
+    rebuilt.  Exact for any ``c`` spanned by the MO set.
+    """
+    p = np.asarray(mo_c, float).T @ (np.asarray(S, float) @ np.asarray(c, float).ravel())
+    return float(np.sum(np.asarray(mo_e, float).ravel() * p**2))
+
+
+def _lowdin_orthonormalize(C: np.ndarray, S: np.ndarray) -> np.ndarray:
+    """Symmetric orthonormalization of AO-coefficient columns in the S metric."""
+    C = np.asarray(C, float)
+    M = C.T @ np.asarray(S, float) @ C
+    w, V = np.linalg.eigh(M)
+    w = np.maximum(w, 1e-14)
+    return C @ (V @ np.diag(w**-0.5) @ V.T)
+
+
+def _localize_core_mos(
     mf,
     *,
     n: int,
     ell: int,
     n_per_atom: Optional[int] = None,
     edge_frag_atoms: Optional[Sequence[int]] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Pick occupied MOs localized on the target nl shell.
+    method: str = "proj",
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """Absorber-localized core MOs, for symmetry-equivalent absorbers.
 
-    Parameters
-    ----------
-    edge_frag_atoms
-        Fragment-local atom indices that contribute core orbitals. If ``None``,
-        defaults to all heavy atoms (Z≥3) for s-shells, else all atoms.
+    Canonical core MOs of equivalent atoms are fixed symmetry combinations: in
+    anthracene each C 1s MO carries only ~0.5 e on the requested carbon and
+    ~0.45 e on its partner.  Such an orbital cannot be compared with — nor used
+    as the ``<c|r|v>`` reference for — a single-site (embedded or fragment)
+    core, which caps the achievable 1s overlap near ``sqrt(0.5)``.
 
-    Returns ``(energies, mo_coeff_columns)``.
+    This rotates the near-degenerate same-element shell manifold onto the
+    individual absorbers:
+
+    ``method='proj'`` (default)
+        Maximize the projection onto each atom's ``nl`` AOs (SVD; deterministic).
+    ``method='boys'``
+        Boys localization of the manifold, then per-atom Mulliken assignment.
+
+    Localized orbitals are not Fock eigenvectors, so energies are returned as
+    ``<phi|F|phi>``.  The manifold is near-degenerate, so this stays within
+    ~1e-4 Ha of the canonical eigenvalue.
+
+    Returns ``(energies, mo_coeff_columns, selection_meta)``.
     """
     mol = mf.mol
     mo_e = np.asarray(mf.mo_energy, dtype=float).ravel()
@@ -651,60 +736,255 @@ def _select_core_mos(
     if occ_idx.size == 0:
         raise RuntimeError("Fragment SCF has no occupied orbitals.")
 
-    shell_ao = _ao_shell_mask(mol, n, ell)
-    if not np.any(shell_ao):
+    mode = str(method).lower().strip()
+    if mode in ("projection", "svd", "atom"):
+        mode = "proj"
+    if mode not in ("proj", "boys"):
+        raise ValueError(f"core_localize must be 'proj' or 'boys' (got {method!r})")
+
+    shell_ao_all = _ao_shell_mask(mol, n, ell)
+    if not np.any(shell_ao_all):
+        raise RuntimeError(
+            f"No AOs matching n={n}, l={ell} in basis; check AE basis / edge."
+        )
+    edge_ids, manifold_ids = _core_atom_sets(mol, ell, edge_frag_atoms)
+    per_atom = max(1, int(n_per_atom) if n_per_atom is not None else (2 * ell + 1))
+
+    S = np.asarray(mol.intor("int1e_ovlp"), dtype=float)
+    C_occ = mo_c[:, occ_idx]
+    shell_man = _ao_mask_for_atoms(mol, manifold_ids, shell_ao_all)
+    if not np.any(shell_man):
+        raise RuntimeError(
+            f"No n={n}, l={ell} AOs on manifold atoms {manifold_ids}; check basis."
+        )
+
+    # The element's shell block: occupied MOs with the largest population on
+    # the manifold's nl AOs.
+    pops_man = _mo_mulliken_on_aos(C_occ, S, shell_man)
+    n_man = int(min(per_atom * len(manifold_ids), occ_idx.size))
+    man_pos = np.argsort(-pops_man)[:n_man]
+    C_man = C_occ[:, man_pos]
+    man_pop_min = float(np.min(pops_man[man_pos]))
+
+    localizer = mode
+    if mode == "boys":
+        try:
+            from pyscf import lo
+
+            loc = lo.Boys(mol, C_man)
+            loc.max_cycle = 200
+            C_loc = np.asarray(loc.kernel(), dtype=float)
+        except Exception:  # fall back to the deterministic projection
+            localizer = "proj_fallback"
+            C_loc = None
+    else:
+        C_loc = None
+
+    if C_loc is None:
+        cols = []
+        for ia in manifold_ids:
+            idx = np.where(_ao_mask_for_atoms(mol, [ia], shell_ao_all))[0]
+            if idx.size == 0:
+                continue
+            # Manifold-space vectors maximizing weight on this atom's nl AOs.
+            A = C_man.T @ S[:, idx]
+            u, _, _ = np.linalg.svd(A, full_matrices=False)
+            cols.append(C_man @ u[:, : min(per_atom, u.shape[1])])
+        if not cols:
+            raise RuntimeError(
+                f"No n={n}, l={ell} AOs on manifold atoms {manifold_ids}; check basis."
+            )
+        C_loc = _lowdin_orthonormalize(np.concatenate(cols, axis=1), S)
+
+    # Per-absorber assignment, as in _select_core_mos but on localized columns.
+    remaining = set(range(C_loc.shape[1]))
+    chosen: List[int] = []
+    per_atom_pops: List[Dict[str, Any]] = []
+    expect = int(min(per_atom * len(edge_ids), C_loc.shape[1]))
+    for ia in edge_ids:
+        atom_shell = _ao_mask_for_atoms(mol, [ia], shell_ao_all)
+        if not np.any(atom_shell):
+            raise RuntimeError(f"No n={n}, l={ell} AOs on edge atom {ia}; check basis.")
+        pops = _mo_mulliken_on_aos(C_loc, S, atom_shell)
+        picks, pick_pops = [], []
+        for _ in range(per_atom):
+            if not remaining:
+                break
+            best = max(remaining, key=lambda j: float(pops[j]))
+            remaining.remove(best)
+            picks.append(best)
+            pick_pops.append(float(pops[best]))
+            chosen.append(best)
+        per_atom_pops.append(
+            {"atom": int(ia), "mulliken_pops": pick_pops, "columns": picks}
+        )
+        if len(chosen) >= expect:
+            break
+
+    chosen = chosen[:expect]
+    energies = np.asarray(
+        [_mo_fock_expectation(mo_c, mo_e, S, C_loc[:, j]) for j in chosen], dtype=float
+    )
+    order = np.argsort(energies)
+    chosen = [chosen[i] for i in order]
+    energies = energies[order]
+    coeff = C_loc[:, chosen].copy()
+
+    meta = {
+        "method": f"localized_{localizer}",
+        "localize": mode,
+        "n": int(n),
+        "ell": int(ell),
+        "edge_atoms": [int(i) for i in edge_ids],
+        "manifold_atoms": [int(i) for i in manifold_ids],
+        "n_per_atom": int(per_atom),
+        "n_manifold": int(C_loc.shape[1]),
+        "manifold_pop_min": man_pop_min,
+        "per_atom": per_atom_pops,
+        "absorber_pop": float(per_atom_pops[0]["mulliken_pops"][0])
+        if per_atom_pops and per_atom_pops[0]["mulliken_pops"]
+        else float("nan"),
+    }
+    return energies, coeff, meta
+
+
+def _select_core_mos(
+    mf,
+    *,
+    n: int,
+    ell: int,
+    n_per_atom: Optional[int] = None,
+    edge_frag_atoms: Optional[Sequence[int]] = None,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """Pick occupied MOs localized on the target nl shell.
+
+    For each absorber, choose the unused occupied MO with the largest
+    S-metric Mulliken population on that atom's ``nl`` AOs.  Candidates are
+    restricted to the deepest shell-weighted occupied block so valence MOs
+    are not selected.
+
+    When several same-element cores are symmetry-delocalized with equal
+    absorber populations, any of those MOs is acceptable (degenerate).
+    The failure mode this fixes is *mis-assignment* among inequivalent or
+    weakly mixed cores (e.g. anthracene C6 vs C8), where energy-sorting the
+    ``|c|²`` shortlist picks a neighbor's 1s.
+
+    Parameters
+    ----------
+    edge_frag_atoms
+        Fragment-local atom indices that contribute core orbitals. If ``None``,
+        defaults to all heavy atoms (Z≥3) for s-shells, else all atoms.
+
+    Returns ``(energies, mo_coeff_columns, selection_meta)``.
+    """
+    mol = mf.mol
+    mo_e = np.asarray(mf.mo_energy, dtype=float).ravel()
+    mo_c = np.asarray(mf.mo_coeff, dtype=float)
+    mo_occ = np.asarray(mf.mo_occ, dtype=float).ravel()
+    occ_idx = np.where(mo_occ > 1e-6)[0]
+    if occ_idx.size == 0:
+        raise RuntimeError("Fragment SCF has no occupied orbitals.")
+
+    shell_ao_all = _ao_shell_mask(mol, n, ell)
+    if not np.any(shell_ao_all):
         raise RuntimeError(
             f"No AOs matching n={n}, l={ell} in basis; check AE basis / edge."
         )
 
-    natm = mol.natm
-    if edge_frag_atoms is not None:
-        edge_ids = [int(i) for i in edge_frag_atoms]
-        for i in edge_ids:
-            if i < 0 or i >= natm:
-                raise ValueError(
-                    f"edge fragment atom {i} out of range for natm={natm}"
-                )
-        n_edge = len(edge_ids)
-        shell_ao = _ao_mask_for_atoms(mol, edge_ids, shell_ao)
-        if not np.any(shell_ao):
+    # Include the full same-Z shell block in the candidate pool even when only
+    # one absorber is requested.
+    edge_ids, manifold_ids = _core_atom_sets(mol, ell, edge_frag_atoms)
+
+    per_atom = int(n_per_atom) if n_per_atom is not None else (2 * ell + 1)
+    per_atom = max(1, per_atom)
+    n_man = len(manifold_ids)
+    expect_man = min(per_atom * n_man, occ_idx.size)
+    expect = min(per_atom * len(edge_ids), occ_idx.size)
+
+    S = np.asarray(mol.intor("int1e_ovlp"), dtype=float)
+    C_occ = mo_c[:, occ_idx]
+    shell_man = _ao_mask_for_atoms(mol, manifold_ids, shell_ao_all)
+    if not np.any(shell_man):
+        raise RuntimeError(
+            f"No n={n}, l={ell} AOs on manifold atoms {manifold_ids}; check basis."
+        )
+
+    # Candidate pool: shell-weighted occupied MOs, then the deepest expect_man.
+    w_man = _mo_mulliken_on_aos(C_occ, S, shell_man)
+    pool_n = min(occ_idx.size, max(expect_man * 2, expect_man))
+    pool = np.argsort(-w_man)[:pool_n]
+    pool = pool[np.argsort(mo_e[occ_idx[pool]])]
+    cand_pos = np.asarray(pool[:expect_man], dtype=int)
+    if cand_pos.size < expect_man:
+        have = set(int(j) for j in cand_pos)
+        for j in np.argsort(mo_e[occ_idx]):
+            if int(j) in have:
+                continue
+            cand_pos = np.append(cand_pos, int(j))
+            if cand_pos.size >= expect_man:
+                break
+
+    C_cand = C_occ[:, cand_pos]
+    e_cand = mo_e[occ_idx[cand_pos]]
+    remaining = set(range(cand_pos.size))
+    chosen_cols: List[int] = []
+    per_atom_pops: List[Dict[str, Any]] = []
+
+    for ia in edge_ids:
+        atom_shell = _ao_mask_for_atoms(mol, [ia], shell_ao_all)
+        if not np.any(atom_shell):
             raise RuntimeError(
-                f"No n={n}, l={ell} AOs on edge atoms {edge_ids}; check basis."
+                f"No n={n}, l={ell} AOs on edge atom {ia}; check basis."
             )
-    elif ell == 0:
-        # Default K-edge: heavy atoms only (skip H/He)
-        edge_ids = [i for i in range(natm) if mol.atom_charge(i) >= 3]
-        if not edge_ids:
-            edge_ids = list(range(natm))
-        n_edge = len(edge_ids)
-        shell_ao = _ao_mask_for_atoms(mol, edge_ids, shell_ao)
-        if not np.any(shell_ao):
-            raise RuntimeError(
-                f"No n={n}, l={ell} AOs on heavy atoms {edge_ids}."
-            )
-    else:
-        edge_ids = list(range(natm))
-        n_edge = natm
+        pops = _mo_mulliken_on_aos(C_cand, S, atom_shell)
+        atom_picks: List[int] = []
+        atom_pick_pops: List[float] = []
+        for _ in range(per_atom):
+            if not remaining:
+                break
+            best = max(remaining, key=lambda j: float(pops[j]))
+            best_pop = float(pops[best])
+            remaining.remove(best)
+            atom_picks.append(best)
+            atom_pick_pops.append(best_pop)
+            chosen_cols.append(best)
+        per_atom_pops.append(
+            {
+                "atom": int(ia),
+                "mo_indices": [int(occ_idx[cand_pos[j]]) for j in atom_picks],
+                "mulliken_pops": atom_pick_pops,
+            }
+        )
+        if len(chosen_cols) >= expect:
+            break
 
-    if n_per_atom is not None:
-        expect = int(n_per_atom) * n_edge
-    else:
-        expect = (2 * ell + 1) * n_edge
-    expect = min(max(1, expect), occ_idx.size)
+    if len(chosen_cols) < expect:
+        leftovers = sorted(remaining, key=lambda j: float(e_cand[j]))
+        for j in leftovers:
+            if len(chosen_cols) >= expect:
+                break
+            chosen_cols.append(int(j))
+            remaining.discard(j)
 
-    weights = np.array(
-        [float(np.sum(mo_c[shell_ao, i] ** 2)) for i in occ_idx],
-        dtype=float,
-    )
-    order = np.argsort(-weights)
-    localized = order[: max(expect * 2, expect)]
-    cand = occ_idx[localized]
-    cand = cand[np.argsort(mo_e[cand])]
-    chosen = cand[:expect]
-    if chosen.size < expect:
-        chosen = occ_idx[np.argsort(mo_e[occ_idx])][:expect]
+    chosen_cols = chosen_cols[:expect]
+    order = np.argsort(e_cand[chosen_cols])
+    chosen_cols = [chosen_cols[i] for i in order]
+    energies = np.asarray([e_cand[j] for j in chosen_cols], dtype=float)
+    coeff = C_cand[:, chosen_cols].copy()
 
-    return mo_e[chosen].copy(), mo_c[:, chosen].copy()
+    meta = {
+        "method": "mulliken_max_per_atom",
+        "n": int(n),
+        "ell": int(ell),
+        "edge_atoms": [int(i) for i in edge_ids],
+        "manifold_atoms": [int(i) for i in manifold_ids],
+        "n_per_atom": int(per_atom),
+        "per_atom": per_atom_pops,
+        "n_candidates": int(cand_pos.size),
+        "chosen_mo_indices": [int(occ_idx[cand_pos[j]]) for j in chosen_cols],
+    }
+    return energies, coeff, meta
+
 
 
 # ---------------------------------------------------------------------------
@@ -718,15 +998,17 @@ def core_from_mf(
     shell: Optional[str] = None,
     edge_atom_indices: Optional[Sequence[int]] = None,
     n_core_per_atom: Optional[int] = None,
-    soc: bool = False,
+    soc: Union[bool, str] = False,
     atom_indices: Optional[Sequence[int]] = None,
+    core_localize: Optional[str] = None,
     verbose: bool = False,
 ) -> CoreOrbitals:
     """Select core MOs from a **user-supplied, converged** PySCF mean-field.
 
     The caller owns the SCF (CPU PySCF, gpu4pyscf, DF, X2C, custom guess, …).
     This only picks the edge-localized occupied MOs and optionally applies
-    orbital SOC.
+    orbital SOC.  ``soc="si"`` keeps spatial cores (SI-SOC is applied after
+    singlet+triplet TDA, not here).
 
     Parameters
     ----------
@@ -739,6 +1021,13 @@ def core_from_mf(
     atom_indices
         Optional parent-geometry index map stored on the result (defaults to
         ``range(mol.natm)``).
+    core_localize
+        ``None`` (default) keeps the canonical MOs.  ``'proj'`` / ``'boys'``
+        first rotate the same-element shell manifold onto individual absorbers
+        (see :func:`_localize_core_mos`).  Required whenever the absorber is
+        symmetry-equivalent to other atoms — otherwise the canonical core is a
+        multi-centre combination and both the 1s overlap and ``<c|r|v>`` are
+        referenced to the wrong initial state.
     """
     if not getattr(mf, "converged", False):
         raise RuntimeError("core_from_mf requires a converged mean-field (mf.converged).")
@@ -786,26 +1075,49 @@ def core_from_mf(
                     f"edge_atom_indices entry {i} out of range for natm={mol.natm}"
                 )
 
-    energies, coeff = _select_core_mos(
-        h,
-        n=n,
-        ell=ell,
-        n_per_atom=n_core_per_atom,
-        edge_frag_atoms=edge_frag,
-    )
+    localize = str(core_localize or "none").lower().strip()
+    if localize in ("none", "off", "", "false", "canonical"):
+        energies, coeff, sel_meta = _select_core_mos(
+            h,
+            n=n,
+            ell=ell,
+            n_per_atom=n_core_per_atom,
+            edge_frag_atoms=edge_frag,
+        )
+    else:
+        energies, coeff, sel_meta = _localize_core_mos(
+            h,
+            n=n,
+            ell=ell,
+            n_per_atom=n_core_per_atom,
+            edge_frag_atoms=edge_frag,
+            method=localize,
+        )
+        if verbose:
+            print(
+                f"core_from_mf: localized ({sel_meta['method']}) "
+                f"absorber pop={sel_meta['absorber_pop']:.4f}  "
+                f"eps={energies[0]:.6f} Ha",
+                flush=True,
+            )
 
+    soc_mode = parse_soc_mode(soc)
     meta: Dict[str, Any] = {
         "xc": getattr(mf, "xc", None),
         "basis": getattr(mol, "basis", None),
         "soc": False,
+        "soc_mode": soc_mode if soc_mode != "si" else "none",
         "n": n,
         "ell": ell,
         "from_user_mf": True,
         "edge_atom_indices": edge_parent,
         "e_tot": float(getattr(mf, "e_tot", np.nan)),
+        "core_selection": sel_meta,
     }
+    if soc_mode == "si":
+        meta["soc_deferred"] = "si"
 
-    if soc:
+    if soc_mode == "orbital":
         if ell == 0:
             if verbose:
                 print("SOC requested for s-shell; skipping (no first-order SOC).")
@@ -814,6 +1126,7 @@ def core_from_mf(
                 energies, coeff, mol, method="bp-subspace"
             )
             meta["soc"] = True
+            meta["soc_mode"] = "orbital"
 
     if atom_indices is None:
         atom_indices = list(range(mol.natm))
@@ -840,7 +1153,7 @@ def extract_fragment_core(
     xc: str = "pbe",
     charge: Optional[int] = None,
     spin: Optional[int] = None,
-    soc: bool = False,
+    soc: Union[bool, str] = False,
     edge_atom_indices: Optional[Sequence[int]] = None,
     n_core_per_atom: Optional[int] = None,
     max_cycle: int = 80,
@@ -1090,16 +1403,6 @@ def apply_orbital_soc(
 # 5. Inject cores into a PW / GTO host
 # ---------------------------------------------------------------------------
 
-def _grid_coords_angstrom(grid) -> np.ndarray:
-    """Cartesian grid points in Angstrom, shape ``(n_grid, 3)``."""
-    # DFTpy DirectGrid: .r is (3, nx, ny, nz) in Bohr
-    r = np.asarray(grid.r)
-    if r.ndim != 4 or r.shape[0] != 3:
-        raise ValueError(f"Unexpected grid.r shape {r.shape}")
-    coords_bohr = np.stack([r[0].ravel(), r[1].ravel(), r[2].ravel()], axis=1)
-    return coords_bohr  # PySCF eval_ao wants Bohr when mol.unit handled via coords
-
-
 def core_mos_to_pw_fields(
     core: CoreOrbitals,
     grid,
@@ -1130,15 +1433,18 @@ def core_mos_to_pw_fields(
     )
 
     mol = core.fragment_mol
-    C = np.asarray(core.mo_coeff, dtype=float)
+    C = np.asarray(core.mo_coeff)
     if C.ndim != 2:
         raise ValueError(f"mo_coeff must be 2-D, got shape {C.shape}")
-    coords = _grid_coords_angstrom(grid)
+    complex_c = np.iscomplexobj(C)
+    from casidapy.xas.xas_utils import grid_coords_bohr
+
+    coords = grid_coords_bohr(grid)
     ngrid = coords.shape[0]
     n_core = C.shape[1]
     xp = array_module(use_gpu)
-    C_x = xp.asarray(C, dtype=float)
-    psi_sum = [np.zeros(ngrid, dtype=float) for _ in range(n_core)]
+    C_x = xp.asarray(C, dtype=complex if complex_c else float)
+    psi_sum = [np.zeros(ngrid, dtype=complex if complex_c else float) for _ in range(n_core)]
 
     for p0, p1 in block_slices(ngrid, blksize, comm):
         ao = numint.eval_ao(mol, coords[p0:p1])
@@ -1160,7 +1466,6 @@ def core_mos_to_pw_fields(
     if normalize:
         fields = normalize_wavefunctions(fields, grid)
     return fields
-
 
 def inject_core_orbitals(
     kernel,
@@ -1228,30 +1533,57 @@ def inject_core_orbitals(
     )
 
 
-def _orthogonalize_occ_to_virt(psi_occ, psi_unocc, grid, *, use_gpu: bool = False):
-    """Gram–Schmidt core orbitals against virtuals on the grid."""
+def _orthogonalize_occ_to_virt(
+    psi_occ, psi_unocc, grid, *, use_gpu: bool = False, n_pass: int = 2
+):
+    """Gram–Schmidt core orbitals against virtuals on the grid.
+
+    Two passes (default) drive ``⟨core|virt⟩`` closer to zero than a single
+    subtract — the residual is what makes the length-gauge dipole
+    origin-dependent on a coarse FFT mesh.
+    """
     from dftpy.field import DirectField
     from casidapy.utils.casida_utils import normalize_wavefunctions
     from casidapy.utils.accel import array_module, asnumpy
 
     dV = float(grid.dV)
     xp = array_module(use_gpu)
-    virt = [xp.asarray(np.asarray(p, dtype=float).ravel(), dtype=float) for p in psi_unocc]
-    out = []
-    for psi in psi_occ:
-        v = xp.asarray(np.asarray(psi, dtype=float).ravel().copy(), dtype=float)
-        for u in virt:
-            overlap = float(asnumpy(xp.vdot(u, v)).real) * dV
-            v = v - overlap * u
-        nrm = float(np.sqrt(float(asnumpy(xp.vdot(v, v)).real) * dV))
-        if nrm < 1e-12:
-            raise RuntimeError(
-                "Core orbital vanished after orthogonalization to virtuals; "
-                "check grid coverage / fragment placement."
-            )
-        v = v / nrm
-        v_np = asnumpy(v)
-        out.append(DirectField(grid=grid, rank=1, griddata_3d=v_np.reshape(grid.nr)))
+    if not psi_unocc:
+        return normalize_wavefunctions(list(psi_occ), grid)
+    U = xp.stack(
+        [
+            xp.asarray(np.asarray(p, dtype=float).ravel(), dtype=float)
+            for p in psi_unocc
+        ],
+        axis=0,
+    )
+    O = xp.stack(
+        [
+            xp.asarray(np.asarray(psi, dtype=float).ravel(), dtype=float)
+            for psi in psi_occ
+        ],
+        axis=0,
+    )
+    for _ in range(max(int(n_pass), 1)):
+        # ⟨o|u⟩ = (O · U) dV;  O ← O − ⟨o|u⟩ U  (no extra dV).
+        overlaps = (O @ U.T) * dV
+        O = O - overlaps @ U
+    norms = xp.sqrt(xp.sum(O * O, axis=1) * dV)
+    if bool(asnumpy(xp.any(norms < 1e-12))):
+        raise RuntimeError(
+            "Core orbital vanished after orthogonalization to virtuals; "
+            "check grid coverage / fragment placement."
+        )
+    O = O / norms[:, None]
+    shape = grid.nr
+    out = [
+        DirectField(
+            grid=grid,
+            rank=1,
+            griddata_3d=asnumpy(O[i]).reshape(shape),
+        )
+        for i in range(O.shape[0])
+    ]
     return normalize_wavefunctions(out, grid)
 
 
@@ -1281,11 +1613,98 @@ def run_cvs_tda(kernel, options, *, n_states: Optional[int] = None):
         use_gpu=bool(getattr(kernel, "use_gpu", False)),
         xc=getattr(options, "xc", "PBE"),
         use_uspp=bool(getattr(kernel, "use_uspp", False)),
-        spin_state=getattr(options, "spin_state", "singlet"),
+        spin_state=getattr(
+            options, "spin_state", getattr(kernel, "spin_state", "singlet")
+        ),
     )
     if not getattr(kernel, "_ready", False):
         kernel.setup(tda=True)
     return run_casida(kernel, opts)
+
+
+def _extract_gto_cvs_kernel(
+    mf,
+    *,
+    n_unocc: int,
+    n_states: int,
+    spin_state: str,
+    use_df: bool,
+    use_gpu: bool,
+    use_mpi_response: bool,
+    verbose: bool,
+):
+    from casidapy.adapter.pyscf import extract_gto_kernel
+
+    return extract_gto_kernel(
+        mf,
+        n_occ=1,
+        n_unocc=int(n_unocc),
+        n_states=int(n_states),
+        use_df=use_df and not use_mpi_response,
+        use_gpu=use_gpu,
+        use_mpi_response=use_mpi_response,
+        verbose=verbose,
+        k_cache_max=0,
+        spin_state=spin_state,
+    )
+
+
+def run_cvs_si_soc(
+    kernel_s,
+    kernel_t,
+    options,
+    *,
+    n_states: Optional[int] = None,
+    n_states_triplet: Optional[int] = None,
+    mol=None,
+    C_o=None,
+    C_v=None,
+    hole_only: bool = False,
+    include_ground: bool = False,
+    scale: Optional[float] = None,
+):
+    """Singlet + triplet CVS-TDA coupled by one-electron SI-SOC.
+
+    ``kernel_s`` must be the singlet kernel (dipoles).  ``kernel_t`` is the
+    triplet-adapted ``f_xc`` kernel on the same core/virtual space.
+    Hole-only L-edge (PW): pass fragment ``mol`` + 2p ``C_o`` and
+    ``hole_only=True`` (``h_vv = 0``).
+    """
+    from casidapy.casida_api import CasidaOptions
+    from casidapy.utils.soc import solve_soc_si
+
+    res_s = run_cvs_tda(kernel_s, options, n_states=n_states)
+    n_t = int(n_states_triplet) if n_states_triplet is not None else (
+        int(n_states) if n_states is not None else int(options.n_states)
+    )
+    opts_t = CasidaOptions(
+        n_occ=int(kernel_t.n_occ),
+        n_unocc=int(kernel_t.n_unocc),
+        n_states=n_t,
+        basis=getattr(options, "basis", "gto"),
+        tda=True,
+        matrix_free=True,
+        solver_method=getattr(options, "solver_method", "davidson"),
+        solver_tol=getattr(options, "solver_tol", 1e-6),
+        solver_maxiter=getattr(options, "solver_maxiter", 80),
+        use_gpu=bool(getattr(kernel_t, "use_gpu", False)),
+        xc=getattr(options, "xc", "PBE"),
+        use_uspp=bool(getattr(kernel_t, "use_uspp", False)),
+        spin_state=getattr(kernel_t, "spin_state", "triplet"),
+    )
+    res_t = run_cvs_tda(kernel_t, opts_t, n_states=n_t)
+    soc = solve_soc_si(
+        res_s,
+        res_t,
+        kernel_s,
+        mol=mol,
+        C_o=C_o,
+        C_v=C_v,
+        hole_only=bool(hole_only),
+        include_ground=bool(include_ground),
+        scale=scale,
+    )
+    return soc, res_s, res_t
 
 
 def run_cvs_gto_from_mf(
@@ -1296,10 +1715,13 @@ def run_cvs_gto_from_mf(
     edge_atom_indices: Optional[Sequence[int]] = None,
     n_unocc: int = 50,
     n_states: int = 50,
-    soc: bool = False,
+    n_states_triplet: Optional[int] = None,
+    soc: Union[bool, str] = False,
+    hole_only: bool = False,
     use_gpu: bool = False,
     use_mpi_response: bool = False,
     use_df: bool = True,
+    core_localize: Optional[str] = None,
     verbose: bool = False,
 ):
     """CVS-TDA entirely in GTO: cores from ``mf``, **real virtuals** from ``mf``.
@@ -1309,40 +1731,95 @@ def run_cvs_gto_from_mf(
         mf = dft.RKS(mol).density_fit()
         mf.xc = "pbe0"
         mf.kernel()
-        res = run_cvs_gto_from_mf(
+        res, core, kernel = run_cvs_gto_from_mf(
             mf, edge="K", edge_atom_indices=[0], n_unocc=100, n_states=100
         )
 
+    L-edge / M-edge **SOC-coupled TDDFT** (spatial 2p/3d, not orbital SOC)::
+
+        res, core, kernel = run_cvs_gto_from_mf(
+            mf, edge="L", edge_atom_indices=[0], soc="si",
+            n_unocc=40, n_states=40,
+        )
+        # res.omega / res.f / res.d_mode are the mixed SI-SOC spectrum
+        # res.singlet, res.triplet are the uncoupled CVS-TDA parents
+
+    ``soc``
+        ``False`` / ``"none"`` — spatial cores, singlet TDA.
+        ``True`` / ``"orbital"`` — Breit–Pauli in the core subspace before
+        injection (j-adapted energies only; not L₂/L₃ TDDFT).
+        ``"si"`` — singlet + triplet TDA coupled by SI-SOC.
+    ``hole_only``
+        With ``soc="si"``, drop particle SOC (``h_vv = 0``).  Default is
+        full one-electron SI (hole + particle).  PW L-edge uses hole-only.
     ``use_gpu``
         CuPy GTO kernel (+ gpu4pyscf response when available).
     ``use_mpi_response``
         Promote ``mf`` to ``mpi4pyscf`` for MPI ``get_jk`` response.
     """
-    from casidapy.adapter.pyscf import extract_gto_kernel
-
+    soc_mode = parse_soc_mode(soc)
+    core_soc = True if soc_mode == "orbital" else False
     core = core_from_mf(
         mf,
         edge=edge,
         shell=shell,
         edge_atom_indices=edge_atom_indices,
-        soc=soc,
+        soc=core_soc,
+        core_localize=core_localize,
         verbose=verbose,
     )
-    # Host with real molecular virtuals; occupied window is temporary and
-    # replaced by inject_core_orbitals / set_core_active_space.
-    kernel, opts = extract_gto_kernel(
-        mf,
-        n_occ=1,
+    kw = dict(
         n_unocc=int(n_unocc),
         n_states=int(n_states),
-        use_df=use_df and not use_mpi_response,
+        use_df=use_df,
         use_gpu=use_gpu,
         use_mpi_response=use_mpi_response,
         verbose=verbose,
-        k_cache_max=0,
     )
-    inject_core_orbitals(kernel, core.energies, core.mo_coeff)
-    return run_cvs_tda(kernel, opts, n_states=n_states), core, kernel
+    if soc_mode != "si":
+        kernel, opts = _extract_gto_cvs_kernel(mf, spin_state="singlet", **kw)
+        inject_core_orbitals(kernel, core.energies, core.mo_coeff)
+        return run_cvs_tda(kernel, opts, n_states=n_states), core, kernel
+
+    kernel_s, opts_s = _extract_gto_cvs_kernel(mf, spin_state="singlet", **kw)
+    kernel_t, _opts_t = _extract_gto_cvs_kernel(mf, spin_state="triplet", **kw)
+    inject_core_orbitals(kernel_s, core.energies, core.mo_coeff)
+    inject_core_orbitals(kernel_t, core.energies, core.mo_coeff)
+    soc_res, res_s, res_t = run_cvs_si_soc(
+        kernel_s,
+        kernel_t,
+        opts_s,
+        n_states=n_states,
+        n_states_triplet=n_states_triplet,
+        hole_only=bool(hole_only),
+    )
+    n_s = int(np.asarray(res_s.omega).size)
+    n_t = int(np.asarray(res_t.omega).size)
+    out = CVSSOCResults(
+        omega=soc_res.omega,
+        f=soc_res.f,
+        mu=soc_res.mu,
+        U=soc_res.U,
+        singlet_weight=soc_res.singlet_weight,
+        triplet_weight=soc_res.triplet_weight,
+        singlet=res_s,
+        triplet=res_t,
+        core=core,
+        kernel=kernel_s,
+        kernel_t=kernel_t,
+        soc=soc_res,
+        metadata={
+            **dict(soc_res.meta),
+            "soc_mode": "si",
+            "edge": str(edge).upper(),
+            "shell": core.shell,
+            "n_core": int(core.energies.size),
+            "n_singlet": n_s,
+            "n_triplet": n_t,
+            "n_si": int(soc_res.omega.size),
+        },
+    )
+    return out, core, kernel_s
 
 
 def build_pw_kernel_from_qepy(
@@ -1356,6 +1833,9 @@ def build_pw_kernel_from_qepy(
     n_total_occ: Optional[int] = None,
     unocc_window_ev: Optional[float] = None,
     n_virt_active: Optional[int] = None,
+    virt_energy_shift_ha: float = 0.0,
+    pack_band_indices: Optional[Sequence[int]] = None,
+    spin_state: str = "singlet",
     verbose: bool = False,
 ):
     """Build a ``PlaneWaveKernel`` with **real QE virtuals** for CVS inject.
@@ -1380,8 +1860,65 @@ def build_pw_kernel_from_qepy(
         use_uspp=bool(casida_uspp),
         tda=True,
         matrix_free=True,
-        unocc_window_ev=unocc_window_ev,
-        unocc_subsample=n_virt_active,
+        unocc_window_ev=None if pack_band_indices is not None else unocc_window_ev,
+        unocc_subsample=None if pack_band_indices is not None else n_virt_active,
+        virt_energy_shift_ha=float(virt_energy_shift_ha),
+        pack_band_indices=pack_band_indices,
+        spin_state=spin_state,
         verbose=verbose,
     )
     return kernel, kernel.grid
+
+
+def clone_pw_kernel_triplet(kernel_s, *, xc=None):
+    """Triplet ALDA ``f_xc`` kernel sharing the singlet core/virtual orbitals.
+
+    Used for PW L-edge SI-SOC: same 2p + QE virtuals, Hartree dropped in ``K``.
+    GIPAW-reconstructed virtuals and dipole origin are copied; dipoles stay
+    on the singlet kernel.
+    """
+    from dftpy.functional.xc import XC
+    from casidapy.kernels.plane_wave import PlaneWaveKernel
+    from casidapy.utils.casida_utils import XC_TO_LIBXC_COMPONENTS
+
+    xc_name = str(
+        xc
+        or getattr(kernel_s, "xc", None)
+        or getattr(getattr(kernel_s, "functional", None), "name", None)
+        or "PBE"
+    ).upper()
+    if xc_name not in XC_TO_LIBXC_COMPONENTS:
+        if "PBE" in xc_name:
+            xc_name = "PBE"
+        elif xc_name in ("LDA", "PZ", "PW"):
+            xc_name = "LDA"
+        elif "BLYP" in xc_name or "B3LYP" in xc_name or "BHANDH" in xc_name:
+            xc_name = "BLYP"
+    if xc_name not in XC_TO_LIBXC_COMPONENTS:
+        raise ValueError(
+            f"No libxc triplet map for {xc_name}; cannot clone PW triplet kernel."
+        )
+    kernel_t = PlaneWaveKernel(
+        kernel_s.rho,
+        XC(xc=xc_name),
+        use_gpu=bool(getattr(kernel_s, "use_gpu", False)),
+        use_uspp=False,
+        spin_state="triplet",
+        libxc_xc_components=XC_TO_LIBXC_COMPONENTS[xc_name],
+        verbose=bool(getattr(kernel_s, "verbose", False)),
+    )
+    kernel_t.spin_state = "triplet"
+    kernel_t.set_active_orbitals(
+        kernel_s._occ_e,
+        kernel_s._unocc_e,
+        list(kernel_s._psi_occ),
+        list(kernel_s._psi_unocc),
+    )
+    tilde = getattr(kernel_s, "_psi_unocc_tilde", None)
+    if tilde is not None:
+        kernel_t._psi_unocc_tilde = tilde
+    kernel_t.dipole_origin = getattr(kernel_s, "dipole_origin", (0.0, 0.0, 0.0))
+    ijab = getattr(kernel_s, "_ijab_gto", None)
+    if ijab is not None:
+        kernel_t.set_gto_ijab(ijab)
+    return kernel_t

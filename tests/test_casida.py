@@ -66,6 +66,35 @@ class TestBuildInitialGuess:
         assert x0.shape == (2, 5)
 
 
+class TestSpinDensityAldaCollapse:
+    """nspin=2 ρ must not break singlet ALDA f_xc construction (MnO / Cr₂O₃)."""
+
+    def test_total_density_up_down_and_filtered(self):
+        from dftpy.field import DirectField
+        from dftpy.functional import Functional
+        from dftpy.grid import DirectGrid
+
+        from casidapy.kernels.plane_wave import PlaneWaveKernel
+        from casidapy.utils.casida_utils import filtered, total_density_for_alda
+
+        grid = DirectGrid(lattice=np.eye(3) * 8.0, nr=[6, 6, 6])
+        up = np.full(grid.nr, 0.05)
+        dn = np.full(grid.nr, 0.04)
+        rho = DirectField(grid, rank=2, griddata_3d=np.stack([up, dn]))
+        rho_t = total_density_for_alda(rho)
+        assert int(rho_t.rank) == 1
+        assert np.allclose(np.asarray(rho_t), 0.09)
+
+        xc = Functional(type="XC", name="PBE")
+        v2 = xc(rho, calcType=["V2"]).v2rho2
+        assert np.asarray(v2).shape[0] == 3
+        out = filtered(v2, 20.0, rho, 1e-3)
+        assert out.shape == tuple(grid.nr)
+
+        kernel = PlaneWaveKernel(rho, xc, spin_state="singlet")
+        assert np.asarray(kernel.fkxc_arr).shape == tuple(grid.nr)
+
+
 # ---------------------------------------------------------------------------
 # Unit tests for slice_active_space (qepy_adapter)
 # ---------------------------------------------------------------------------
@@ -156,6 +185,36 @@ class TestSliceActiveSpace:
         assert len(unocc_e) == 5
         assert psi_unocc == [3, 4, 5, 6, 7]
 
+    def test_plan_pw_band_indices_subsample(self):
+        from casidapy.adapter.qepy import (
+            plan_pw_band_indices,
+            slice_active_space_by_indices,
+        )
+
+        n_total_occ = 4
+        occ_idx, virt_idx, meta = plan_pw_band_indices(
+            self.eigs,
+            n_total_occ=n_total_occ,
+            n_occ=1,
+            n_unocc=6,
+            unocc_subsample=3,
+            verbose=False,
+        )
+        assert occ_idx == [3]
+        assert len(virt_idx) == 3
+        assert virt_idx[0] == 4
+        assert virt_idx[-1] == 9
+        assert meta["virt_eigs"].size == 3
+
+        psi_all = [None] * len(self.eigs)
+        for i in range(len(self.eigs)):
+            psi_all[i] = self.psi_all[i]
+        occ_e, unocc_e, psi_occ, psi_unocc = slice_active_space_by_indices(
+            self.eigs, psi_all, occ_idx, virt_idx
+        )
+        assert len(unocc_e) == 3
+        assert len(psi_unocc) == 3
+
     def test_invalid_n_occ_raises(self):
         from casidapy.adapter.qepy import slice_active_space
 
@@ -167,6 +226,17 @@ class TestSliceActiveSpace:
 
         with pytest.raises(ValueError, match="len\\(eigs\\)"):
             slice_active_space(self.eigs[:5], self.psi_all, 3)
+
+
+class TestVirtEnergyAlignment:
+    def test_fermi_energy_ha_from_driver(self):
+        from casidapy.adapter.qepy import fermi_energy_ha
+
+        class _Driver:
+            def get_fermi_level(self):
+                return 1.578  # Ry
+
+        assert fermi_energy_ha(_Driver()) == pytest.approx(0.789)
 
 
 # ---------------------------------------------------------------------------
@@ -1123,6 +1193,64 @@ class TestGPUAcceleration:
             _make_synthetic_pw_kernel(use_gpu=True)
 
 
+class TestHybridExxIjab:
+    """CIS ``−c_x (ij|ab)`` is v_H of occupied products, not exciton Hartree."""
+
+    def test_matvec_matches_spectral_occupied_hartree(self):
+        pytest.importorskip("dftpy")
+        kernel, _ = _make_synthetic_pw_kernel(use_gpu=False)
+        rng = np.random.default_rng(0)
+        v = rng.standard_normal(kernel.n_trans)
+        Kv0 = kernel.apply_K(v)
+
+        kernel.set_hybrid_exx(hybrid_coeff=1.0)
+        kernel.setup(tda=True)
+        Kv1 = kernel.apply_K(v)
+
+        n_o, n_u = kernel.n_occ, kernel.n_unocc
+        V = v.reshape(n_o, n_u)
+        expect = np.zeros((n_o, n_u))
+        nr = tuple(int(n) for n in kernel._grid_shape)
+        dV = float(kernel._dV)
+        psi_o = kernel._psi_occ_arr
+        psi_u = kernel._psi_unocc_arr
+        for i in range(n_o):
+            for j in range(n_o):
+                rho = (psi_o[i] * psi_o[j]).reshape(nr)
+                vh = np.asarray(kernel._hartree_spectral(rho, xp=np)).ravel()
+                chi_j = V[j] @ psi_u
+                expect[i] -= (psi_u @ (vh * chi_j)) * dV
+        np.testing.assert_allclose(Kv1 - Kv0, expect.ravel(), atol=1e-9, rtol=1e-7)
+
+        kernel.set_hybrid_exx(hybrid_coeff=0.25)
+        kernel.setup(tda=True)
+        Kv025 = kernel.apply_K(v)
+        np.testing.assert_allclose(
+            Kv025 - Kv0, 0.25 * (Kv1 - Kv0), atol=1e-9, rtol=1e-7
+        )
+
+    def test_dense_rows_match_matvec(self):
+        pytest.importorskip("dftpy")
+        kernel, _ = _make_synthetic_pw_kernel(use_gpu=False)
+        kernel.set_hybrid_exx(hybrid_coeff=0.25)
+        kernel.setup(tda=True)
+        rng = np.random.default_rng(1)
+        v = rng.standard_normal(kernel.n_trans)
+        K = kernel.dense_K_rows(range(kernel.n_trans))
+        np.testing.assert_allclose(K @ v, kernel.apply_K(v), atol=1e-8, rtol=1e-6)
+
+    def test_pbe_stays_off(self):
+        pytest.importorskip("dftpy")
+        kernel, _ = _make_synthetic_pw_kernel(use_gpu=False)
+        assert not kernel.exx_ijab_active
+        rng = np.random.default_rng(2)
+        v = rng.standard_normal(kernel.n_trans)
+        Kv = kernel.apply_K(v)
+        kernel.set_hybrid_exx(0.0)
+        kernel.setup(tda=True)
+        np.testing.assert_allclose(kernel.apply_K(v), Kv, atol=0.0, rtol=0.0)
+
+
 def _h2_rks(xc="pbe"):
     from pyscf import gto, dft
 
@@ -1750,3 +1878,97 @@ class TestUnionBoxGeometry:
         assert _place_in_box(np.ones((6, 6, 6)), (2, 2, 2), (1, 1, 1), (16, 9, 8)).sum() == 216
         assert _place_in_box(np.ones((6, 6, 6)), (0, 0, 0), (2, 2, 2), (6, 6, 6)).sum() == 64  # clipped
         assert _place_in_box(np.ones((3, 3, 3)), (0, 0, 0), (10, 10, 10), (5, 5, 5)).sum() == 0  # disjoint
+
+
+class TestEwaldMtLongRange:
+    """Reciprocal erf / Martyna–Tuckerman LR kernels (no Förster)."""
+
+    def _neutral_gaussian_field(self, grid, center, sigma=1.2, amp=1.0):
+        from dftpy.field import DirectField
+        r = grid.r
+        d2 = sum((r[i] - center[i]) ** 2 for i in range(3))
+        g = amp * np.exp(-d2 / (2.0 * sigma * sigma))
+        # charge-neutral pair: opposite Gaussians along z
+        shift = np.array(center, dtype=float)
+        shift[2] += 2.5
+        d2b = sum((r[i] - shift[i]) ** 2 for i in range(3))
+        g = g - amp * np.exp(-d2b / (2.0 * sigma * sigma))
+        fld = DirectField(grid=grid, rank=1)
+        fld[:] = g.reshape(fld.shape)
+        return fld
+
+    def test_sr_plus_lr_equals_full(self):
+        from dftpy.grid import DirectGrid
+        from dftpy.mpi import MP, SerialComm
+        from casidapy.subsystem_coupling import _screened_coulomb_potential
+
+        lattice = np.eye(3) * 20.0
+        grid = DirectGrid(lattice=lattice, nr=(32, 32, 32), full=True, mp=MP(comm=SerialComm()))
+        rho = self._neutral_gaussian_field(grid, (8.0, 8.0, 7.0))
+        alpha = 0.15
+        v_full = np.asarray(_screened_coulomb_potential(rho, alpha, "full"))
+        v_sr = np.asarray(_screened_coulomb_potential(rho, alpha, "sr"))
+        v_lr = np.asarray(_screened_coulomb_potential(rho, alpha, "lr"))
+        assert np.allclose(v_sr + v_lr, v_full, rtol=1e-6, atol=1e-8)
+
+    def test_ewald_lr_matches_screened_lr(self):
+        from dftpy.grid import DirectGrid
+        from dftpy.mpi import MP, SerialComm
+        from casidapy.subsystem_coupling import (
+            _ewald_lr_potential,
+            _screened_coulomb_potential,
+        )
+
+        lattice = np.eye(3) * 20.0
+        grid = DirectGrid(lattice=lattice, nr=(24, 24, 24), full=True, mp=MP(comm=SerialComm()))
+        rho = self._neutral_gaussian_field(grid, (7.0, 7.0, 6.0))
+        alpha = 0.1
+        a = np.asarray(_ewald_lr_potential(rho, alpha, mt_obj=None))
+        b = np.asarray(_screened_coulomb_potential(rho, alpha, "lr"))
+        assert np.allclose(a, b, rtol=1e-6, atol=1e-8)
+
+    def test_mt_lr_adds_wg_correction(self):
+        from dftpy.grid import DirectGrid
+        from dftpy.mpi import MP, SerialComm
+        from casidapy.subsystem_coupling import (
+            _ewald_lr_potential,
+            _make_coupling_mt,
+        )
+
+        lattice = np.eye(3) * 18.0
+        grid = DirectGrid(lattice=lattice, nr=(24, 24, 24), full=True, mp=MP(comm=SerialComm()))
+        rho = self._neutral_gaussian_field(grid, (6.0, 6.0, 5.5))
+        alpha = 0.12
+        mt = _make_coupling_mt(grid, alpha)
+        v_ewald = np.asarray(_ewald_lr_potential(rho, alpha, mt_obj=None))
+        v_mt = np.asarray(_ewald_lr_potential(rho, alpha, mt_obj=mt))
+        assert float(np.max(np.abs(v_mt - v_ewald))) > 1e-10
+        recip = rho.grid.get_reciprocal()
+        damp = np.exp(-recip.gg / (4.0 * alpha * alpha))
+        ker = 4.0 * np.pi * recip.invgg * damp + np.asarray(mt.wg)
+        v_ref = np.asarray((rho.fft() * ker).ifft(force_real=True))
+        assert np.allclose(v_mt, v_ref, rtol=1e-6, atol=1e-8)
+
+
+class TestDiagonalSrCoulomb:
+    """SR self-blocks K[I,I] fold into coupled A when include_diagonal_k=True."""
+
+    def test_diagonal_sr_shifts_tda_spectrum(self):
+        import numpy as np
+        from casidapy.subsystem_coupling import assemble_coupled_casida
+
+        res = [
+            {"omega": np.array([0.5]), "Z": np.eye(1)},
+            {"omega": np.array([0.6]), "Z": np.eye(1)},
+        ]
+        K = {
+            (0, 1): np.array([[0.01]]),
+            (1, 0): np.array([[0.01]]),
+            (0, 0): np.array([[0.05]]),
+            (1, 1): np.array([[0.07]]),
+        }
+        w0, _ = assemble_coupled_casida(res, K, tda=True, include_diagonal_k=False)
+        w1, _ = assemble_coupled_casida(res, K, tda=True, include_diagonal_k=True)
+        evals = np.linalg.eigvalsh(np.array([[0.55, 0.01], [0.01, 0.67]]))
+        np.testing.assert_allclose(sorted(w1), sorted(evals), rtol=1e-10)
+        assert float(np.min(np.abs(w1 - w0))) > 1e-6

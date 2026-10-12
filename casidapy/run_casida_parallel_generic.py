@@ -36,6 +36,12 @@ try:
 except ImportError:
     HAS_POLARITON_MODULE = False
 
+try:
+    from casidapy.qed_post import run_qed_post, save_qed_post_results
+    HAS_QED_POST_MODULE = True
+except ImportError:
+    HAS_QED_POST_MODULE = False
+
 
 def patch_ions_class():
     if not hasattr(Ions, "_orig_init"):
@@ -296,6 +302,33 @@ def main():
                         help="Lorentzian broadening for polaritonic spectrum (eV)")
     parser.add_argument("--npts", type=int, default=2000,
                         help="Number of points for broadened spectrum grid")
+    # ----- QED post-processing (Pauli-Fierz / Jaynes-Cummings) -----
+    parser.add_argument("--qed-post", type=str, default=None,
+                        help="Comma-separated cavity-QED models to post-process "
+                             "after the Casida solve: pf,jc,tc (e.g. 'pf,jc').")
+    parser.add_argument("--qed-omega-c", type=str, default="auto",
+                        help="Cavity energy in eV for --qed-post, or 'auto' for "
+                             "resonance with the brightest excitation (default: auto).")
+    parser.add_argument("--qed-lambda", type=float, nargs=3, default=None,
+                        metavar=("LX", "LY", "LZ"),
+                        help="Explicit coupling vector lambda (a.u.) for --qed-post.")
+    parser.add_argument("--qed-lambda-sweep", type=str, default=None,
+                        help="Comma-separated |lambda| magnitudes (a.u.) along --qed-pol.")
+    parser.add_argument("--qed-pol", type=float, nargs=3, default=[0.0, 0.0, 1.0],
+                        metavar=("PX", "PY", "PZ"),
+                        help="Polarization direction for --qed-lambda-sweep (default: 0 0 1).")
+    parser.add_argument("--qed-nstates", type=int, default=None,
+                        help="Cap on electronic roots in the PF manifold / TC (default: all).")
+    parser.add_argument("--qed-no-dse", action="store_true",
+                        help="Disable the dipole self-energy term in Pauli-Fierz.")
+    parser.add_argument("--qed-tda-pf", action="store_true",
+                        help="Also run full in-calculation Pauli-Fierz QED-TDDFT "
+                             "(build_qed_tda_matrix on the kernel) for the same "
+                             "cavity settings, to compare with the --qed-post PF/JC. "
+                             "Uses the full MO dipole blocks (incl. excited-state "
+                             "dipole structure), unlike the S0->Sk-only post-processing.")
+    parser.add_argument("--qed-tda-nstates", type=int, default=None,
+                        help="Number of QED-TDDFT roots for --qed-tda-pf (default: --n-states).")
     # ----- Input file -----
     parser.add_argument("--input-file", type=str, default=None,
                         help='Input file (.in format) containing all calculation parameters. '
@@ -734,6 +767,24 @@ def main():
         np.save(f"{output_base}_Z.npy", Z)
         if casida.mu_transition is not None:
             np.save(f"{output_base}_mu_transition.npy", casida.mu_transition)
+        # State-basis transition dipoles + physical amplitudes: the input
+        # contract for standalone QED (PF/JC) post-processing (casidapy-qed-post).
+        if casida.d_mode is not None:
+            np.save(f"{output_base}_d_mode.npy", casida.d_mode)
+        if casida.xpy is not None:
+            np.save(f"{output_base}_xpy.npy", casida.xpy)
+        # MO dipole blocks (occ-occ, virt-virt, occ-virt) enable offline
+        # excited-state (permanent) dipole analysis, e.g. dipole-switch/CT states.
+        _kern = getattr(casida, "_kernel", None)
+        if _kern is not None and hasattr(_kern, "mo_dipole_blocks"):
+            try:
+                _doo, _dvv, _dov = _kern.mo_dipole_blocks()
+                np.save(f"{output_base}_mo_dip_oo.npy", np.asarray(_doo))
+                np.save(f"{output_base}_mo_dip_vv.npy", np.asarray(_dvv))
+                np.save(f"{output_base}_mo_dip_ov.npy", np.asarray(_dov))
+                print(f"    Saved: {output_base}_mo_dip_{{oo,vv,ov}}.npy")
+            except Exception as _exc:
+                print(f"    Note: could not save MO dipole blocks: {_exc}")
 
         with open(f"{output_base}_results.txt", "w") as fout:
             fout.write("# Casida TDDFT Results\n")
@@ -760,6 +811,10 @@ def main():
         print(f"    Saved: {output_base}_Z.npy")
         if casida.mu_transition is not None:
             print(f"    Saved: {output_base}_mu_transition.npy")
+        if casida.d_mode is not None:
+            print(f"    Saved: {output_base}_d_mode.npy")
+        if casida.xpy is not None:
+            print(f"    Saved: {output_base}_xpy.npy")
         print(f"    Saved: {output_base}_results.txt")
 
         # ===== [10] Plot =====
@@ -829,6 +884,84 @@ def main():
                 save_polariton_results(polariton_data, output_base, args, comm=comm)
                 print(f"    Saved polariton results with prefix: {output_base}_polariton_*")
                 sys.stdout.flush()
+
+        # ===== [12] QED post-processing (Pauli-Fierz / Jaynes-Cummings) =====
+        # rank 0 only; run_qed_post is pure NumPy (no MPI collectives) and reuses
+        # the same core as the standalone casidapy-qed-post entry point.
+        if args.qed_post:
+            if not HAS_QED_POST_MODULE:
+                print("    Warning: casidapy.qed_post unavailable, skipping --qed-post")
+            elif casida.d_mode is None:
+                print("    Warning: no state dipoles (d_mode) available, skipping --qed-post")
+            else:
+                print("\n[12] QED post-processing (Pauli-Fierz / Jaynes-Cummings)...")
+                omega_c = None
+                if str(args.qed_omega_c).strip().lower() != "auto":
+                    omega_c = float(args.qed_omega_c) / 27.211386245988
+                lam_sweep = None
+                if args.qed_lambda_sweep:
+                    lam_sweep = [float(x) for x in args.qed_lambda_sweep.split(",") if x.strip()]
+                if args.qed_lambda is None and lam_sweep is None:
+                    print("    Warning: --qed-post set but no --qed-lambda/--qed-lambda-sweep; skipping")
+                else:
+                    qed_data = run_qed_post(
+                        omega, casida.d_mode, f=f,
+                        models=[m for m in args.qed_post.split(",") if m.strip()],
+                        omega_c=omega_c, lam_vec=args.qed_lambda, lam_sweep=lam_sweep,
+                        pol=args.qed_pol, nstates=args.qed_nstates,
+                        include_dse=not args.qed_no_dse,
+                    )
+                    save_qed_post_results(
+                        qed_data, output_base,
+                        bare_omega_ev=np.asarray(omega) * 27.211386245988, bare_f=f,
+                        gamma_pol_ev=getattr(args, "gamma_pol", 0.05),
+                        npts=getattr(args, "npts", 2000), plot=args.plot,
+                    )
+                    print(f"    Saved QED post results with prefix: {output_base}_qed*  "
+                          f"(ω_c = {qed_data['omega_c_ev']:.4f} eV)")
+                    sys.stdout.flush()
+
+        # ===== [13] In-calculation Pauli-Fierz QED-TDDFT (--qed-tda-pf) =====
+        # Full PF built in the transition basis using the MO dipole blocks
+        # (q_ov, Q_oo, Q_vv) -> captures excited-state dipole structure (DSE)
+        # that the S0->Sk-only post-processing (--qed-post) omits. Serial
+        # (comm=None): keep this run single-rank so it stays inside rank 0.
+        if rank == 0 and args.qed_tda_pf:
+            HA2EV = 27.211386245988
+            try:
+                from casidapy.utils.qed import solve_qed_tda
+                kernel = getattr(casida, "_kernel", None)
+                if kernel is None:
+                    print("    Warning: no kernel handle for --qed-tda-pf; skipping")
+                else:
+                    print("\n[13] In-calculation Pauli-Fierz QED-TDDFT...")
+                    # Cavity frequency: reuse the auto/explicit --qed-omega-c.
+                    if str(args.qed_omega_c).strip().lower() == "auto":
+                        wbright = omega[np.argmax(f)] if np.max(f) > 0 else omega[omega > 1e-8][0]
+                        omega_c = float(wbright)
+                    else:
+                        omega_c = float(args.qed_omega_c) / HA2EV
+                    # Same coupling vectors as the post-processing path.
+                    from casidapy.qed_post import make_lambda_vectors
+                    qsweep = None
+                    if args.qed_lambda_sweep:
+                        qsweep = [float(x) for x in args.qed_lambda_sweep.split(",") if x.strip()]
+                    lam_vecs = make_lambda_vectors(args.qed_lambda, sweep=qsweep, pol=args.qed_pol)
+                    n_pf = args.qed_tda_nstates or args.n_states
+                    for il, lam in enumerate(lam_vecs):
+                        res_pf = solve_qed_tda(
+                            kernel, lam_vec=lam, omega_c=omega_c, nstates=n_pf,
+                            include_dse=not args.qed_no_dse, matrix_free=False, comm=None,
+                        )
+                        tag = f"{output_base}_incalcpf_lambda{il}"
+                        np.save(f"{tag}_energies_ev.npy", np.asarray(res_pf.omega) * HA2EV)
+                        np.save(f"{tag}_osc_strength.npy", np.asarray(res_pf.f))
+                        np.save(f"{tag}_photon_frac.npy", np.asarray(res_pf.photon_frac))
+                    print(f"    Saved in-calc PF results with prefix: {output_base}_incalcpf_*  "
+                          f"(ω_c = {omega_c * HA2EV:.4f} eV, {len(lam_vecs)} λ points)")
+                    sys.stdout.flush()
+            except Exception as exc:
+                print(f"    Warning: --qed-tda-pf failed: {exc}")
 
         print("\n" + "=" * 60)
         print("Calculation complete!")

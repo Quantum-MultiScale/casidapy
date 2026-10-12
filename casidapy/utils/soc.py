@@ -63,6 +63,18 @@ class SOCResults:
     used for ``f``; stored as real after phase alignment)."""
     meta: Dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def d_mode(self) -> np.ndarray:
+        """``(3, n_states)`` singlet-borrowed dipoles for spectrum helpers."""
+        mu = np.asarray(self.mu, dtype=float)
+        if mu.ndim != 2:
+            raise ValueError(f"mu must be 2-D, got shape {mu.shape}")
+        if mu.shape[1] == 3:
+            return mu.T
+        if mu.shape[0] == 3:
+            return mu
+        raise ValueError(f"mu shape {mu.shape} is not (n,3) or (3,n)")
+
 
 def soc_ao_integrals(mol, *, scale: Optional[float] = None) -> np.ndarray:
     """One-electron spatial SOC AO matrices ``h[k]`` (complex hermitian).
@@ -93,9 +105,15 @@ def soc_ao_integrals(mol, *, scale: Optional[float] = None) -> np.ndarray:
 def soc_mo_blocks(
     hso_ao: np.ndarray,
     C_o: np.ndarray,
-    C_v: np.ndarray,
+    C_v: Optional[np.ndarray] = None,
+    *,
+    n_unocc: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Transform SOC AO integrals into oo / vv / ov MO blocks.
+
+    ``C_v is None`` (hole-only): ``h_vv`` and ``h_ov`` are zero.  That is
+    the L-edge CVS truncation — 2p hole SOC (L₂/L₃) without particle SOC
+    on the virtuals.
 
     Returns
     -------
@@ -103,8 +121,14 @@ def soc_mo_blocks(
     """
     hso_ao = np.asarray(hso_ao)
     C_o = np.asarray(C_o, dtype=float)
-    C_v = np.asarray(C_v, dtype=float)
     h_oo = np.einsum("xuv,ui,vj->xij", hso_ao, C_o, C_o, optimize=True)
+    n_o = int(C_o.shape[1])
+    if C_v is None:
+        n_v = int(n_unocc) if n_unocc is not None else 0
+        h_vv = np.zeros((3, n_v, n_v), dtype=complex)
+        h_ov = np.zeros((3, n_o, n_v), dtype=complex)
+        return h_oo, h_vv, h_ov
+    C_v = np.asarray(C_v, dtype=float)
     h_vv = np.einsum("xuv,ua,vb->xab", hso_ao, C_v, C_v, optimize=True)
     h_ov = np.einsum("xuv,ui,va->xia", hso_ao, C_o, C_v, optimize=True)
     return h_oo, h_vv, h_ov
@@ -245,11 +269,46 @@ def _phase_align_real_dipoles(mu_c: np.ndarray) -> np.ndarray:
     return np.real(mu)
 
 
+def _singlet_state_dipoles(singlet_results, kernel=None, mu_ia=None) -> np.ndarray:
+    """Singlet TDA state dipoles ``(n_s, 3)`` from μ_ia, ``d_mode``, or kernel."""
+    z = np.asarray(singlet_results.Z, dtype=float)
+    if mu_ia is not None:
+        mu = np.asarray(mu_ia, dtype=float)
+        if mu.ndim != 2 or mu.shape[0] != z.shape[0]:
+            raise ValueError(
+                f"mu_ia shape {mu.shape} incompatible with Z {z.shape}"
+            )
+        return (z.T @ mu).astype(complex)
+    d_mode = getattr(singlet_results, "d_mode", None)
+    if d_mode is not None:
+        d = np.asarray(d_mode, dtype=float)
+        n_s = z.shape[1]
+        if d.ndim == 2 and d.shape == (3, n_s):
+            return d.T.astype(complex)
+        if d.ndim == 2 and d.shape == (n_s, 3):
+            return d.astype(complex)
+    if kernel is None:
+        raise ValueError(
+            "solve_soc_si needs a singlet kernel, mu_ia, or singlet d_mode."
+        )
+    if getattr(kernel, "triplet", False):
+        raise ValueError(
+            "Pass the singlet kernel to solve_soc_si (for transition dipoles)."
+        )
+    mu = np.asarray(kernel.dipole_matrix(), dtype=float)
+    return (z.T @ mu).astype(complex)
+
+
 def solve_soc_si(
     singlet_results,
     triplet_results,
-    kernel,
+    kernel=None,
     *,
+    mol=None,
+    C_o=None,
+    C_v=None,
+    hole_only: bool = False,
+    mu_ia=None,
     include_ground: bool = False,
     origin: Sequence[float] = (0.0, 0.0, 0.0),
     scale: Optional[float] = None,
@@ -262,17 +321,46 @@ def solve_soc_si(
         :class:`~casidapy.casida_api.CasidaResults` from closed-shell TDA
         (``Z`` amplitudes required).
     kernel
-        The **singlet** (or shared RKS) :class:`~casidapy.kernels.gto.GTOKernel`
-        providing ``mol``, ``_C_o``, ``_C_v``.
+        Singlet kernel.  A :class:`~casidapy.kernels.gto.GTOKernel` supplies
+        ``mol``, ``_C_o``, ``_C_v`` and dipoles.  A plane-wave kernel is
+        enough for ``n_occ`` / ``n_unocc`` / dipoles when ``mol`` + ``C_o``
+        are passed (hole-only L-edge).
+    mol, C_o, C_v
+        Override the GTO SOC integrals.  ``C_v is None`` or ``hole_only``
+        zeros the particle block ``h_vv`` (2p hole SOC only).
     include_ground
         If True, add ``S0`` (E=0) coupled to triplets via ``h_ov``.
     """
-    if getattr(kernel, "_spin_flip", False):
-        raise ValueError("solve_soc_si expects a closed-shell GTOKernel (not SF).")
+    if kernel is not None and getattr(kernel, "_spin_flip", False):
+        raise ValueError("solve_soc_si expects a closed-shell kernel (not SF).")
     if singlet_results.Z is None or triplet_results.Z is None:
         raise ValueError("CasidaResults.Z amplitudes are required for SI-SOC.")
 
-    n_o, n_v = kernel.n_occ, kernel.n_unocc
+    if kernel is not None:
+        n_o = int(kernel.n_occ)
+        n_v = int(kernel.n_unocc)
+        if mol is None:
+            mol = getattr(kernel, "mol", None)
+        if C_o is None:
+            C_o = getattr(kernel, "_C_o", None)
+        if C_v is None and not hole_only:
+            C_v = getattr(kernel, "_C_v", None)
+    else:
+        if C_o is None:
+            raise ValueError("solve_soc_si needs kernel or C_o.")
+        n_o = int(np.asarray(C_o).shape[1])
+        n_trans = int(np.asarray(singlet_results.Z).shape[0])
+        if n_trans % n_o != 0:
+            raise ValueError(
+                f"n_trans={n_trans} is not a multiple of n_occ={n_o}"
+            )
+        n_v = n_trans // n_o
+
+    if mol is None:
+        raise ValueError("solve_soc_si needs mol (kernel.mol or mol=).")
+    if C_o is None:
+        raise ValueError("solve_soc_si needs occupied MO coefficients C_o.")
+
     X_s = _reshape_amps(singlet_results.Z, n_o, n_v)
     X_t = _reshape_amps(triplet_results.Z, n_o, n_v)
     omega_s = np.asarray(singlet_results.omega, dtype=float).ravel()
@@ -280,8 +368,12 @@ def solve_soc_si(
     if X_s.shape[0] != omega_s.size or X_t.shape[0] != omega_t.size:
         raise ValueError("Amplitude / omega count mismatch in SI-SOC inputs.")
 
-    hso_ao = soc_ao_integrals(kernel.mol, scale=scale)
-    h_oo, h_vv, h_ov = soc_mo_blocks(hso_ao, kernel._C_o, kernel._C_v)
+    hso_ao = soc_ao_integrals(mol, scale=scale)
+    if hole_only:
+        C_v = None
+    h_oo, h_vv, h_ov = soc_mo_blocks(
+        hso_ao, C_o, C_v, n_unocc=n_v if C_v is None else None
+    )
     H_st = st_soc_matrix(X_s, X_t, h_oo, h_vv)
     H_s0t = s0_triplet_soc(X_t, h_ov) if include_ground else None
 
@@ -299,36 +391,28 @@ def solve_soc_si(
         w_s = w_s + np.abs(U[0, :]) ** 2
     w_t = np.sum(np.abs(U[n_s0 + n_s:, :]) ** 2, axis=0)
 
-    # Singlet-borrowed transition dipoles from S0
-    # μ_ia from kernel (singlet spatial); state dipole = Σ_ia Z_ia μ_ia
-    # For mixed state k: μ_k = Σ_p U[S_p, k] * μ(S_p)
-    mu_ia = kernel.dipole_matrix()  # (n_trans, 3); zeros if kernel is triplet
-    if getattr(kernel, "triplet", False):
-        # Need singlet spatial dipoles even if we were passed a triplet kernel
+    mu_s = _singlet_state_dipoles(singlet_results, kernel=kernel, mu_ia=mu_ia)
+    if mu_s.shape[0] != n_s:
         raise ValueError(
-            "Pass the singlet GTOKernel to solve_soc_si (for transition dipoles)."
+            f"singlet dipoles ({mu_s.shape[0]}) != n_s={n_s}"
         )
-    # Singlet state dipoles: (n_s, 3)
-    mu_s = (singlet_results.Z.T @ mu_ia).astype(complex)  # (n_s, 3)
     mu_mixed_c = np.zeros((evals.size, 3), dtype=complex)
     for p in range(n_s):
         mu_mixed_c += U[n_s0 + p, :, None] * mu_s[p, None, :]
-    # S0 has no transition dipole to itself; S0 component does not add μ
     mu_real = _phase_align_real_dipoles(mu_mixed_c)
 
-    # Oscillator strength f = (2/3) ω |μ|² (a.u.); skip near-zero / negative ω
     f = np.zeros_like(evals, dtype=float)
     for k, w in enumerate(evals):
         if w <= 1e-12:
             continue
         f[k] = (2.0 / 3.0) * float(w) * float(np.dot(mu_real[k], mu_real[k]))
 
-    # Drop the ground-like root if include_ground (ω≈0)
     meta = {
         **layout,
         "scale": 0.5 / (C_AU ** 2) if scale is None else float(scale),
         "one_electron_only": True,
         "triplet_triplet_soc": False,
+        "hole_only": bool(hole_only or C_v is None),
         "origin": list(np.asarray(origin, dtype=float).ravel()),
     }
     return SOCResults(

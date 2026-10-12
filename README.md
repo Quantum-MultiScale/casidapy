@@ -384,6 +384,33 @@ res, core, kernel = run_cvs_gto_from_mf(
 # or: core = core_from_mf(mf, edge="K", edge_atom_indices=[0])
 ```
 
+**L/M-edge (final-state SI-SOC)** — spatial 2p/3d cores (do **not** apply
+orbital SOC on the hole; that double-counts). Run singlet and triplet
+CVS-TDA, then couple them with one-electron state-interaction SOC:
+
+```
+⟨S_p|H_SO|T_q^u⟩ = √2 Σ X^S X^T (δ_ij h^u_ab − δ_ab h^u_ij)
+```
+
+The hole block ``−h_oo`` on 2p is the L₂/L₃ splitting; ``h_vv`` is particle
+SOC. Oscillator strength of mixed roots is singlet-borrowed.
+
+```python
+from casidapy.xas import run_xas_gto
+
+res, core, kernel = run_xas_gto(
+    mf, edge="L", edge_atom_indices=[0], soc="si", n_unocc=40, n_states=40
+)
+# res.omega / res.f / res.d_mode — mixed SI-SOC spectrum
+# res.singlet, res.triplet — uncoupled CVS-TDA parents
+```
+
+``soc=True`` / ``"orbital"`` still diagonalizes Breit–Pauli in the 2p
+subspace *before* injection (j-adapted orbital energies). That is **not**
+SOC-coupled TDDFT and does not produce L₂/L₃ intensity borrowing.
+
+Crystal ``run_ae_host_pw_grid_cvs`` remains the K-edge 1s + GIPAW path.
+
 **PW host** — keep QE/QEPy virtuals; inject GTO cores onto the grid:
 
 ```python
@@ -444,7 +471,10 @@ res, core, kernel, mf = run_xas_reconstruct(
 )
 ```
 
-L-edge: use `edge="L", soc=True` to diagonalize Breit–Pauli SOC in the 2p subspace before injection (j-adapted energies). This is **orbital** SOC on the fragment, distinct from valence state-interaction SOC in `casidapy.utils.soc`.
+L-edge SOC-coupled TDDFT is the GTO path: ``run_xas_gto(..., edge="L", soc="si")``
+(spatial 2p + singlet/triplet SI-SOC). ``soc=True`` is orbital SOC on the
+fragment only, not final-state TDDFT coupling. Crystal ``ae_host`` remains
+the K-edge 1s + GIPAW production path.
 
 ---
 

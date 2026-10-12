@@ -1,0 +1,17 @@
+{
+  "argv": [
+    "/projectsn/mp1009_1/am4655/stddft/bin/python-libffi",
+    "-m",
+    "ipykernel_launcher",
+    "-f",
+    "{connection_file}"
+  ],
+  "display_name": "Python (casidapy / stddft + libffi)",
+  "language": "python",
+  "env": {
+    "LD_LIBRARY_PATH": "/projects/community-old/libffi/3.3/gc563/lib64:/projects/community-old/gcc/11.2/openmpi/4.1.6/ez82/lib:/projects/community-old/openssl-3.0.14/lib:/projects/community-old/python/3.10/lib",
+    "PYTHONPATH": "/projectsn/mp1009_1/am4655/casidapy",
+    "OMPI_MCA_btl": "^openib",
+    "OPAL_PREFIX": "/projects/community-old/gcc/11.2/openmpi/4.1.6/ez82"
+  }
+}

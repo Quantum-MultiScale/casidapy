@@ -18,6 +18,7 @@ def _wtime() -> float:
     return time.time()
 
 from dftpy.functional import Functional, LocalPseudo, TotalFunctional
+from dftpy.field import DirectField
 from dftpy.ions import Ions
 from dftpy.time_data import timer
 
@@ -31,11 +32,13 @@ from casidapy.utils.casida_utils import (
     build_initial_guess,
     mpi_comm_rank,
     mpi_comm_size,
+    normalize_psi_slabs,
     normalize_wavefunctions,
     psi_to_fields,
 )
 from casidapy.utils.davidson import davidson, solve_davidson, solve_eigsh, solve_lobpcg
-from casidapy.kernels.plane_wave import PlaneWaveKernel
+from casidapy.utils.memlog import report_memory
+from casidapy.kernels.plane_wave import PlaneWaveKernel, center_of_positive_charge
 from casidapy.adapter.qepy import slice_active_space
 
 
@@ -51,7 +54,8 @@ class CasidaKS_MPI:
                  rho_cutoff=1e-3, fxc_max=20.0, use_gpu=False,
                  spin_state="singlet", libxc_xc_components=None, comm=None,
                  use_uspp=False, beta_projectors=None, qij_augmentation=None,
-                 use_eDFTpy=False, kernel=None, driver=None):
+                 use_eDFTpy=False, kernel=None, driver=None,
+                 hartree_kernel="full", hartree_screen_alpha=0.1):
         if comm is None:
             self.comm = MPI.COMM_WORLD
         else:
@@ -76,6 +80,9 @@ class CasidaKS_MPI:
                 use_eDFTpy=use_eDFTpy,
                 verbose=(self.rank == 0),
                 use_gpu=use_gpu,
+                comm=self.comm,
+                hartree_kernel=hartree_kernel,
+                hartree_screen_alpha=hartree_screen_alpha,
             )
 
         # Mirror kernel attributes for backward-compatible access
@@ -131,70 +138,31 @@ class CasidaKS_MPI:
     def xas(
         self,
         *,
-        reconstruct=True,
         edge_atom,
+        gipaw_upf,
         edge="K",
-        basis="def2-tzvp",
-        xc="pbe0",
+        basis="aug-cc-pvdz",
+        xc="pbe",
         n_virt=None,
         n_states=40,
-        shell=None,
-        shells=None,
-        upf_path=None,
-        verbose=False,
-        driver=None,
-        pw_xc=None,
-        embed_mode="hirshfeld",
-        vhxc_scale="auto",
-        vhxc_scale_alpha=None,
-        vhxc_scale_min=None,
-        vhxc_scale_max=None,
-        r_damp=1.0,
-        gauge_align="far_field",
-        ae_electrons="atomic",
         oxidation_state=None,
         oxidation_states=None,
-        spin=None,
-        zero_embedding=False,
-        core_gauge_shift_ha=0.0,
-        eps_core_reference_ha=None,
-        core_reference_index=0,
-        vloc_source="qepy",
         use_gpu=None,
-        use_gpu_pw=None,
-        n_virt_active=None,
         comm=None,
+        verbose=False,
+        driver=None,
+        upf_path=None,
+        pw_xc=None,
+        **options,
     ):
-        """Core XAS via AE reconstruction in frozen ``V_env``.
+        """Core XAS: frozen-core AE 1s + QE virtuals + GIPAW μ/K.
 
-        Production defaults: ``hirshfeld`` (method-2 ionic + ``v_Hxc[ρ_env]``),
-        ``ae_electrons="atomic"`` (formal oxidation state), ``gauge_align="far_field"``
-        (auto Hirshfeld weight gauge for ``hirshfeld`` mode),
-        ``vloc_source="qepy"`` (QE ``setlocal`` peel of ``V_loc(A)``).
-        Use ``embed_mode="loc_only"`` for ionic solids; ``damp_vhxc`` for the
-        legacy geometric fade; ``zero_embedding=True`` for the isolated-ion
-        diagnostic. Pass ``eps_core_reference_ha`` to align cores to a full-AE
-        GTO reference level.
-
-        ``use_gpu``
-            CuPy for Hirshfeld / ``V_env`` AO / (optionally) PW kernel. Defaults
-            to the host kernel's ``use_gpu`` flag when omitted.
-        ``use_gpu_pw``
-            CuPy for PW Casida orbitals. Defaults to ``use_gpu``.
-        ``n_virt_active``
-            Optional energy-strided Casida virtual count for large ``n_virt``
-            pools (``None`` = use every selected virtual).
-        ``comm``
-            Optional ``mpi4py`` communicator for Hirshfeld atom loops and
-            AO-grid blocks (``None`` = serial; does not auto-touch
-            ``COMM_WORLD``).
+        Thin wrapper around :func:`~casidapy.xas.run_ae_host_pw_grid_cvs`.
         """
-        if not reconstruct:
-            raise ValueError("xas() currently requires reconstruct=True")
         driver = driver if driver is not None else self.driver
         if driver is None:
             raise ValueError("xas() needs a QEpy driver")
-        from casidapy.xas import run_reconstruct_cvs_from_driver
+        from casidapy.xas import run_ae_host_pw_grid_cvs
 
         n_virt = int(n_virt if n_virt is not None else (self.n_unocc or 40))
         if use_gpu is None:
@@ -203,39 +171,23 @@ class CasidaKS_MPI:
             comm = getattr(self, "comm", None)
         if pw_xc is None:
             pw_xc = getattr(getattr(self, "functional", None), "name", None) or "PBE"
-        return run_reconstruct_cvs_from_driver(
+        return run_ae_host_pw_grid_cvs(
             driver,
             int(edge_atom),
             edge=edge,
-            shell=shell,
-            shells=shells,
             basis=basis,
             xc=xc,
             pw_xc=pw_xc,
             n_virt=n_virt,
             n_states=int(n_states),
-            n_virt_active=n_virt_active,
+            oxidation_state=oxidation_state,
+            oxidation_states=oxidation_states,
             use_gpu=bool(use_gpu),
-            use_gpu_pw=use_gpu_pw,
             comm=comm,
             upf_path=upf_path,
             verbose=verbose,
-            embed_mode=embed_mode,
-            vhxc_scale=vhxc_scale,
-            vhxc_scale_alpha=vhxc_scale_alpha,
-            vhxc_scale_min=vhxc_scale_min,
-            vhxc_scale_max=vhxc_scale_max,
-            r_damp=r_damp,
-            gauge_align=gauge_align,
-            vloc_source=vloc_source,
-            ae_electrons=ae_electrons,
-            oxidation_state=oxidation_state,
-            oxidation_states=oxidation_states,
-            spin=spin,
-            zero_embedding=zero_embedding,
-            core_gauge_shift_ha=core_gauge_shift_ha,
-            eps_core_reference_ha=eps_core_reference_ha,
-            core_reference_index=core_reference_index,
+            gipaw_upf=gipaw_upf,
+            **options,
         )
 
     def transition_orbital(self, psi_i, psi_a, proj_i=None, proj_a=None):
@@ -423,6 +375,55 @@ class CasidaKS_MPI:
             dtype=np.float64,
         )
 
+    def _solve_dense_from_operator(self, A_op, k, verbose=1):
+        """Assemble the operator column-block by column-block and diagonalize.
+
+        Exact and free of convergence issues when ``n_trans`` is a few
+        thousand: blocks of identity columns go through ``matmat`` (which
+        spreads the Hartree FFTs over ranks), then rank 0 runs ``eigh`` and
+        broadcasts the lowest ``k`` pairs.
+        """
+        import time
+
+        from casidapy.utils.memlog import report_memory
+
+        n = self._n_trans
+        comm = self.comm
+        size = max(1, int(self.size))
+        block = 4 * size
+        A = np.empty((n, n), dtype=np.float64)
+        t0 = time.time()
+        for c0 in range(0, n, block):
+            c1 = min(n, c0 + block)
+            E = np.zeros((n, c1 - c0), dtype=np.float64)
+            E[np.arange(c0, c1), np.arange(c1 - c0)] = 1.0
+            A[:, c0:c1] = A_op.matmat(E)
+            if c0 == 0:
+                report_memory("dense solver: first column block", comm)
+            if self.rank == 0 and verbose:
+                dt = time.time() - t0
+                eta = dt / c1 * (n - c1)
+                print(
+                    f"  dense build: {c1}/{n} columns, {dt / 60:.1f} min, "
+                    f"ETA {eta / 60:.1f} min",
+                    flush=True,
+                )
+        asym = float(np.max(np.abs(A - A.T))) if n else 0.0
+        A = 0.5 * (A + A.T)
+        k = min(int(k), n)
+        w = np.empty(k, dtype=np.float64)
+        V = np.empty((n, k), dtype=np.float64)
+        if self.rank == 0:
+            if verbose:
+                print(f"  dense build: max |A - A^T| = {asym:.3e}", flush=True)
+            ev, evec = np.linalg.eigh(A)
+            w[:] = ev[:k]
+            V[:] = evec[:, :k]
+        if comm is not None and size > 1:
+            comm.Bcast(w, root=0)
+            comm.Bcast(V, root=0)
+        return w, V
+
     def solve_matrix_free(self, k, tol=1e-8, maxiter=200, verbose=1, method="lobpcg"):
         if not hasattr(self, "_matrix_free") or not self._matrix_free:
             raise RuntimeError("Call setup_matrix_free() first.")
@@ -438,7 +439,11 @@ class CasidaKS_MPI:
 
         X0 = build_initial_guess(self._dE, k)
 
-        if method.lower() == "davidson":
+        if method.lower() == "dense":
+            eigenvalues, eigenvectors = self._solve_dense_from_operator(
+                A_op, k, verbose=verbose
+            )
+        elif method.lower() == "davidson":
             eigenvalues, eigenvectors = solve_davidson(
                 A_op, nroots=k, X0=X0, diagonal=diagonal, tol=tol, maxiter=maxiter,
                 largest=False, verbose=verbose if self.rank == 0 else 0
@@ -455,7 +460,8 @@ class CasidaKS_MPI:
             )
         else:
             raise ValueError(
-                f"Unknown method: {method}. Use 'davidson', 'lobpcg', or 'eigsh'."
+                f"Unknown method: {method}. "
+                "Use 'dense', 'davidson', 'lobpcg', or 'eigsh'."
             )
 
         if self.tda:
@@ -521,7 +527,12 @@ class CasidaKS_MPI:
 
         local_rows = [ia for ia in range(Ntrans) if ia % self.size == self.rank]
         n_local = len(local_rows)
-        K_local = self._kernel.dense_K_rows(local_rows, verbose=(self.rank == 0))
+        if self.size > 1 and hasattr(self._kernel, 'dense_K_rows_mpi'):
+            K_local = self._kernel.dense_K_rows_mpi(
+                local_rows, self.comm, verbose=(self.rank == 0)
+            )
+        else:
+            K_local = self._kernel.dense_K_rows(local_rows, verbose=(self.rank == 0))
         if self.use_eDFTpy:
             self.transition_densities = self._kernel.transition_densities
 
@@ -716,6 +727,10 @@ def run_casida(
     # Grid backends (PW) build the full fxc engine; MO backends (GTO) attach a
     # minimal shell without PW fxc construction.
     if kernel.provides_grid:
+        if hasattr(kernel, '_comm') and kernel._comm is None and comm is not None:
+            kernel._comm = comm
+            kernel._mpi_size = int(comm.Get_size())
+            kernel._mpi_rank = int(comm.Get_rank())
         casida = CasidaKS_MPI(
             kernel.rho,
             kernel.functional,
@@ -895,6 +910,21 @@ def _run_casida_plane_wave(inputs: CasidaInputs, options: CasidaOptions, comm=No
         ions = Ions.from_ase(atoms)
     grid = inputs.grid
     rho_ks = inputs.rho_ks
+    # Guard: density must be a DirectField (``.grid``). After MPI gather some
+    # ranks historically received a bare ndarray, which crashes PlaneWaveKernel
+    # and leaves surviving ranks hung in Allreduce.
+    if not hasattr(rho_ks, "grid"):
+        rho_ks = DirectField(grid=grid, data=np.ascontiguousarray(rho_ks, dtype=float))
+        inputs = CasidaInputs(
+            atoms=inputs.atoms,
+            grid=inputs.grid,
+            rho_ks=rho_ks,
+            psi=inputs.psi,
+            eigs=inputs.eigs,
+            occs=inputs.occs,
+            beta_projectors=inputs.beta_projectors,
+            qij_augmentation=inputs.qij_augmentation,
+        )
     eigs = np.asarray(inputs.eigs).copy()
     occs = np.asarray(inputs.occs).copy()
     psi_list = inputs.psi
@@ -937,9 +967,23 @@ def _run_casida_plane_wave(inputs: CasidaInputs, options: CasidaOptions, comm=No
         from dftpy.td import hamiltonian
         Hamiltonian = hamiltonian(potential= totalfunctional(rho_ks).potential)
         eigs, psi_list = Hamiltonian.diagonalize()
-        
-    psi_list = psi_to_fields(psi_list, grid=grid, ions=ions, comm=comm)
-    psi_list = normalize_wavefunctions(psi_list, grid)
+
+    # Pre-scattered flat slabs from the QEpy adapter: skip psi_to_fields
+    # (which would gather/broadcast a full replica on every rank).
+    _sample = None
+    if isinstance(psi_list, (list, tuple)):
+        for _p in psi_list:
+            if _p is not None:
+                _sample = np.asarray(_p).ravel()
+                break
+    n_flat = int(np.prod(grid.nr))
+    if _sample is not None and _sample.ndim == 1 and _sample.size < n_flat:
+        psi_list = normalize_psi_slabs(
+            psi_list, float(grid.dV), comm=comm, inplace=True
+        )
+    else:
+        psi_list = psi_to_fields(psi_list, grid=grid, ions=ions, comm=comm)
+        psi_list = normalize_wavefunctions(psi_list, grid)
 
     n_total_occ = options.n_total_occ if options.n_total_occ is not None else int(np.sum(occs > 0.01))
     print('N total occ',n_total_occ)
@@ -954,8 +998,23 @@ def _run_casida_plane_wave(inputs: CasidaInputs, options: CasidaOptions, comm=No
         beta_projectors=inputs.beta_projectors,
         qij_augmentation=inputs.qij_augmentation,
         use_gpu=options.use_gpu,
+        hartree_kernel=getattr(options, "hartree_kernel", "full"),
+        hartree_screen_alpha=getattr(options, "hartree_screen_alpha", 0.1),
+        fxc_max=float(getattr(options, "fxc_max", 20.0)),
         comm=comm,
     )
+    upf_by_symbol = dict(getattr(options, "uspp_map", None) or {})
+    pseudo_map = getattr(options, "pseudo_map", None) or {}
+    for symbol, path in pseudo_map.items():
+        upf_by_symbol.setdefault(symbol, path)
+    dipole_origin = center_of_positive_charge(ions, upf_by_symbol)
+    casida._kernel.dipole_origin = tuple(float(x) for x in dipole_origin)
+    if rank == 0:
+        print(
+            "dipole origin at center of positive charge (Bohr): "
+            f"{dipole_origin[0]:.6f} {dipole_origin[1]:.6f} {dipole_origin[2]:.6f}",
+            flush=True,
+        )
     if eigs.ndim == 2:
         eigs = eigs[0]
     occ_e, unocc_e, psi_occ, psi_unocc = slice_active_space(
@@ -978,9 +1037,11 @@ def _run_casida_plane_wave(inputs: CasidaInputs, options: CasidaOptions, comm=No
     n_trans = casida.n_occ * casida.n_unocc
     n_states_actual = min(options.n_states, n_trans)
 
+    report_memory("casida: active orbitals set", comm)
     t0 = _wtime()
     if options.matrix_free:
         casida.setup_matrix_free(tda=options.tda)
+        report_memory("casida: kernel setup", comm)
         t_build = _wtime() - t0
         t1 = _wtime()
         omega, Z = casida.solve_matrix_free(
@@ -997,9 +1058,34 @@ def _run_casida_plane_wave(inputs: CasidaInputs, options: CasidaOptions, comm=No
         t1 = _wtime()
         omega, Z = casida.solve(k=n_states_actual)
         t_solve = _wtime() - t1
+    report_memory("casida: eigensolve", comm)
 
     f = casida.oscillator_strengths(k=n_states_actual)
+    report_memory("casida: oscillator strengths", comm)
     rho_state = casida.collapse_transition_densities_to_state_basis(n_states_actual)
+
+    # Full state-basis dipole matrix for excited-state-dipole QED (pff / coupled
+    # pff). Built from the MO dipole blocks when requested; skipped otherwise to
+    # avoid the extra O(n_occ²+n_unocc²) grid integrals.
+    D_full = None
+    if getattr(options, "compute_dipole_blocks", False):
+        _kern = getattr(casida, "_kernel", None)
+        if _kern is not None and hasattr(_kern, "mo_dipole_blocks"):
+            try:
+                from casidapy.utils.qed import state_basis_dipole_matrix
+                d_oo, d_vv, d_ov = _kern.mo_dipole_blocks()
+                D_full = np.asarray(
+                    state_basis_dipole_matrix(
+                        np.asarray(Z)[:, :n_states_actual], d_oo, d_vv, d_ov
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                if rank == 0:
+                    print(f"  D_full (mo_dipole_blocks) skipped: {exc}", flush=True)
+                D_full = None
+        elif rank == 0:
+            print("  D_full requested but kernel has no mo_dipole_blocks; skipping.", flush=True)
+
     return CasidaResults(
         omega=np.asarray(omega),
         f=np.asarray(f),
@@ -1008,6 +1094,7 @@ def _run_casida_plane_wave(inputs: CasidaInputs, options: CasidaOptions, comm=No
         rho_transition=rho_state,
         d_mode=None if casida.d_mode is None else np.asarray(casida.d_mode),
         xpy=np.asarray(casida.xpy) if casida.xpy is not None else np.asarray(casida.Z),
+        D_full=D_full,
         metadata={
             "n_total_occ": n_total_occ,
             "n_trans": n_trans,
@@ -1016,6 +1103,10 @@ def _run_casida_plane_wave(inputs: CasidaInputs, options: CasidaOptions, comm=No
             "tda": options.tda,
             "xc": options.xc,
             "of_context": options.of_context,
+            "hartree_kernel": getattr(options, "hartree_kernel", "full"),
+            "hartree_screen_alpha": float(
+                getattr(options, "hartree_screen_alpha", 0.1) or 0.1
+            ),
             "rho_basis": "amplitude_xpy",
             "timings_s": {"build_or_setup": float(t_build), "solve": float(t_solve)},
         },

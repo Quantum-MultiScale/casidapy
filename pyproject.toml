@@ -30,6 +30,8 @@ all = ["qepy", "pylibxc", "matplotlib", "pyscf"]
 [project.scripts]
 casidapy-run = "casidapy.run_casida_parallel_generic:main"
 casidapy-plot = "casidapy.plot_casida_spectrum:main"
+casidapy-qed-post = "casidapy.qed_post:main"
+casidapy-run-fused = "casidapy.run_casida_fused:main"
 
 [tool.setuptools.packages.find]
 include = ["casidapy*"]

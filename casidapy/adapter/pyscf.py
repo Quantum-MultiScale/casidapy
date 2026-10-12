@@ -15,6 +15,40 @@ from casidapy.casida_api import CasidaOptions
 from casidapy.kernels.gto import GTOKernel
 
 
+def density_fit_mf(mf, *, mol=None, auxbasis=None, xc=None, verbose: bool = False):
+    """Promote *mf* to RI-JK density fitting with per-element aux-basis fallbacks.
+
+    PySCF's default ``density_fit()`` picks a single jkfit name from the AO
+    basis (e.g. ``aug-cc-pvdz-jkfit``), which fails for elements missing from
+    that library (Ti, …).  ``df.make_auxbasis`` supplies jkfit where available
+    and even-tempered Gaussians elsewhere.
+    """
+    if getattr(mf, "with_df", None) is not None:
+        return mf
+    mol = mol if mol is not None else getattr(mf, "mol", None)
+    if mol is None:
+        raise ValueError("density_fit_mf requires mol or mf.mol")
+
+    from pyscf import df
+    from pyscf.lib.exceptions import BasisNotFoundError
+
+    xc_name = xc if xc is not None else getattr(mf, "xc", "HF")
+    if auxbasis is None:
+        auxbasis = df.make_auxbasis(mol, xc=xc_name)
+
+    try:
+        return mf.density_fit(auxbasis=auxbasis)
+    except BasisNotFoundError:
+        auxbasis = df.make_auxbasis(mol, xc=xc_name)
+        if verbose:
+            warnings.warn(
+                "DF auxbasis incomplete; retrying with make_auxbasis ETB fallback.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return mf.density_fit(auxbasis=auxbasis)
+
+
 def _as_numpy(a) -> np.ndarray:
     """Host float array; pull CuPy / gpu4pyscf buffers with ``.get()`` / ``asnumpy``."""
     if a is None:
@@ -129,7 +163,7 @@ def move_mf_to_gpu(
         gmf.mo_energy = cp.asarray(mo_energy)
         gmf.mo_occ = cp.asarray(mo_occ)
         if use_df:
-            gmf = gmf.density_fit()
+            gmf = density_fit_mf(gmf, mol=mol, xc=getattr(mf, "xc", xc), verbose=verbose)
         if getattr(gmf, "grids", None) is not None:
             gmf.grids.build()
         return gmf
@@ -167,7 +201,7 @@ def scf_highspin_uks(
     mf = dft.UKS(m)
     mf.xc = xc
     if use_df:
-        mf = mf.density_fit()
+        mf = density_fit_mf(mf, mol=m, xc=xc)
     mf.conv_tol = conv_tol
     mf.kernel()
     if not getattr(mf, "converged", True):

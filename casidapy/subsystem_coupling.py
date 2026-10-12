@@ -241,6 +241,7 @@ def _empty_coupled_result() -> Dict[str, Any]:
     return {
         "omega": np.array([]),
         "f": np.array([]),
+        "d_mode": np.zeros((0, 3), dtype=float),
         "Z": np.zeros((0, 0), dtype=float),
         "K_coupling": {},
         "f_nadd": None,
@@ -382,7 +383,20 @@ def assemble_coupled_casida(
     tda: bool = False,
     *,
     verbose: bool = False,
+    include_diagonal_k: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    """Assemble and diagonalize the coupled Casida / RPA matrix.
+
+    By default only off-diagonal ``K[I,J]`` (``I != J``) enter: fragment
+    ``omega_I`` already contain each fragment's own Casida response, so a
+    *full* Hartree self-block would double-count.
+
+    ``include_diagonal_k=True`` folds in ``K[I,I]`` as well.  Use this for
+    range-separated / MT coupling where ``K[I,I]`` is the **short-range
+    (erfc) Coulomb only** — the supercell's screened periodic self-images
+    that are absent from MT-split fragment energies and are not restored by
+    the inter-fragment MT long-range piece.
+    """
     omega_blocks = [_res_array(res, "omega") for res in fragment_results]
     block_sizes = [len(w) for w in omega_blocks]
     offsets = np.cumsum([0] + block_sizes[:-1]).tolist()
@@ -398,15 +412,15 @@ def assemble_coupled_casida(
             A_coupled[i0:i1, i0:i1] = np.diag(omega_blocks[I])
 
         for (I, J), K_IJ in K_coupling.items():
-            if I == J:
-                continue  # diagonal stays diag(omega_I); no self-block (see RPA note)
+            if I == J and not include_diagonal_k:
+                continue
             i0_I, i0_J = offsets[I], offsets[J]
             n_I, n_J = block_sizes[I], block_sizes[J]
             K_blk = _project_k_to_state_basis(
                 K_IJ, fragment_results[I], fragment_results[J], n_I, n_J,
             )
             A_coupled[i0_I:i0_I + n_I, i0_J:i0_J + n_J] += K_blk
-            if (J, I) not in K_coupling:
+            if I != J and (J, I) not in K_coupling:
                 A_coupled[i0_J:i0_J + n_J, i0_I:i0_I + n_I] += K_blk.T
 
         omega, Z = scipy_eigh(A_coupled)
@@ -417,16 +431,11 @@ def assemble_coupled_casida(
         i0, i1 = offsets[I], offsets[I] + block_sizes[I]
         C_coupled[i0:i1, i0:i1] = np.diag(omega_blocks[I] ** 2)
 
-    # Only OFF-diagonal blocks couple fragments. The diagonal stays diag(omega_I**2):
-    # the fragment excitations already are eigenstates of their embedded Casida, so a
-    # self-block K[I,I] re-integrates the kernel over a fragment's own transitions and
-    # double-counts response already in omega_I. Empirically the self-block drives the
-    # RPA C matrix indefinite (negative eigenvalues -> spurious omega=0 states) and
-    # shifts states below the fragment manifold even at large separation where the
-    # inter-fragment coupling is ~0. Skipping it makes the coupled spectrum reduce to
-    # the fragment spectrum as K_IJ(I!=J) -> 0, as it must.
+    # Off-diagonal K couples fragments. Diagonal K[I,I] only when
+    # ``include_diagonal_k`` (SR Coulomb self-block for rangesep/MT). Full
+    # Hartree K_II double-counts omega_I and can make RPA C indefinite.
     for (I, J), K_IJ in K_coupling.items():
-        if I == J:
+        if I == J and not include_diagonal_k:
             continue
         i0_I, i0_J = offsets[I], offsets[J]
         n_I, n_J = block_sizes[I], block_sizes[J]
@@ -437,7 +446,7 @@ def assemble_coupled_casida(
         )
         coupling = 2.0 * (sqrt_omega_I[:, None] * K_blk * sqrt_omega_J[None, :])
         C_coupled[i0_I:i0_I + n_I, i0_J:i0_J + n_J] += coupling
-        if (J, I) not in K_coupling:
+        if I != J and (J, I) not in K_coupling:
             C_coupled[i0_J:i0_J + n_J, i0_I:i0_I + n_I] += coupling.T
 
     w2, Z = scipy_eigh(C_coupled)
@@ -450,16 +459,14 @@ def assemble_coupled_casida(
         )
     return np.sqrt(np.maximum(w2, 0.0)), np.asarray(Z, dtype=float)
 
-def coupled_oscillator_strengths(
-    omega_coupled: np.ndarray,
-    Z_coupled: np.ndarray,
-    fragment_results: List[Dict[str, Any]],
-    *,
-    tda: bool = False,
-    verbose: bool = False,
-) -> np.ndarray:
-    mu_blocks = []
-    omega_blocks = []
+
+def _coupled_fragment_dipoles(fragment_results, *, verbose=False):
+    """Stack the fragment-state transition dipoles ``d_I`` and energies ``omega_I``.
+
+    Returns ``(mu_full (Ntot,3), omega_full (Ntot,))`` in the fragment-state
+    (transition) basis, or ``(None, None)`` if no fragment carries dipoles.
+    """
+    mu_blocks, omega_blocks = [], []
     for frag_idx, res in enumerate(fragment_results):
         om = np.asarray(_res_array(res, "omega"), dtype=float)
         n_states = len(om)
@@ -467,14 +474,10 @@ def coupled_oscillator_strengths(
         mu = _res_optional(res, "dip_tran")
         if mu is None:
             if verbose:
-                print(
-                    f"  WARNING: fragment {frag_idx} has no dip_tran; "
-                    "coupled oscillator strengths set to zero there.",
-                    flush=True,
-                )
+                print(f"  WARNING: fragment {frag_idx} has no dip_tran; "
+                      "coupled dipoles set to zero there.", flush=True)
             mu_blocks.append(np.zeros((n_states, 3)))
             continue
-
         mu = np.asarray(mu)
         if mu.shape[0] != n_states:
             amp = _fragment_amp_matrix(res)
@@ -484,12 +487,156 @@ def coupled_oscillator_strengths(
                 Z = _res_array(res, "Z", "eigenvectors")
                 mu = np.real(Z.conj().T @ mu)
         mu_blocks.append(mu)
-
     if not mu_blocks:
-        return np.array([], dtype=float)
+        return None, None
+    return np.vstack(mu_blocks), np.concatenate(omega_blocks)
 
-    mu_full = np.vstack(mu_blocks)               # (Ntot, 3) fragment-state dipoles d_I
-    omega_full = np.concatenate(omega_blocks)    # (Ntot,)  fragment excitation energies
+
+def coupled_transition_dipoles(
+    omega_coupled: np.ndarray,
+    Z_coupled: np.ndarray,
+    fragment_results: List[Dict[str, Any]],
+    *,
+    tda: bool = False,
+    verbose: bool = False,
+) -> np.ndarray:
+    """Physical S0->state transition dipoles of the coupled (merged) states.
+
+    ``mu_n`` (n_coupled, 3) such that ``f_n = (2/3) omega_n |mu_n|^2``:
+    ``mu_n = Σ_I d_I Z_I^n`` (TDA) or ``(Σ_I sqrt(omega_I) d_I Z_I^n)/sqrt(omega_n)``
+    (RPA). This is the state-basis ``d_mode`` consumed by the QED post-processing
+    (:func:`casidapy.qed_post.run_qed_post`).
+    """
+    mu_full, omega_full = _coupled_fragment_dipoles(fragment_results, verbose=verbose)
+    if mu_full is None:
+        return np.zeros((len(omega_coupled), 3), dtype=float)
+    Z_coupled = np.asarray(Z_coupled, dtype=float)
+    mu_eff = mu_full if tda else mu_full * np.sqrt(np.maximum(omega_full, 0.0))[:, None]
+    mu_coupled = np.zeros((len(omega_coupled), 3), dtype=float)
+    for n, omega_n in enumerate(omega_coupled):
+        if omega_n < 1e-30:
+            continue
+        d_n = np.real(mu_eff.T @ Z_coupled[:, n])
+        mu_coupled[n] = d_n if tda else d_n / np.sqrt(float(omega_n))
+    return mu_coupled
+
+
+def coupled_state_dipole_matrix(
+    omega_coupled: np.ndarray,
+    Z_coupled: np.ndarray,
+    fragment_results: List[Dict[str, Any]],
+    *,
+    mu_coupled: Optional[np.ndarray] = None,
+    tda: bool = False,
+    verbose: bool = False,
+) -> Optional[np.ndarray]:
+    r"""Full state-basis dipole matrix ``⟨P|r|Q⟩`` of the **coupled** spectrum.
+
+    Returns ``(3, N+1, N+1)`` with index 0 = coupled ground state and ``N`` =
+    number of coupled excited states, in the coherent-state frame (ground dipole
+    set to zero). This is the coupled analogue of
+    :func:`casidapy.utils.qed.state_basis_dipole_matrix`, feeding the
+    full-dipole Pauli–Fierz model (``pff``) on a subsystem-coupled result.
+
+    Physics (Frenkel / subsystem-LR-TDDFT diabatic basis)
+    -----------------------------------------------------
+    Coupled states are ``|P⟩ = Σ_{I,k} c^P_{I,k} |I,k⟩`` where ``|I,k⟩`` is
+    excitation ``k`` localized on fragment ``I`` (all other fragments in their
+    ground state). The one-body position operator ``r = Σ_M r_M`` gives
+
+        ⟨I,k|r|J,l⟩ = δ_IJ ⟨ψ^I_k|r_I|ψ^I_l⟩       (I≠J vanishes),
+
+    because moving excitation from fragment ``J`` to ``I`` is a two-site process
+    that a one-body operator cannot connect. Hence the coupled excited–excited
+    block is **purely intra-fragment**, rotated by the coupled eigenvectors::
+
+        ⟨P|r|Q⟩ = Σ_I Σ_{k,l} c^P_{I,k} c^Q_{I,l} · D^I_exc[k,l]
+
+    with ``D^I_exc`` the excited–excited block of fragment ``I``'s own
+    :func:`state_basis_dipole_matrix` (carried as ``res['D_full']``). The
+    ground↔excited (transition) block is the physical coupled transition dipole
+    from :func:`coupled_transition_dipoles`.
+
+    Exactness: for **TDA** the coupled eigenvectors are orthonormal, so the
+    rotation is exact. For **RPA** the ``(X+Y)`` weights are used (consistent
+    with the transition-dipole construction) but the excited-state permanent
+    dipoles are then only approximate — prefer TDA for ``pff``.
+
+    Returns ``None`` if no fragment carries ``D_full`` (nothing to build).
+    """
+    block_sizes = [len(_res_array(res, "omega")) for res in fragment_results]
+    offsets = np.cumsum([0] + block_sizes[:-1]).tolist()
+    omega_coupled = np.asarray(omega_coupled, dtype=float).ravel()
+    n_cpl = omega_coupled.size
+    if n_cpl == 0:
+        return None
+    if all(_res_optional(res, "D_full") is None for res in fragment_results):
+        if verbose:
+            print(
+                "  coupled_state_dipole_matrix: no fragment carries 'D_full'; "
+                "skipping (pff unavailable, use pf/jc/tddft).",
+                flush=True,
+            )
+        return None
+
+    Z_coupled = np.asarray(Z_coupled, dtype=float)
+    if mu_coupled is None:
+        mu_coupled = coupled_transition_dipoles(
+            omega_coupled, Z_coupled, fragment_results, tda=tda, verbose=verbose
+        )
+    mu_coupled = np.asarray(mu_coupled, dtype=float)  # (n_cpl, 3)
+
+    # Per-fragment-state -> coupled-state amplitude weights.
+    if tda:
+        W = Z_coupled  # columns orthonormal
+    else:
+        omega_full = np.concatenate(
+            [np.asarray(_res_array(res, "omega"), dtype=float) for res in fragment_results]
+        )
+        sw = np.sqrt(np.maximum(omega_full, 0.0))[:, None]
+        denom = np.sqrt(np.maximum(omega_coupled, 1e-30))[None, :]
+        W = (sw * Z_coupled) / denom  # (X+Y)-style weights
+
+    N = n_cpl + 1
+    D = np.zeros((3, N, N), dtype=float)
+    D[:, 0, 1:] = mu_coupled.T
+    D[:, 1:, 0] = mu_coupled.T
+    for I, res in enumerate(fragment_results):
+        Dfull_I = _res_optional(res, "D_full")
+        n_I = block_sizes[I]
+        if Dfull_I is None or n_I == 0:
+            continue
+        Dfull_I = np.asarray(Dfull_I, dtype=float)  # (3, n_I+1, n_I+1)
+        Dexc_I = Dfull_I[:, 1 : 1 + n_I, 1 : 1 + n_I].copy()  # (3, n_I, n_I)
+        # Coherent-state frame: the coupled GROUND dipole is set to zero (D[:,0,0]=0),
+        # so the excited block must be referenced to the SAME origin. The fragment's
+        # own state_basis_dipole_matrix leaves mu0_I on every excited diagonal
+        # (mu_exc = mu0_I + Dmu_k); subtract it so the excited block is the pure
+        # dipole FLUCTUATION Dmu_k. Omitting this left a spurious ~mu0 permanent
+        # dipole on every coupled excited state (huge for ionic LiCN) -> full-dipole
+        # PF (pff) over-mixed/over-shifted states and misplaced oscillator strength.
+        mu0_I = Dfull_I[:, 0, 0]  # fragment ground permanent dipole (3,)
+        for _k in range(n_I):
+            Dexc_I[:, _k, _k] -= mu0_I
+        W_I = W[offsets[I] : offsets[I] + n_I, :]  # (n_I, n_cpl)
+        # D[a, 1+P, 1+Q] += Σ_kl Dexc_I[a,k,l] W_I[k,P] W_I[l,Q]
+        D[:, 1:, 1:] += np.einsum(
+            "akl,kP,lQ->aPQ", Dexc_I, W_I, W_I, optimize=True
+        )
+    return D
+
+
+def coupled_oscillator_strengths(
+    omega_coupled: np.ndarray,
+    Z_coupled: np.ndarray,
+    fragment_results: List[Dict[str, Any]],
+    *,
+    tda: bool = False,
+    verbose: bool = False,
+) -> np.ndarray:
+    mu_full, omega_full = _coupled_fragment_dipoles(fragment_results, verbose=verbose)
+    if mu_full is None:
+        return np.array([], dtype=float)
     Z_coupled = np.asarray(Z_coupled, dtype=float)
     f_coupled = np.zeros(len(omega_coupled), dtype=float)
 
@@ -500,10 +647,7 @@ def coupled_oscillator_strengths(
     #   RPA : f_n = (2/3)         |Σ_I sqrt(omega_I) d_I Z_I^n|^2
     #
     # The RPA form carries the sqrt(omega_I) weight from the symmetric Casida-C
-    # eigenvector normalisation. The previous code instead divided by sqrt(omega_n)
-    # and kept an omega_n prefactor, which dropped the per-state sqrt(omega_I) factor
-    # and inflated every RPA intensity by ~1/omega_I (3-12x for omega~0.1-0.3 Ha),
-    # breaking intensity conservation and letting one mixed state hoard the dipole.
+    # eigenvector normalisation.
     if tda:
         mu_eff = mu_full
     else:
@@ -588,6 +732,8 @@ def run_subsystem_casida(
     f_nadd: Optional[np.ndarray] = None,
     hartree_mode: str = "full",
     coupling_alpha: Optional[float] = None,
+    diagonal_sr_coulomb: Optional[bool] = None,
+    diagonal_lr_coulomb: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Pavanello coupling on a serial ``gsystem`` (grid/density patched by eDFTpy).
 
@@ -628,6 +774,8 @@ def run_subsystem_casida(
             f_nadd=f_nadd,
             hartree_mode=hartree_mode,
             coupling_alpha=coupling_alpha,
+            diagonal_sr_coulomb=diagonal_sr_coulomb,
+            diagonal_lr_coulomb=diagonal_lr_coulomb,
         )
 
     if verbose:
@@ -870,6 +1018,12 @@ def run_subsystem_casida(
     return {
         "omega": omega_coupled,
         "f": f_coupled,
+        "d_mode": coupled_transition_dipoles(
+            omega_coupled, Z_coupled, active_results, tda=tda
+        ),
+        "D_full": coupled_state_dipole_matrix(
+            omega_coupled, Z_coupled, active_results, tda=tda, verbose=verbose
+        ),
         "Z": Z_coupled,
         "K_coupling": K_coupling,
         "f_nadd": f_nadd,
@@ -943,6 +1097,16 @@ def _select_active_fragments(fragment_results, omega_coupling_max, verbose):
                     if res.get("dip_tran") is not None
                     and np.asarray(res["dip_tran"]).shape[0] == omega.size
                     else res.get("dip_tran"),
+                    # Slice the full state-basis dipole matrix to the kept states,
+                    # keeping the ground row/col (index 0): idx map [0, keep+1].
+                    "D_full": (
+                        np.asarray(res["D_full"])[
+                            :, np.r_[0, keep + 1][:, None], np.r_[0, keep + 1][None, :]
+                        ]
+                        if res.get("D_full") is not None
+                        and np.asarray(res["D_full"]).shape[1] == omega.size + 1
+                        else res.get("D_full")
+                    ),
                     "rho_transition": [
                         res["rho_transition"][int(i)] for i in keep
                     ] if res.get("rho_transition") is not None else None,
@@ -1106,18 +1270,29 @@ def _box_grid(gsystem, box_shift, box_shape):
 
 
 def _sr_coupling_block_box(
-    phi_res, stream_state, n_stream, gsystem, isub_res, isub_stream, f_nadd, alpha, pad=2,
+    phi_res, stream_state, n_stream, gsystem, isub_res, isub_stream, f_nadd, alpha,
+    pad=2, lr_mode: str = "none", mt_obj=None,
 ):
-    """Screened (erfc) short-range coupling block on the *union sub-box* of the two
-    fragments — the memory-saving variant of the SR term.
+    """Screened (erfc) short-range coupling on the union sub-box of two fragments.
 
     Because the SR Coulomb is screened it decays within ~1/alpha, so it only needs
-    a grid spanning where the two densities are close, not the full cell. Returns
-    ``K`` (n_res, n_stream); combine with the far-field dipole LR as usual.
+    a grid spanning where the two densities are close, not the full cell.
+
+    ``lr_mode`` (same stream pass — partner density is consumed once):
+      * ``"none"``  — return SR (+ ``f_nadd``) only; caller may add Förster LR.
+      * ``"ewald"`` — add periodic reciprocal ``erf`` LR on the **global** grid.
+      * ``"mt"``    — add Martyna–Tuckerman LR: ``erf`` kernel + ``W(G)`` on the
+        global grid (open-boundary / image-corrected long range).
     """
     n_res = len(phi_res)
     if n_res == 0 or n_stream == 0:
         return np.zeros((n_res, n_stream), dtype=float)
+
+    lr_mode = str(lr_mode).lower()
+    if lr_mode not in ("none", "ewald", "mt"):
+        raise ValueError(f"unknown lr_mode {lr_mode!r}")
+    if lr_mode == "mt" and mt_obj is None:
+        raise ValueError("lr_mode='mt' requires mt_obj (MartynaTuckerman on global grid)")
 
     box_shift, box_shape = _union_index_box(gsystem, isub_res, isub_stream, pad)
     if np.any(np.asarray(box_shape) <= 0):
@@ -1128,11 +1303,12 @@ def _sr_coupling_block_box(
     s_str = np.asarray(graph.sub_shift[isub_stream], dtype=int)
     box_grid = _box_grid(gsystem, box_shift, box_shape)
     box_dV = float(box_grid.dV)
+    global_grid = gsystem.grid
 
     bsl = tuple(slice(int(box_shift[i]), int(box_shift[i] + box_shape[i])) for i in range(3))
     f_nadd_box = np.asarray(f_nadd)[bsl]
 
-    res_flat = np.stack([
+    res_box_flat = np.stack([
         _place_in_box(
             np.asarray(_embedding_subcell_field(phi_res[ia], gsystem, isub_res)),
             s_res, box_shift, box_shape,
@@ -1140,17 +1316,35 @@ def _sr_coupling_block_box(
         for ia in range(n_res)
     ])  # (n_res, n_box)
 
+    # Resident densities on the global grid for the LR integral (only if needed).
+    if lr_mode != "none":
+        phi_res_fields = [
+            _embedding_subcell_field(phi_res[ia], gsystem, isub_res) for ia in range(n_res)
+        ]
+        res_glob_flat = np.stack([np.asarray(f).ravel() for f in phi_res_fields])
+        sub_dV = float(phi_res_fields[0].grid.dV)
+
     K = np.zeros((n_res, n_stream), dtype=float)
     for jb in range(n_stream):
+        phi_j_sub = _embedding_subcell_field(stream_state(jb), gsystem, isub_stream)
         phi_j_box = _place_in_box(
-            np.asarray(_embedding_subcell_field(stream_state(jb), gsystem, isub_stream)),
-            s_str, box_shift, box_shape,
+            np.asarray(phi_j_sub), s_str, box_shift, box_shape,
         )
         fld = DirectField(grid=box_grid, rank=1)
         fld[:] = phi_j_box.reshape(fld.shape)
         v_sr = np.asarray(_screened_coulomb_potential(fld, alpha, "sr"))
         response = v_sr + f_nadd_box * phi_j_box
-        K[:, jb] = res_flat @ response.ravel() * box_dV
+        K[:, jb] = res_box_flat @ response.ravel() * box_dV
+
+        if lr_mode != "none":
+            phi_jb_global = _sub_to_global(phi_j_sub, gsystem, isub_stream)
+            v_lr = np.asarray(
+                _ewald_lr_potential(phi_jb_global, alpha, mt_obj if lr_mode == "mt" else None),
+            )
+            response_field = DirectField(grid=global_grid, rank=1)
+            response_field[:] = v_lr.reshape(response_field.shape)
+            response_on_res = _global_to_sub(response_field, gsystem, isub_res)
+            K[:, jb] = K[:, jb] + res_glob_flat @ np.asarray(response_on_res).ravel() * sub_dV
     return K
 
 
@@ -1178,6 +1372,32 @@ def _screened_coulomb_potential(rho, alpha, part="sr"):
         else:
             raise ValueError(f"unknown screened-Coulomb part {part!r}")
     return (rho_g * ker).ifft(force_real=True)
+
+
+def _make_coupling_mt(grid, alpha_rs: float):
+    """Martyna–Tuckerman helper on ``grid`` matching our range-sep ``alpha`` (a0^-1).
+
+    DFTpy/QE store the erf split as ``erf(sqrt(alpha_mt) r)/r`` with
+    ``alpha_mt = alpha_rs**2``, so ``exp(-G^2/(4 alpha_mt))`` matches our
+    ``exp(-G^2/(4 alpha_rs^2))`` damping.
+    """
+    from dftpy.functional.martyna_tuckerman import MartynaTuckerman
+    return MartynaTuckerman(grid, alpha=float(alpha_rs) ** 2)
+
+
+def _ewald_lr_potential(rho, alpha, mt_obj=None):
+    """Reciprocal long-range Hartree: erf kernel, optionally + MT ``W(G)``.
+
+    * Ewald (periodic): ``4 pi / G^2 * exp(-G^2/(4 alpha^2))``
+    * Martyna–Tuckerman: same plus ``W(G)`` so the LR mimics open boundaries
+      (no Förster dipole truncation).
+    """
+    recip = rho.grid.get_reciprocal()
+    damp = np.exp(-recip.gg / (4.0 * alpha * alpha))
+    ker = 4.0 * np.pi * recip.invgg * damp
+    if mt_obj is not None:
+        ker = ker + np.asarray(mt_obj.wg)
+    return (rho.fft() * ker).ifft(force_real=True)
 
 
 def compute_coupling_block_streamed(
@@ -1306,30 +1526,19 @@ def _run_subsystem_casida_distributed(
     f_nadd=None,
     hartree_mode="full",
     coupling_alpha=None,
+    diagonal_sr_coulomb=None,
+    diagonal_lr_coulomb=None,
 ):
     """Collective distributed coupling. See :func:`run_subsystem_casida`.
 
     Every rank calls this. Returns the coupled result dict on world rank 0 and
     ``None`` elsewhere (eDFTpy broadcasts the slim spectrum afterwards).
 
-    ``hartree_mode``:
-      * ``"full"``  — grid Hartree on the serial global grid (streams densities).
-      * ``"dipole"`` — far-field (Förster) coupling: the erf->1 long-range limit
-        of the range-separated Coulomb, i.e. transition-dipole/transition-dipole
-        interaction. Needs no grids and no density streaming (uses ``dip_tran``
-        metadata already present on every rank), so it is O(1) memory and image
-        free. Accurate for well-separated fragments; misses short-range overlap
-        and higher multipoles.
-      * ``"rangesep"`` — full erf/erfc range separation: screened (erfc) short
-        range on the **global** grid (image-free) + erf long range as far-field
-        dipole. Image-corrected coupling at ~the same memory as ``full``;
-        ``coupling_alpha`` (a.u.^-1) sets the split (exact result is
-        alpha-independent).
-      * ``"rangesep_box"`` — same physics as ``rangesep`` but the screened SR is
-        solved on the **union sub-box** of the two fragments instead of the global
-        grid (memory-saving; the SR is localized within ~1/alpha so the small box
-        is sufficient). Validate against ``rangesep`` — they should agree when the
-        box + pad exceeds the screening length.
+    ``diagonal_sr_coulomb`` / ``diagonal_lr_coulomb``:
+      Optional self-blocks ``K[I,I]`` folded onto coupled A diagonals.
+      SR = erfc only (legacy when fragment Casida used full Hartree).
+      LR = erf + ``W(G)`` MT / Ewald (use when fragment Casida already owns
+      erfc SR via ``hartree_kernel='mt_sr'`` — do **not** also enable SR).
     """
     if graphtopo is None or fragment_owners is None:
         raise ValueError(
@@ -1366,22 +1575,35 @@ def _run_subsystem_casida_distributed(
 
     hartree = Functional(type="HARTREE")
 
-    # Range-separated Hartree: the grid loop computes the screened (erfc) short
-    # range with 'sr' kernel; the erf long range is added afterwards as far-field
-    # dipole coupling (root only). A FIXED alpha (a.u.) is used so the split is
-    # identical across a distance scan; the exact result is alpha-independent, and
-    # a smaller alpha pushes more of the interaction onto the exact grid SR.
+    # Range-separated Hartree: grid loop builds screened (erfc) SR (+ f_nadd);
+    # LR is either Förster dipole (post-pass) or reciprocal erf / MT (same stream).
     _mode = str(hartree_mode).lower()
-    _rangesep = _mode in ("rangesep", "rangesep_box")
-    _rangesep_box = _mode == "rangesep_box"
+    _rangesep_box = _mode in ("rangesep_box", "rangesep_box_ewald", "rangesep_box_mt")
+    _rangesep = _mode in ("rangesep",) or _rangesep_box
+    _lr_dipole = _mode in ("rangesep", "rangesep_box")
+    _lr_box = (
+        "mt" if _mode == "rangesep_box_mt"
+        else ("ewald" if _mode == "rangesep_box_ewald" else "none")
+    )
     _screen_alpha = None
+    _mt_obj = None
     if _rangesep:
         _screen_alpha = float(coupling_alpha) if coupling_alpha else _DEFAULT_COUPLING_ALPHA
+        if _lr_box == "mt":
+            _mt_obj = _make_coupling_mt(gsystem.grid, _screen_alpha)
         if verbose and ((not is_mpi) or my_rank == root):
             where = "union sub-box" if _rangesep_box else "global grid"
+            if _lr_dipole:
+                lr_msg = "erf far-field dipole LR"
+            elif _lr_box == "mt":
+                lr_msg = "Martyna-Tuckerman reciprocal LR (erf + W(G))"
+            elif _lr_box == "ewald":
+                lr_msg = "Ewald reciprocal erf LR (periodic)"
+            else:
+                lr_msg = "no LR"
             print(
                 f"  Range-separated coupling Hartree: erfc SR on {where} (alpha="
-                f"{_screen_alpha:.3f} a0^-1) + erf far-field dipole LR.",
+                f"{_screen_alpha:.3f} a0^-1) + {lr_msg}.",
                 flush=True,
             )
 
@@ -1460,6 +1682,7 @@ def _run_subsystem_casida_distributed(
                     K_rs = _sr_coupling_block_box(
                         phi_res, _getter, n_stream, gsystem,
                         resident, producer, f_nadd, _screen_alpha,
+                        lr_mode=_lr_box, mt_obj=_mt_obj,
                     )
                 else:
                     K_rs = compute_coupling_block_streamed(
@@ -1477,6 +1700,85 @@ def _run_subsystem_casida_distributed(
         if is_mpi:
             comm.Barrier()
 
+    # Self-blocks K[I,I] (owners only; gathered with K_local).
+    # SR (erfc): legacy when fragment Casida used full Hartree.
+    # LR (erf+W): when fragment Casida owns only mt_sr Hartree.
+    _use_diag_sr = diagonal_sr_coulomb
+    if _use_diag_sr is None:
+        # Default SR diagonals only for Förster-LR rangesep (no grid LR).
+        _use_diag_sr = bool(_rangesep) and _lr_box == "none"
+    _use_diag_sr = bool(_use_diag_sr) and bool(_rangesep)
+
+    _use_diag_lr = diagonal_lr_coulomb
+    if _use_diag_lr is None:
+        # Complement of fragment mt_sr: restore LR self-Hartree at coupling time.
+        # Stay off if the user still asked for SR diagonals (legacy).
+        _use_diag_lr = bool(_lr_box in ("mt", "ewald")) and not _use_diag_sr
+    _use_diag_lr = bool(_use_diag_lr) and bool(_lr_box in ("mt", "ewald"))
+    if _use_diag_sr and _use_diag_lr:
+        raise ValueError(
+            "Cannot enable both diagonal_sr_coulomb and diagonal_lr_coulomb. "
+            "With fragment hartree_kernel='mt_sr' use LR only; otherwise SR only."
+        )
+
+    if _use_diag_sr or _use_diag_lr:
+        f_nadd_zero = np.zeros_like(f_nadd)
+        for fidx in active_indices:
+            if fragment_owners[fidx] != my_rank:
+                continue
+            phi_self = _resident_rho(res_by_frag, fidx)
+            n_self = len(phi_self)
+
+            def _self_getter(jb, _p=phi_self):
+                return _p[jb]
+
+            if _use_diag_lr:
+                K_ii = np.zeros((n_self, n_self), dtype=float)
+                global_grid = gsystem.grid
+                phi_fields = [
+                    _embedding_subcell_field(phi_self[ia], gsystem, fidx)
+                    for ia in range(n_self)
+                ]
+                flat = np.stack([np.asarray(f).ravel() for f in phi_fields])
+                sub_dV = float(phi_fields[0].grid.dV)
+                for jb in range(n_self):
+                    phi_jb_global = _sub_to_global(phi_fields[jb], gsystem, fidx)
+                    v_lr = np.asarray(
+                        _ewald_lr_potential(
+                            phi_jb_global,
+                            _screen_alpha,
+                            _mt_obj if _lr_box == "mt" else None,
+                        ),
+                    )
+                    response_field = DirectField(grid=global_grid, rank=1)
+                    response_field[:] = v_lr.reshape(response_field.shape)
+                    response_on = _global_to_sub(response_field, gsystem, fidx)
+                    K_ii[:, jb] = flat @ np.asarray(response_on).ravel() * sub_dV
+            elif _rangesep_box:
+                K_ii = _sr_coupling_block_box(
+                    phi_self, _self_getter, n_self, gsystem,
+                    fidx, fidx, f_nadd_zero, _screen_alpha,
+                    lr_mode="none", mt_obj=None,
+                )
+            else:
+                K_ii = compute_coupling_block_streamed(
+                    phi_self, _self_getter, n_self, gsystem,
+                    fidx, fidx, f_nadd_zero, hartree, include_hartree=True,
+                    screen_alpha=_screen_alpha, screen_part="sr",
+                )
+            K_local[(fidx, fidx)] = K_ii
+        if verbose and ((not is_mpi) or my_rank == root):
+            which = (
+                "long-range (erf+W MT/Ewald)"
+                if _use_diag_lr
+                else "short-range (erfc)"
+            )
+            print(
+                f"  Building {which} Coulomb self-blocks K[I,I] for "
+                "coupled A-matrix diagonals.",
+                flush=True,
+            )
+
     # ---- gather the (small) K blocks to root ----
     if is_mpi:
         gathered = comm.gather(K_local, root=root)
@@ -1492,10 +1794,9 @@ def _run_subsystem_casida_distributed(
     for (I, J), K_IJ in list(K_coupling.items()):
         K_coupling.setdefault((J, I), np.asarray(K_IJ).T)
 
-    # Range separation: add the erf long range as far-field dipole coupling. The
-    # grid loop above produced the screened (erfc) short range + f_nadd; here we
-    # add the smooth erf tail from the transition dipoles (no grid).
-    if _rangesep:
+    # Förster LR only for classic rangesep / rangesep_box. Ewald/MT LR is already
+    # folded into the streamed SR pass (needs densities; no second MPI stream).
+    if _lr_dipole:
         centers = {i: _fragment_center(gsystem, i) for i in active_indices}
         for (I, J) in [k for k in list(K_coupling.keys()) if k[0] < k[1]]:
             mu_I = _res_optional(res_by_frag[I], "dip_tran")
@@ -1506,9 +1807,11 @@ def _run_subsystem_casida_distributed(
             K_coupling[(I, J)] = np.asarray(K_coupling[(I, J)]) + K_lr
             K_coupling[(J, I)] = np.asarray(K_coupling[(J, I)]) + K_lr.T
 
+    _use_diag_any = _use_diag_sr or _use_diag_lr
+
     if verbose:
         for (I, J), K_IJ in sorted(K_coupling.items()):
-            if I < J:
+            if I < J or (I == J and _use_diag_any):
                 K_IJ = np.asarray(K_IJ)
                 k_max = float(np.max(np.abs(K_IJ))) if K_IJ.size else 0.0
                 print(f"  K[{I},{J}] shape={K_IJ.shape}  max|K|={k_max:.4e} Ha", flush=True)
@@ -1518,7 +1821,9 @@ def _run_subsystem_casida_distributed(
         print("  Solving coupled Casida equation...", flush=True)
     omega_coupled, Z_coupled = assemble_coupled_casida(
         active_results, K_pos, tda=tda, verbose=verbose,
+        include_diagonal_k=_use_diag_any,
     )
+
     f_coupled = coupled_oscillator_strengths(
         omega_coupled, Z_coupled, active_results, tda=tda, verbose=verbose,
     )
@@ -1531,6 +1836,12 @@ def _run_subsystem_casida_distributed(
     return {
         "omega": omega_coupled,
         "f": f_coupled,
+        "d_mode": coupled_transition_dipoles(
+            omega_coupled, Z_coupled, active_results, tda=tda
+        ),
+        "D_full": coupled_state_dipole_matrix(
+            omega_coupled, Z_coupled, active_results, tda=tda, verbose=verbose
+        ),
         "Z": Z_coupled,
         "K_coupling": K_coupling,
         "f_nadd": f_nadd,
@@ -1622,7 +1933,136 @@ def _assemble_dipole_coupling(
     return {
         "omega": omega_coupled,
         "f": f_coupled,
+        "d_mode": coupled_transition_dipoles(
+            omega_coupled, Z_coupled, active_results, tda=tda
+        ),
+        "D_full": coupled_state_dipole_matrix(
+            omega_coupled, Z_coupled, active_results, tda=tda, verbose=verbose
+        ),
         "Z": Z_coupled,
         "K_coupling": K_coupling,
         "f_nadd": None,
     }
+
+
+# ---------------------------------------------------------------------------
+# WFT (CASSCF/CCSD) correction of the subsystem-TDDFT coupled spectrum.
+# Scissor-correct each fragment on-site energy omega_i to its matched embedded
+# CASSCF/CCSD value, swap in the WFT transition dipoles for intensities, KEEP
+# the TDDFT inter-fragment coupling K_ij, and re-diagonalize the coupled Casida.
+# WFT numbers arrive as plain arrays -> this stays qiskit-free (they come from
+# casidapy.embed_wft or QIS_QE.embed_qiskit upstream).
+# ---------------------------------------------------------------------------
+_HA2EV = 27.211386245988
+
+
+def match_fragment_states(omega_t, mu_t, omega_w, mu_w, *,
+                          energy_weight_ev=1.0, dipole_weight=1.0, max_cost=None):
+    """Assign TDDFT fragment states to WFT states by (|dE|[eV] + dipole
+    misalignment) via optimal (Hungarian) assignment. Returns
+    {tddft_index: wft_index} for matches under ``max_cost`` (all if None).
+
+    omega_* in Hartree; mu_* shape (n,3) transition dipoles (a.u.)."""
+    from scipy.optimize import linear_sum_assignment
+    omega_t = np.asarray(omega_t, float)
+    omega_w = np.asarray(omega_w, float)
+    mu_t = np.atleast_2d(np.asarray(mu_t, float))
+    mu_w = np.atleast_2d(np.asarray(mu_w, float))
+    nt, nw = len(omega_t), len(omega_w)
+    # Relative brightness within each set (0=dark..1=brightest). Direction alone
+    # (|cos|) cannot tell bright from dark for a LINEAR chromophore (all dipoles
+    # share one axis -> cos~1 everywhere), so pair by brightness MAGNITUDE class
+    # too: this keeps bright<->bright, dark<->dark.
+    ft = np.array([float(mu_t[i] @ mu_t[i]) for i in range(nt)])
+    fw = np.array([float(mu_w[j] @ mu_w[j]) for j in range(nw)])
+    ft = ft / ft.max() if ft.max() > 0 else ft
+    fw = fw / fw.max() if fw.max() > 0 else fw
+    C = np.empty((nt, nw))
+    for i in range(nt):
+        ni = float(np.linalg.norm(mu_t[i]))
+        for j in range(nw):
+            de = abs(omega_t[i] - omega_w[j]) * _HA2EV
+            nj = float(np.linalg.norm(mu_w[j]))
+            align = (1.0 - abs(float(mu_t[i] @ mu_w[j])) / (ni * nj)
+                     if ni > 1e-6 and nj > 1e-6 else 1.0)
+            bright = abs(ft[i] - fw[j])          # brightness-class mismatch
+            C[i, j] = energy_weight_ev * de + dipole_weight * (align + bright)
+    ri, cj = linear_sum_assignment(C)
+    return {int(i): int(j) for i, j in zip(ri, cj)
+            if (max_cost is None or C[i, j] <= max_cost)}
+
+
+def apply_wft_correction(fragment_results, wft_fragments, *, match_kwargs=None,
+                         order_match=False):
+    """Build energy-corrected and WFT-dipole fragment result lists.
+
+    ``wft_fragments[I]`` = list of ``(omega_Ha, mu_vec[a.u.], s2)`` for fragment I.
+    Returns ``(frag_energy_corrected, frag_wft_dipoles, matches_per_fragment)``:
+      - frag_energy_corrected: omega <- WFT, TDDFT ``dip_tran`` kept (feeds the
+        coupled A-matrix diagonal AND the TDDFT coupling projection).
+      - frag_wft_dipoles:      omega <- WFT AND ``dip_tran`` <- WFT (feeds the
+        coupled transition dipoles / oscillator strengths).
+
+    ``order_match=True`` pairs states by ENERGY RANK (nth-lowest TDDFT -> nth-
+    lowest WFT) instead of proximity/dipole Hungarian. Use it for the EOM-CCSD
+    energy-shift (no WFT dipoles): a large uniform shift makes proximity matching
+    invert bright/dark, while rank matching preserves the state ordering.
+    """
+    mk = match_kwargs or {}
+    frag_ec, frag_wd, matches_all = [], [], []
+    for res, wft in zip(fragment_results, wft_fragments):
+        # Pass-through fragments that carry no WFT states (e.g. an ACTIVE but
+        # non-WFT-corrected environment like Ar): keep their TDDFT spectrum so the
+        # fragment list stays aligned with K_coupling (indices into ALL coupled
+        # fragments). Omitting them would misalign the coupling indices.
+        if not wft:
+            frag_ec.append(dict(res)); frag_wd.append(dict(res)); matches_all.append({})
+            continue
+        omega_t = np.asarray(_res_array(res, "omega"), float)
+        mu_t = _res_optional(res, "dip_tran")
+        mu_t = (np.asarray(mu_t, float) if mu_t is not None
+                else np.zeros((len(omega_t), 3)))
+        omega_w = np.array([w for w, _, _ in wft], float)
+        mu_w = np.array([np.asarray(mu, float) for _, mu, _ in wft])
+        if order_match:
+            ot = np.argsort(omega_t); ow = np.argsort(omega_w)
+            m = {int(ot[k]): int(ow[k]) for k in range(min(len(ot), len(ow)))}
+        else:
+            m = match_fragment_states(omega_t, mu_t, omega_w, mu_w, **mk)
+        omega_c = omega_t.copy()
+        d_wd = mu_t.copy()
+        for i, j in m.items():
+            omega_c[i] = omega_w[j]
+            d_wd[i] = mu_w[j]
+        r_ec = dict(res); r_ec["omega"] = omega_c                 # keep TDDFT dip_tran
+        r_wd = dict(res); r_wd["omega"] = omega_c; r_wd["dip_tran"] = d_wd
+        frag_ec.append(r_ec); frag_wd.append(r_wd); matches_all.append(m)
+    return frag_ec, frag_wd, matches_all
+
+
+def wft_corrected_coupled_casida(fragment_results, K_coupling, wft_fragments, *,
+                                 tda=True, match_kwargs=None, energy_only=False,
+                                 order_match=False, include_diagonal_k=False,
+                                 verbose=False):
+    """WFT-corrected subsystem TDDFT: scissor-correct fragment on-site energies
+    to the matched embedded WFT values, re-diagonalize the coupled Casida with
+    the unchanged TDDFT coupling K.
+
+    ``energy_only=False`` (CASSCF): coupled transition dipoles come from the WFT
+    fragment dipoles. ``energy_only=True`` (EOM-CCSD, which has no transition
+    dipoles): shift energies ω←WFT only and keep the TDDFT dipoles for
+    intensities — removes the WFT active-space dependence. Match with
+    ``match_kwargs=dict(dipole_weight=0.0)`` so EOM-CCSD states pair by energy.
+
+    Returns dict(omega, Z, d_mode, matches) -- ready for
+    coupled_oscillator_strengths / run_qed_post.
+    """
+    frag_ec, frag_wd, matches = apply_wft_correction(
+        fragment_results, wft_fragments, match_kwargs=match_kwargs,
+        order_match=order_match)
+    omega_c, Z = assemble_coupled_casida(
+        frag_ec, K_coupling, tda=tda,
+        include_diagonal_k=include_diagonal_k, verbose=verbose)
+    mu_src = frag_ec if energy_only else frag_wd   # energy_only -> keep TDDFT dipoles
+    mu_c = coupled_transition_dipoles(omega_c, Z, mu_src, tda=tda, verbose=verbose)
+    return {"omega": omega_c, "Z": Z, "d_mode": mu_c, "matches": matches}
